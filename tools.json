@@ -174,5 +174,21 @@
     "inputMode": "stdin",
     "outputMode": "stdout-text",
     "timeout": 600000
+  },
+  {
+    "name": "opencode-m31free",
+    "displayName": "OpenCode M3.1 Free",
+    "description": "OpenCode CLI (opencode-go/minimax-m3.1-flash-free, 独立免费池不限流, --auto)",
+    "transport": "cli",
+    "command": "opencode",
+    "args": [
+      "run",
+      "-m",
+      "opencode-go/minimax-m3.1-flash-free",
+      "--auto"
+    ],
+    "inputMode": "stdin",
+    "outputMode": "stdout-text",
+    "timeout": 600000
   }
 ]
