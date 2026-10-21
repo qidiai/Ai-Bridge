@@ -18,8 +18,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 
 const PORT = 9811;
 const HOST = '127.0.0.1';
@@ -230,6 +232,70 @@ async function main () {
   const c3 = await req('POST', '/v1/chat/completions', { model: PROBE, messages: [{ role: 'user', content: 'EMPTYOUT_MARK 静默失败应报错' }] });
   check('T3-8 工具空产出 → 502 同构错误(不返回空 completion)', c3.status === 502 && typeof c3.body.error === 'string', `status=${c3.status} ${JSON.stringify(c3.body).substring(0, 150)}`);
 
+  // ── T4 模型透传:单元级(CliAdapter + 校验 + 无 modelFlag 免疫) ──
+  section('T4: CLI 模型透传(-m 覆盖/注入拒绝/无声明免疫/追加形态)');
+  const { CliAdapter } = require('./adapters/cli-adapter.js');
+  const fakeArgv = path.join(TEST_RUNTIME, 'fake_argv.js');
+  fs.writeFileSync(fakeArgv, 'console.log(JSON.stringify(process.argv.slice(2)))\n', 'utf-8');
+  const t4out = testDataPath('t4out');
+  const mkCfg = (args, extra) => ({ name: 't4fake', displayName: 'T4 Fake', description: '', command: process.execPath, args, inputMode: 'arg', timeout: 30000, ...extra });
+
+  try {
+    const ad1 = new CliAdapter(mkCfg([fakeArgv, '-m', 'default/model'], { modelFlag: '-m' }));
+    const r1 = await ad1.execute('hi', { outputDir: t4out, model: 'foo/bar' });
+    const argv1 = JSON.parse(String(r1.content || '').trim());
+    check('U-1 modelFlag 覆盖默认模型(替换首个 -m 的下一参数)', argv1.includes('-m') && argv1[argv1.indexOf('-m') + 1] === 'foo/bar' && !argv1.includes('default/model'), JSON.stringify(argv1));
+  } catch (e) { check('U-1 modelFlag 覆盖默认模型(替换首个 -m 的下一参数)', false, e.message); }
+
+  try {
+    const ad2 = new CliAdapter(mkCfg([fakeArgv, '-m', 'default/model'], { modelFlag: '-m' }));
+    let injErr = null;
+    try { await ad2.execute('hi', { outputDir: t4out, model: 'bad model;rm -rf x' }); } catch (e) { injErr = e; }
+    check('U-2 含空格/元字符的模型名被拒绝(执行前抛错,不 spawn)', injErr !== null && /不合法/.test(String(injErr && injErr.message)), injErr ? String(injErr.message).substring(0, 120) : 'no-throw');
+  } catch (e) { check('U-2 含空格/元字符的模型名被拒绝(执行前抛错,不 spawn)', false, e.message); }
+
+  try {
+    const ad3 = new CliAdapter(mkCfg([fakeArgv, '-m', 'default/model']));
+    const r3 = await ad3.execute('hi', { outputDir: t4out, model: 'foo/bar' });
+    const argv3 = JSON.parse(String(r3.content || '').trim());
+    check('U-3 未声明 modelFlag 的工具对 model 覆盖免疫(参数原样)', argv3.includes('default/model') && !argv3.includes('foo/bar'), JSON.stringify(argv3));
+  } catch (e) { check('U-3 未声明 modelFlag 的工具对 model 覆盖免疫(参数原样)', false, e.message); }
+
+  try {
+    const ad4 = new CliAdapter(mkCfg([fakeArgv], { modelFlag: '-m' }));
+    const r4 = await ad4.execute('hi', { outputDir: t4out, model: 'x/y' });
+    const argv4 = JSON.parse(String(r4.content || '').trim());
+    check('U-4 args 无默认 -m 时追加 [modelFlag, model] 到末尾', argv4.slice(-2).join('|') === '-m|x/y', JSON.stringify(argv4));
+  } catch (e) { check('U-4 args 无默认 -m 时追加 [modelFlag, model] 到末尾', false, e.message); }
+
+  // ── T4 模型发现端点(服务端行为) ──
+  section('T4: GET /api/discover-models 模型发现');
+  const dm1 = await req('GET', '/api/discover-models?tool=ext-no-such-tool');
+  check('U-5a 未知工具 → 400', dm1.status === 400 && typeof dm1.body.error === 'string', `status=${dm1.status}`);
+  const dm2 = await req('GET', '/api/discover-models?tool=qoder');
+  check('U-5b 未声明 modelListCmd 的工具 → 400 且提示不支持', dm2.status === 400 && /不支持|无/.test(dm2.body.error || ''), `status=${dm2.status} ${JSON.stringify(dm2.body).substring(0, 120)}`);
+  const dm3 = await req('GET', '/api/discover-models?tool=opencode');
+  check('U-5c opencode 探测:200+models数组 或 503(命令不可用,均视为环境合规)', (dm3.status === 200 && Array.isArray(dm3.body.models)) || dm3.status === 503, `status=${dm3.status} ${JSON.stringify(dm3.body).substring(0, 150)}`);
+
+  // ── T5 用量自报协议(usage-reporter 单元) ──
+  section('T5: usage-reporter [USAGE] 自报协议');
+  let ur = null;
+  try { ur = require('./usage-reporter.js'); } catch (e) { /* 缺失时下方逐项判红 */ }
+  check('V-1 usage-reporter 模块存在且导出后缀常量', !!ur && typeof ur.USAGE_REPORT_SUFFIX === 'string' && /\[USAGE\] input=/.test(ur.USAGE_REPORT_SUFFIX) && /自报/.test(ur.USAGE_REPORT_SUFFIX), ur ? 'exports=' + Object.keys(ur).join(',') : 'require failed');
+  const need = typeof ur?.parseUsageReport === 'function' ? ur.parseUsageReport : () => ({ content: '(unavailable)', usage: undefined });
+  {
+    const a = need('结果代码\n[USAGE] input=123 output=45');
+    check('V-2 末行标记被剥离且用量转正式 reported(123/45/168)', a.content === '结果代码' && a.usage?.input === 123 && a.usage?.output === 45 && a.usage?.total === 168 && a.usage?.reported === true, JSON.stringify(a).substring(0, 200));
+    const b = need('AB\r\n[USAGE]  input = 10  output = 20  \r\n');
+    check('V-3 CRLF/多空格/等号两侧空白容错(10/20/30)', b.content.startsWith('AB') && b.usage?.input === 10 && b.usage?.output === 20 && b.usage?.total === 30, JSON.stringify(b).substring(0, 200));
+    const c = need('no marker here');
+    check('V-4 无标记时 content 原样且 usage=null', c.content === 'no marker here' && c.usage === null, JSON.stringify(c).substring(0, 120));
+    const d = need('x\n[USAGE] input=1 output=2\ny\n[USAGE] input=7 output=8');
+    check('V-5 多个标记取最后一个(仅剥离该行)', d.usage?.input === 7 && d.usage?.output === 8 && String(d.content).split('\n').pop() === 'y', JSON.stringify(d).substring(0, 200));
+    const f = need('big\n[USAGE] input=999999999 output=999999999');
+    check('V-6 超 1e8 视为无效值:仍剥离但 usage=null', f.content === 'big' && f.usage === null, JSON.stringify(f).substring(0, 150));
+  }
+
   // ── 静态接线检查 ──
   section('静态接线:server.js / README');
   const src = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf-8');
@@ -239,6 +305,14 @@ async function main () {
   const readme = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf-8');
   check('S-4 README 写明 Node.js 22+ 硬依赖', /Node(\.js)? 22/.test(readme));
   check('S-5 README 含 opencode 免费模型接入指引', /opencode/i.test(readme) && /(免费|free)/i.test(readme));
+  const tjson = JSON.parse(fs.readFileSync(path.join(__dirname, 'tools.json'), 'utf-8'));
+  const opencodeish = tjson.filter(t => String(t.name).startsWith('opencode'));
+  check('S-6 tools.json 四个 opencode 工具声明 modelFlag=-m 与 modelListCmd', opencodeish.length === 4 && opencodeish.every(t => t.modelFlag === '-m' && t.modelListCmd && t.modelListCmd.command === 'opencode' && Array.isArray(t.modelListCmd.args)), opencodeish.map(t => t.name + ':' + JSON.stringify(t.modelFlag || null)).join(','));
+  check('S-7 server.js 接线 model_override 与 discover-models', /model_override/.test(src) && /discover-models/.test(src));
+  const adapterSrc = fs.readFileSync(path.join(__dirname, 'adapters', 'cli-adapter.js'), 'utf-8');
+  check('S-8 cli-adapter 接线 modelFlag 且校验拒绝文案含"不合法"', /modelFlag/.test(adapterSrc) && /不合法/.test(adapterSrc));
+  check('S-9 server.js 接线 usage-reporter(require+CLI 门控+reported 合并)', /usage-reporter/.test(src) && /reported/.test(src));
+  check('S-10 README 含模型透传与用量自报说明', /model_override/.test(readme) && /\[USAGE\]/.test(readme));
 
   process.stdout.write('\n' + '='.repeat(40) + '\n');
   process.stdout.write(`结果: ${passed} 通过 / ${failed} 失败\n`);
