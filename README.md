@@ -20,6 +20,8 @@ node server.js     # 启动服务 (端口 9800)
 - **工具名直连**：`POST /v1/chat/completions` 的 `model` 既可用模型名，也可直接用**工具名**（如 `opencode-flash`、`claude-code`）触发该单工具的纯 1:1 透传执行（无接力、无评审、无工作区绑定）。命中 `models.json` 走原有反代 transport；两者皆不命中才返回 404 并提示查阅 `GET /v1/models`。
 - **工具名直连暂不支持 stream**：工具分支忽略 `stream` 参数，始终一次性返回完整 JSON（模型反代分支不受此限，仍可流式）。
 - **opencode CLI 安装 + 平台免费模型**：先安装 opencode CLI（如 `npm i -g opencode-ai`，或按官方安装脚本），接入后即可享用平台自带的 opencode-go 免费模型池（如 `deepseek-v4.1-flash`、`step-5-preview-free` 等 free/免费 模型），由 `opencode` / `opencode-flash` 工具直接派发，无需自备 API Key。
+- **模型透传（运行时指定任意模型）**：`POST /api/dispatch` 请求体可加 `"model":"opencode-go/minimax-m3.1-flash-free"`，或在 `/v1/chat/completions` 请求体加 `"model_override":"<模型名>"`（后者等价于 dispatch 的 `model`），派发时临时覆盖工具默认的 `-m` 模型，无需改 `tools.json`；仅对声明了 `modelFlag` 的工具（opencode 系四个）生效，含空格/shell 元字符的模型名会被直接拒绝。货架上有哪些模型可自行枚举：`GET /api/discover-models?tool=opencode`。示例：`curl -s -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/json" -d '{"task":"写一个 add 函数","tools":["opencode-flash"],"model":"opencode-go/minimax-m3.1-flash-free"}'`；查看模型清单：`curl -s "http://127.0.0.1:9800/api/discover-models?tool=opencode"`。
+- **用量自报（T5 预告）**：工具输出可尾随 `[USAGE] input=… output=…` 自报行，中枢自动剥离计入 usage，供接入方智能体主动上报真实 token 消耗。
 
 curl 示例（服务默认端口 9800）：
 

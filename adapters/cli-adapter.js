@@ -16,6 +16,8 @@
  *   parse.usagePath: stdout-json 模式下提取 usage 的 JSONPath
  *   parse.outputFile: file 模式下要读取的输出文件名
  *   timeout:         超时毫秒数
+ *   modelFlag:       可选,模型参数字面(如 "-m")。声明后 execute 的 opts.model
+ *                    会覆盖 args 中该 flag 的下一个参数(不存在则追加),实现运行时模型透传
  *
  * 执行目录:
  *   opts.workspaceDir 存在时,子进程 cwd = workspaceDir(工作区模式);
@@ -61,6 +63,16 @@ class CliAdapter extends BaseAdapter {
    * 执行任务
    */
   async execute (task, opts = {}) {
+    // ── 模型透传:校验先行,必须在任何 spawn/落盘之前抛出 ──
+    // opts.model 为 undefined/null/空串/纯空白/非字符串 → 视为未指定;合法但工具未声明 modelFlag → 静默忽略,行为原样
+    let modelOverride = null;
+    if (typeof opts.model === 'string' && opts.model.trim() !== '') {
+      if (!/^[A-Za-z0-9][A-Za-z0-9.:/@_-]{0,79}$/.test(opts.model)) {
+        throw new Error(`model 名称不合法: ${opts.model.substring(0, 40)}`);
+      }
+      modelOverride = opts.model;
+    }
+
     const taskId = opts.taskId || `${this.name}_${Date.now()}`;
     // 默认输出根固定在 ai-bridge/output(不随进程 cwd 漂移,与 server 清理逻辑同一坐标系)
     const dir = opts.outputDir || path.join(__dirname, '..', 'output', `${this.name}_${taskId}`);
@@ -103,6 +115,20 @@ class CliAdapter extends BaseAdapter {
         taskId
       });
     });
+
+    // 模型覆盖:仅对声明了 modelFlag 的工具生效。
+    // 替换基于模板替换后的 args 数组:找到第一个等于 modelFlag 的位置 i,把 i+1 替换为用户模型;
+    // args 中不存在该 flag 时在末尾追加 [modelFlag, model]。args 是 map() 生成的新数组,并发安全不污染 config。
+    if (modelOverride && this.config.modelFlag) {
+      const flag = this.config.modelFlag;
+      const flagIdx = args.indexOf(flag);
+      if (flagIdx >= 0) {
+        if (flagIdx + 1 < args.length) args[flagIdx + 1] = modelOverride;
+        else args.push(modelOverride);
+      } else {
+        args.push(flag, modelOverride);
+      }
+    }
 
     // 执行
     const stdin = this.inputMode === 'stdin' ? task : null;
@@ -353,4 +379,4 @@ function extractJSON (stdout) {
   }
 }
 
-module.exports = { CliAdapter };
+module.exports = { CliAdapter, runCommand };

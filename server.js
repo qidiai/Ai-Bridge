@@ -27,7 +27,7 @@ const {
   buildRoutingProfile,
   rankRoutingProfiles
 } = require('./routing-score');
-const { CliAdapter } = require('./adapters/cli-adapter');
+const { CliAdapter, runCommand } = require('./adapters/cli-adapter');
 const store = require('./store');
 const workspaceManager = require('./workspace-manager');
 const db = require('./db');
@@ -566,7 +566,9 @@ async function executeTool (name, task, opts = {}) {
       result = await tool.execute(task, {
         taskId,
         timeout: opts.timeout || tool.timeout || CONFIG.EXECUTE_TIMEOUT,
-        workspaceDir: opts.workspace?.path
+        workspaceDir: opts.workspace?.path,
+        // 模型透传:opts.model 交由适配器校验/覆盖(仅声明 modelFlag 的工具生效);客户端通道不受影响
+        model: opts.model
       });
     }
   } catch (e) {
@@ -676,7 +678,7 @@ async function executeClient (clientName, task, opts = {}) {
   });
 }
 
-async function doDispatch (task, toolNames, autoFallback = true, context = '', withReview = false, reviewerPref = null, workspaceRef = null, fallbackScope = 'auto') {
+async function doDispatch (task, toolNames, autoFallback = true, context = '', withReview = false, reviewerPref = null, workspaceRef = null, fallbackScope = 'auto', modelOverride = null) {
   // 入参校验
   if (!task || typeof task !== 'string') return { error: '缺少 task 参数', code: 'invalid_request' };
   if (task.length > CONFIG.MAX_TASK_LENGTH) return { error: `任务描述过长(>${CONFIG.MAX_TASK_LENGTH}字符)`, code: 'invalid_request' };
@@ -684,6 +686,8 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
   if (toolNames != null && !Array.isArray(toolNames)) toolNames = null;
   // fallback_scope 归一化:非 'all'/'none' 的一切值(含 undefined/非法值)按 'auto'
   fallbackScope = ['all', 'none'].includes(fallbackScope) ? fallbackScope : 'auto';
+  // model 透传归一化:非空字符串才生效,其余(undefined/空串/非字符串)视为未指定
+  modelOverride = (typeof modelOverride === 'string' && modelOverride.trim()) ? modelOverride : null;
 
   // 工作区前置校验:不存在/已归档/目录缺失直接返回明确错误,不占用并发额度
   let workspace = null;
@@ -786,7 +790,7 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
     const rawResults = await Promise.allSettled(
       targets.map(async (name) => {
         try {
-          const result = await executeTool(name, effectiveTask, { workspace });
+          const result = await executeTool(name, effectiveTask, { workspace, model: modelOverride });
           const check = isToolFailed(result, null);
           if (check.failed) {
             log('warn', `dispatch 判定工具失败: tool=${name} reason=${String(check.reason || '').substring(0, 200)}`);
@@ -828,7 +832,7 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
           usedFallback.add(fb);
           METRICS.fallbackTotal++;
           try {
-            const fbResult = await executeTool(fb, handoffPrompt, { workspace });
+            const fbResult = await executeTool(fb, handoffPrompt, { workspace, model: modelOverride });
             // 接力结果二次校验:接力工具本身也可能限额/断连,别把失败回复当成功
             const fbCheck = isToolFailed(fbResult, null);
             if (fbCheck.failed) { log('warn', `接力工具仍失败: from=${failed.tool} to=${fb} reason=${String(fbCheck.reason || '').substring(0, 200)}`); fallbackLog.push({ from: failed.tool, to: fb, success: false, reason: fbCheck.reason }); continue; }
@@ -1076,6 +1080,11 @@ async function handleProxy (req, res, p, search) {
 // /api/dispatch 早期错误 code → HTTP 状态码映射(工具级失败不在此列,仍走 200 结果体)
 const DISPATCH_ERROR_HTTP = { invalid_request: 400, workspace_error: 400, workspace_busy: 409, no_targets: 409, too_many: 429 };
 
+// ── 模型枚举(/api/discover-models)结果缓存:工具名 → { ts, models },60 秒 TTL,命中不再 spawn ──
+const discoverModelCache = new Map();
+const DISCOVER_MODEL_TTL = 60000;
+const DISCOVER_MODEL_TIMEOUT = 15000;
+
 const server = http.createServer(async (req, res) => {
   // 全局错误处理:任何未捕获异常不会崩溃服务
   try {
@@ -1175,6 +1184,36 @@ const server = http.createServer(async (req, res) => {
       });
       const total = stats.total || { input: 0, output: 0, total: 0, calls: 0 };
       sendJSON(res, 200, { tools, total });
+      return;
+    }
+
+    // ── 模型发现:GET /api/discover-models?tool=<name>(命令串完全来自本地 tools.json 配置,不拼接任何请求内容,无注入面) ──
+    if (p === '/api/discover-models' && req.method === 'GET') {
+      const toolRef = String(url.searchParams.get('tool') || '').trim();
+      const allTools = await getAllTools();
+      const t = toolRef ? resolveToolReference(toolRef, allTools) : null;
+      if (!t) { sendJSON(res, 400, { error: `未知工具: ${toolRef || '(空)'}` }); return; }
+      const adapter = TOOLS.find(x => x.name === t.name);
+      const listCmd = adapter && adapter.config && adapter.config.modelListCmd;
+      if (!listCmd || typeof listCmd.command !== 'string' || !listCmd.command.trim()) {
+        sendJSON(res, 400, { error: `工具 ${t.name} 不支持模型枚举(未声明 modelListCmd)` });
+        return;
+      }
+      const cached = discoverModelCache.get(t.name);
+      if (cached && Date.now() - cached.ts < DISCOVER_MODEL_TTL) {
+        sendJSON(res, 200, { tool: t.name, models: cached.models, ts: cached.ts });
+        return;
+      }
+      try {
+        // 复用 cli-adapter 的无 shell 安全 spawn(Windows .cmd 走 cmd.exe /c,不走 shell:true)
+        const stdout = await runCommand(listCmd.command.trim(), Array.isArray(listCmd.args) ? listCmd.args.map(String) : [], { timeout: DISCOVER_MODEL_TIMEOUT, cwd: __dirname });
+        const models = String(stdout).split(/\r?\n/).map(s => s.trim()).filter(s => s !== '' && !s.startsWith('<'));
+        const entry = { ts: Date.now(), models };
+        discoverModelCache.set(t.name, entry);
+        sendJSON(res, 200, { tool: t.name, models, ts: entry.ts });
+      } catch (e) {
+        sendJSON(res, 503, { error: `模型枚举失败: ${String(e.message || e).substring(0, 200)}` });
+      }
       return;
     }
 
@@ -1347,7 +1386,7 @@ const server = http.createServer(async (req, res) => {
         const taskId = `atask_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         rememberAsyncTask(taskId, { status: 'running', result: null, ts: new Date().toISOString() });
         db.createAsyncTask(taskId, body.task);
-        doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null, body.fallback_scope)
+        doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null, body.fallback_scope, body.model)
           .then(r => {
             const status = r.error ? 'failed' : 'done';
             rememberAsyncTask(taskId, { status, result: r, ts: new Date().toISOString() });
@@ -1360,7 +1399,7 @@ const server = http.createServer(async (req, res) => {
         sendJSON(res, 202, { taskId, status: 'running', message: '任务已入队,用 GET /api/task/' + taskId + ' 查询结果' });
         return;
       }
-      const result = await doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null, body.fallback_scope);
+      const result = await doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null, body.fallback_scope, body.model);
       if (result && result.error) {
         const code = result.code || 'invalid_request';
         sendJSON(res, DISPATCH_ERROR_HTTP[code] || 400, { error: result.error, code });
@@ -1861,7 +1900,9 @@ const server = http.createServer(async (req, res) => {
         db.recordTraffic({ ts: new Date().toISOString(), direction: 'out', tool: t.name, taskId: toolTaskId, type: 'openai-tool', content: String(prompt).substring(0, 8000), source: 'bridge' });
         activeDispatchCount++;
         try {
-          const r = await executeTool(t.name, prompt, {});
+          // 模型透传:model_override 为非空字符串时作为适配器的 opts.model(仅声明 modelFlag 的工具生效)
+          const toolModelOverride = (typeof body.model_override === 'string' && body.model_override.trim()) ? body.model_override : undefined;
+          const r = await executeTool(t.name, prompt, { model: toolModelOverride });
           const fail = isToolFailed(r, null);
           if (fail.failed) { sendJSON(res, 502, { error: `工具 ${t.name} 执行失败: ${String(fail.reason || '').substring(0, 300)}` }); return; }
           const tokens = r.tokens || {};

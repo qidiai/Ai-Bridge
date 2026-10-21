@@ -139,6 +139,8 @@
       "opencode-go/step-5-preview-free",
       "--auto"
     ],
+    "modelFlag": "-m",
+    "modelListCmd": { "command": "opencode", "args": ["models"] },
     "inputMode": "stdin",
     "outputMode": "stdout-text",
     "timeout": 600000
@@ -155,6 +157,8 @@
       "opencode-go/kimi-k3",
       "--auto"
     ],
+    "modelFlag": "-m",
+    "modelListCmd": { "command": "opencode", "args": ["models"] },
     "inputMode": "stdin",
     "outputMode": "stdout-text",
     "timeout": 600000
@@ -171,6 +175,8 @@
       "opencode-go/deepseek-v4.1-flash",
       "--auto"
     ],
+    "modelFlag": "-m",
+    "modelListCmd": { "command": "opencode", "args": ["models"] },
     "inputMode": "stdin",
     "outputMode": "stdout-text",
     "timeout": 600000
@@ -187,6 +193,8 @@
       "opencode-go/minimax-m3.1-flash-free",
       "--auto"
     ],
+    "modelFlag": "-m",
+    "modelListCmd": { "command": "opencode", "args": ["models"] },
     "inputMode": "stdin",
     "outputMode": "stdout-text",
     "timeout": 600000
