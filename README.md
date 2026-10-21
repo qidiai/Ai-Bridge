@@ -12,6 +12,27 @@ node server.js     # 启动服务 (端口 9800)
 
 浏览器打开 `http://127.0.0.1:9800` 即可访问 Web UI。
 
+## 外部用户接入（OpenAI 兼容层）
+
+本中枢同时以 OpenAI 兼容接口对外提供服务（zcode、one-api、任意 OpenAI SDK 均可直连）。**硬依赖：服务端需 Node.js 22+**（使用内置 `node:sqlite` 数据库，低版本无法启动）。
+
+- **列出全量清单**：`GET /v1/models` 返回「模型清单 ∪ 全部已启用可派发工具」——既含 `models.json` 的模型条目，也含 `tools.json` 里每个可派发工具的 `name`（含在线接入的 MCP 客户端），外部客户端据此一眼看到所有可用算力。被开关禁用的工具不会出现；与模型同名（小写不敏感）时模型条目优先，不重复。
+- **工具名直连**：`POST /v1/chat/completions` 的 `model` 既可用模型名，也可直接用**工具名**（如 `opencode-flash`、`claude-code`）触发该单工具的纯 1:1 透传执行（无接力、无评审、无工作区绑定）。命中 `models.json` 走原有反代 transport；两者皆不命中才返回 404 并提示查阅 `GET /v1/models`。
+- **工具名直连暂不支持 stream**：工具分支忽略 `stream` 参数，始终一次性返回完整 JSON（模型反代分支不受此限，仍可流式）。
+- **opencode CLI 安装 + 平台免费模型**：先安装 opencode CLI（如 `npm i -g opencode-ai`，或按官方安装脚本），接入后即可享用平台自带的 opencode-go 免费模型池（如 `deepseek-v4.1-flash`、`step-5-preview-free` 等 free/免费 模型），由 `opencode` / `opencode-flash` 工具直接派发，无需自备 API Key。
+
+curl 示例（服务默认端口 9800）：
+
+```bash
+# 1) 列出全部可用模型与工具（含工具名，可直接当 model 用）
+curl -s http://127.0.0.1:9800/v1/models
+
+# 2) 用工具名当模型直连单工具执行（工具分支不支持 stream，始终返回完整 JSON）
+curl -s http://127.0.0.1:9800/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"opencode-flash","messages":[{"role":"user","content":"写一个 Python 的 add 函数"}]}'
+```
+
 ## 前置条件
 
 - Node.js 22+（使用内置 `node:sqlite`）

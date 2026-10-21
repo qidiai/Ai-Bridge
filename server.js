@@ -1764,13 +1764,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ── OpenAI 兼容反代:把各 AI 编程软件绑定的免费订阅统一以 OpenAI 格式暴露 ──
-    // 模型清单由 models.json + kimi-code 自动同步条目动态生成,受 switches 开关约束(禁用的工具不出现在清单里)
+    // 清单 = models.json + kimi-code 自动同步条目(受 modelEnabled 开关约束)∪ 已启用工具(受 isToolEnabled 开关约束,不看 available)
+    // 工具条目代表"可派发的算力"(含在线 MCP 客户端),与 models 条目 id 冲突时 models 优先(小写不敏感去重)
     if (p === '/v1/models' && req.method === 'GET') {
       const created = Math.floor(START_TIME / 1000);
-      const data = loadAllModels().filter(modelEnabled).map(m => ({
-        id: m.id, object: 'model', created, owned_by: m.owned_by || 'ai-bridge'
-      }));
-      sendJSON(res, 200, { object: 'list', data });
+      const modelEntries = loadAllModels().filter(modelEnabled).map(m => ({ id: m.id, object: 'model', created, owned_by: m.owned_by || 'ai-bridge' }));
+      const modelIds = new Set(modelEntries.map(x => String(x.id).toLowerCase()));
+      const allT = await getAllTools();
+      const toolEntries = allT
+        .filter(t => isToolEnabled(t) && !modelIds.has(String(t.name).toLowerCase()))
+        .map(t => ({ id: t.name, object: 'model', created, owned_by: t.type }));
+      sendJSON(res, 200, { object: 'list', data: modelEntries.concat(toolEntries) });
       return;
     }
 
@@ -1834,7 +1838,48 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req, PROXY_MAX_BODY);
       const isStream = body.stream === true;
       const model = findModel(body.model);
-      if (!model) { sendJSON(res, 404, { error: `未知模型: ${body.model || '(空)'}。可用模型见 GET /v1/models` }); return; }
+      if (!model) {
+        // ── 分支 T3:model=<工具名> 直连单工具执行(纯 1:1 透传,无接力/评审/工作区;不支持 stream,始终一次性返回 JSON) ──
+        // models 查找已优先执行(model 命中走下方 transport 分支);此处仅处理"模型名即工具名"的直连语义
+        const allT = await getAllTools();
+        const t = resolveToolReference(body.model, allT);
+        if (!t) { sendJSON(res, 404, { error: `未知模型: ${body.model || '(空)'}。可用模型见 GET /v1/models` }); return; }
+        if (!isToolEnabled(t)) { sendJSON(res, 403, { error: `工具 ${t.name} 已被开关禁用` }); return; }
+        if (activeDispatchCount >= CONFIG.MAX_CONCURRENT_DISPATCH) { sendJSON(res, 429, { error: `并发数已达上限(${CONFIG.MAX_CONCURRENT_DISPATCH}),请稍后重试` }); return; }
+        // prompt 提取:取最后一条 role==='user' 消息;content 为字符串直接用,为数组时取各 part.text 拼接;无有效文本 → 400
+        const msgs = Array.isArray(body.messages) ? body.messages : [];
+        let prompt = '';
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i];
+          if (!m || m.role !== 'user') continue;
+          if (typeof m.content === 'string') prompt = m.content;
+          else if (Array.isArray(m.content)) prompt = m.content.map(x => (x && typeof x.text === 'string') ? x.text : '').join('');
+          break;
+        }
+        if (!String(prompt).trim()) { sendJSON(res, 400, { error: 'messages 中缺少可用文本内容', code: 'invalid_request' }); return; }
+        const toolTaskId = `proxy_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+        db.recordTraffic({ ts: new Date().toISOString(), direction: 'out', tool: t.name, taskId: toolTaskId, type: 'openai-tool', content: String(prompt).substring(0, 8000), source: 'bridge' });
+        activeDispatchCount++;
+        try {
+          const r = await executeTool(t.name, prompt, {});
+          const fail = isToolFailed(r, null);
+          if (fail.failed) { sendJSON(res, 502, { error: `工具 ${t.name} 执行失败: ${String(fail.reason || '').substring(0, 300)}` }); return; }
+          const tokens = r.tokens || {};
+          const pt = tokens.input ?? estimateTokens(prompt);
+          const ct = tokens.output ?? estimateTokens(r.content || '');
+          sendJSON(res, 200, {
+            id: 'chatcmpl-' + toolTaskId, object: 'chat.completion', created: Math.floor(Date.now() / 1000),
+            model: String(body.model),
+            choices: [{ index: 0, message: { role: 'assistant', content: r.content || '' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: tokens.total ?? (pt + ct) }
+          });
+        } catch (e) {
+          sendJSON(res, 502, { error: `工具 ${t.name} 执行异常: ${String(e.message || e).substring(0, 300)}` });
+        } finally {
+          activeDispatchCount--;
+        }
+        return;
+      }
       if (!modelEnabled(model)) { sendJSON(res, 403, { error: `模型 ${model.id} 已被开关禁用(${model.switch})` }); return; }
       const taskId = `proxy_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
 
