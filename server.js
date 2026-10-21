@@ -678,8 +678,8 @@ async function executeClient (clientName, task, opts = {}) {
 
 async function doDispatch (task, toolNames, autoFallback = true, context = '', withReview = false, reviewerPref = null, workspaceRef = null, fallbackScope = 'auto') {
   // 入参校验
-  if (!task || typeof task !== 'string') return { error: '缺少 task 参数' };
-  if (task.length > CONFIG.MAX_TASK_LENGTH) return { error: `任务描述过长(>${CONFIG.MAX_TASK_LENGTH}字符)` };
+  if (!task || typeof task !== 'string') return { error: '缺少 task 参数', code: 'invalid_request' };
+  if (task.length > CONFIG.MAX_TASK_LENGTH) return { error: `任务描述过长(>${CONFIG.MAX_TASK_LENGTH}字符)`, code: 'invalid_request' };
   // tools 入参硬化:非数组一律视为未指定(回退全量可用工具),防畸形入参 crash
   if (toolNames != null && !Array.isArray(toolNames)) toolNames = null;
   // fallback_scope 归一化:非 'all'/'none' 的一切值(含 undefined/非法值)按 'auto'
@@ -691,7 +691,7 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
     try {
       workspace = workspaceManager.resolveForDispatch(workspaceRef);
     } catch (e) {
-      return { error: e.message };
+      return { error: e.message, code: 'workspace_error' };
     }
   }
 
@@ -702,7 +702,7 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
 
   // 并发限制
   if (activeDispatchCount >= CONFIG.MAX_CONCURRENT_DISPATCH) {
-    return { error: `并发数已达上限(${CONFIG.MAX_CONCURRENT_DISPATCH}),请稍后重试` };
+    return { error: `并发数已达上限(${CONFIG.MAX_CONCURRENT_DISPATCH}),请稍后重试`, code: 'too_many' };
   }
   activeDispatchCount++;
   const dispatchId = `dispatch_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
@@ -717,7 +717,7 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
       try {
         workspaceLease = workspaceManager.beginRun(workspace.id, dispatchId);
       } catch (e) {
-        return { error: e.message };
+        return { error: e.message, code: 'workspace_busy' };
       }
     }
     const allTools = await getAllTools();
@@ -780,7 +780,7 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
     });
 
     if (targets.length === 0) {
-      return { error: `没有选中可执行的目标。当前可调度工具: ${availableNames.join(', ') || '无'}(可能被禁用,或 workspace 任务要求 exec 能力)` };
+      return { error: `没有选中可执行的目标。当前可调度工具: ${availableNames.join(', ') || '无'}(可能被禁用,或 workspace 任务要求 exec 能力)`, code: 'no_targets' };
     }
 
     const rawResults = await Promise.allSettled(
@@ -1073,6 +1073,9 @@ async function handleProxy (req, res, p, search) {
   upReq.end();
 }
 
+// /api/dispatch 早期错误 code → HTTP 状态码映射(工具级失败不在此列,仍走 200 结果体)
+const DISPATCH_ERROR_HTTP = { invalid_request: 400, workspace_error: 400, workspace_busy: 409, no_targets: 409, too_many: 429 };
+
 const server = http.createServer(async (req, res) => {
   // 全局错误处理:任何未捕获异常不会崩溃服务
   try {
@@ -1339,8 +1342,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       // 异步模式:立即返回 taskId,后台执行,结果写内存表+全局库(跨重启可查)
       if (body.async === true) {
-        if (!body.task || typeof body.task !== 'string') { sendJSON(res, 400, { error: '缺少 task 参数' }); return; }
-        if (body.task.length > CONFIG.MAX_TASK_LENGTH) { sendJSON(res, 400, { error: `任务描述过长(>${CONFIG.MAX_TASK_LENGTH}字符)` }); return; }
+        if (!body.task || typeof body.task !== 'string') { sendJSON(res, 400, { error: '缺少 task 参数', code: 'invalid_request' }); return; }
+        if (body.task.length > CONFIG.MAX_TASK_LENGTH) { sendJSON(res, 400, { error: `任务描述过长(>${CONFIG.MAX_TASK_LENGTH}字符)`, code: 'invalid_request' }); return; }
         const taskId = `atask_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         rememberAsyncTask(taskId, { status: 'running', result: null, ts: new Date().toISOString() });
         db.createAsyncTask(taskId, body.task);
@@ -1358,7 +1361,12 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const result = await doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null, body.fallback_scope);
-      sendJSON(res, 200, result);
+      if (result && result.error) {
+        const code = result.code || 'invalid_request';
+        sendJSON(res, DISPATCH_ERROR_HTTP[code] || 400, { error: result.error, code });
+      } else {
+        sendJSON(res, 200, result);
+      }
       return;
     }
 
