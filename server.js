@@ -33,6 +33,7 @@ const workspaceManager = require('./workspace-manager');
 const db = require('./db');
 const observe = require('./observe');
 const { cleanupStaleTaskDirs } = require('./output-cleaner.js');
+const { USAGE_REPORT_SUFFIX, parseUsageReport } = require('./usage-reporter');
 
 // ── 配置(集中管理,不再分散硬编码) ──
 // 解析正整数 env:非数字/0/负数一律回退默认值
@@ -530,10 +531,12 @@ async function executeTool (name, task, opts = {}) {
   const taskId = opts.taskId || `${executionName}_${Date.now()}`;
   const startTime = Date.now();
 
-  // 客户端工作区任务会把目录简报拼进任务文本,流量记录记实际下发的载荷
-  const outboundTask = (toolDef.type === 'client' && opts.workspace)
-    ? withWorkspaceBrief(task, opts.workspace.path)
-    : task;
+  // 客户端工作区任务会把目录简报拼进任务文本,流量记录记实际下发的载荷。
+  // T5 自报协议:仅 CLI 类型工具(type!=='client')追加用量自报后缀;
+  // 连接的客户端豁免——MCP sampling 已上报真实用量,追加后缀会污染对话。
+  const outboundTask = toolDef.type === 'client'
+    ? (opts.workspace ? withWorkspaceBrief(task, opts.workspace.path) : task)
+    : ((toolDef.type === 'client' && opts.workspace) ? withWorkspaceBrief(task, opts.workspace.path) : task) + USAGE_REPORT_SUFFIX;
 
   // 流量保真:exec 准入预检——未声明 exec 的客户端在 "'out' 流量记录" 之前就被拒绝,
   // 否则会把"注入过工作区简报但从未发出"的文本假如实入流量。
@@ -563,7 +566,7 @@ async function executeTool (name, task, opts = {}) {
       result = await executeClient(toolDef.clientKey || executionName, task, opts);
     } else {
       const tool = TOOLS.find(t => t.name === executionName);
-      result = await tool.execute(task, {
+      result = await tool.execute(outboundTask, {
         taskId,
         timeout: opts.timeout || tool.timeout || CONFIG.EXECUTE_TIMEOUT,
         workspaceDir: opts.workspace?.path,
@@ -591,6 +594,18 @@ async function executeTool (name, task, opts = {}) {
     throw execError;
   }
 
+  // T5 用量自报:CLI 结果末行 [USAGE] 剥离并转正式用量(优先于估算);client 豁免。
+  // 无效自报(如超阈值)也要剥离标记行;无标记时 content 原样,usage 缺失走既有 estimate 路径。
+  if (toolDef.type !== 'client') {
+    const reported = parseUsageReport(result.content || '');
+    if (reported.usage) {
+      result.content = reported.content;
+      result.usage = { input: reported.usage.input, output: reported.usage.output, reported: true };
+    } else {
+      result.content = reported.content;
+    }
+  }
+
   db.recordTraffic({
     ts: new Date().toISOString(),
     direction: 'in',
@@ -608,7 +623,7 @@ async function executeTool (name, task, opts = {}) {
   // 统一 token 统计:total 永远 = input + output
   const rawUsage = result.usage;
   const usage = rawUsage
-    ? { input: rawUsage.input || 0, output: rawUsage.output || 0, total: (rawUsage.input || 0) + (rawUsage.output || 0), estimated: rawUsage.estimated || false }
+    ? { input: rawUsage.input || 0, output: rawUsage.output || 0, total: (rawUsage.input || 0) + (rawUsage.output || 0), estimated: rawUsage.estimated || false, reported: rawUsage.reported || false }
     : { input: estimateTokens(task), output: estimateTokens(result.content), total: 0, estimated: true };
   usage.total = usage.input + usage.output;
   recordTokens(toolDef, usage, `${duration}s`);
