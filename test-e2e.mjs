@@ -454,7 +454,8 @@ async function main () {
   const emptyDisp = await req('POST', '/api/dispatch', { task: 'EMPTYOUT_MARK 这个任务宿主返回空输出', tools: [CLIENT], auto_fallback: false });
   check('空产出判为失败(successCount=0)', emptyDisp.body.successCount === 0, JSON.stringify(emptyDisp.body).slice(0, 200));
   check('失败原因是空产出', /空产出/.test(emptyDisp.body.results?.[0]?.reason || ''), JSON.stringify(emptyDisp.body.results?.[0] || {}).slice(0, 200));
-  const emptyFb = await req('POST', '/api/dispatch', { task: 'EMPTYOUT_MARK 应触发接力', tools: [CLIENT] });
+  // fallback_scope:'all' 显式保留"越白名单池回退"旧行为验证;默认(auto)已收紧为白名单内(见 test-external-fixes.mjs T1)
+  const emptyFb = await req('POST', '/api/dispatch', { task: 'EMPTYOUT_MARK 应触发接力', tools: [CLIENT], fallback_scope: 'all' });
   check('空产出后自动接力换工具成功', emptyFb.body.successCount === 1 && emptyFb.body.results?.[0]?.fallback === true, JSON.stringify(emptyFb.body.results?.[0] || {}).slice(0, 220));
   check('接力目标为评审客户端', emptyFb.body.results?.[0]?.tool === REVIEWER, 'tool=' + emptyFb.body.results?.[0]?.tool);
 

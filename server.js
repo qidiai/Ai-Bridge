@@ -676,12 +676,14 @@ async function executeClient (clientName, task, opts = {}) {
   });
 }
 
-async function doDispatch (task, toolNames, autoFallback = true, context = '', withReview = false, reviewerPref = null, workspaceRef = null) {
+async function doDispatch (task, toolNames, autoFallback = true, context = '', withReview = false, reviewerPref = null, workspaceRef = null, fallbackScope = 'auto') {
   // 入参校验
   if (!task || typeof task !== 'string') return { error: '缺少 task 参数' };
   if (task.length > CONFIG.MAX_TASK_LENGTH) return { error: `任务描述过长(>${CONFIG.MAX_TASK_LENGTH}字符)` };
   // tools 入参硬化:非数组一律视为未指定(回退全量可用工具),防畸形入参 crash
   if (toolNames != null && !Array.isArray(toolNames)) toolNames = null;
+  // fallback_scope 归一化:非 'all'/'none' 的一切值(含 undefined/非法值)按 'auto'
+  fallbackScope = ['all', 'none'].includes(fallbackScope) ? fallbackScope : 'auto';
 
   // 工作区前置校验:不存在/已归档/目录缺失直接返回明确错误,不占用并发额度
   let workspace = null;
@@ -799,7 +801,12 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
 
     const fallbackLog = [];
     const usedFallback = new Set(); // 防止同一个接力工具被多个失败目标重复占用
-    if (autoFallback) {
+    if (autoFallback && fallbackScope !== 'none') {
+      // 接力作用域:'auto'+显式白名单时,接力候选仅限白名单内(白名单意图优先,防越权烧配额);
+      // 'all' 或未指定 tools(自动路由)时维持现有全池行为
+      const explicitWhitelist = (toolNames || []).length > 0;
+      const scopeAll = fallbackScope === 'all' || !explicitWhitelist;
+      const scopePool = scopeAll ? dispatchableTools : dispatchableTools.filter(t => targets.includes(t.name));
       for (let i = 0; i < rawResults.length; i++) {
         const r = rawResults[i];
         if (r.status !== 'fulfilled' || !r.value.failed) continue;
@@ -811,7 +818,11 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
           continue;
         }
         // 接力链:依次尝试所有未用过的可用工具,直到有一个真正成功(而非只试第一个)
-        const untried = dispatchableTools.filter(t => !targets.includes(t.name) && isToolEnabled(t) && !usedFallback.has(t.name) && !coolingToolIds.has(t.id)).map(t => t.name);
+        const untried = scopePool.filter(t => !targets.includes(t.name) && isToolEnabled(t) && !usedFallback.has(t.name) && !coolingToolIds.has(t.id)).map(t => t.name);
+        if (!scopeAll && untried.length === 0) {
+          // 白名单目标均已尝试过,接力被作用域抑制 → 留痕,不静默烧白名单外配额
+          fallbackLog.push({ from: failed.tool, suppressed: true, skipped: 'fallback_scope=auto 时接力仅限显式白名单内(白名单候选已用尽)' });
+        }
         const handoffPrompt = `以下是之前另一个 AI 工具写到一半的代码(工具突然限额/断开),请在此基础上继续完成。\n\n## 任务\n${effectiveTask}\n\n## 已有代码(可能不完整)\n\`\`\`\n${failed.partialCode || '(无可用代码,请从头开始)'}\n\`\`\`\n\n请输出完整的最终代码。`;
         for (const fb of untried) {
           usedFallback.add(fb);
@@ -1333,7 +1344,7 @@ const server = http.createServer(async (req, res) => {
         const taskId = `atask_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
         rememberAsyncTask(taskId, { status: 'running', result: null, ts: new Date().toISOString() });
         db.createAsyncTask(taskId, body.task);
-        doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null)
+        doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null, body.fallback_scope)
           .then(r => {
             const status = r.error ? 'failed' : 'done';
             rememberAsyncTask(taskId, { status, result: r, ts: new Date().toISOString() });
@@ -1346,7 +1357,7 @@ const server = http.createServer(async (req, res) => {
         sendJSON(res, 202, { taskId, status: 'running', message: '任务已入队,用 GET /api/task/' + taskId + ' 查询结果' });
         return;
       }
-      const result = await doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null);
+      const result = await doDispatch(body.task, body.tools, body.auto_fallback !== false, body.context, body.review === true, body.reviewer || null, body.workspace || null, body.fallback_scope);
       sendJSON(res, 200, result);
       return;
     }
