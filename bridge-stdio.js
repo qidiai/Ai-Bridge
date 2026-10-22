@@ -238,7 +238,7 @@ function httpGet (path) {
   return new Promise((resolve, reject) => {
     const headers = {};
     if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;
-    http.get({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, timeout: 30000, headers }, res => {
+    const rq = http.get({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, timeout: 30000, headers }, res => {
       let d = '';
       res.on('data', c => d += c);
       res.on('end', () => {
@@ -254,7 +254,10 @@ function httpGet (path) {
         err.body = parsedOk ? parsed : null;
         reject(err);
       });
-    }).on('error', e => reject(new Error(`无法连接服务: ${e.message}`)));
+    });
+    // 与 httpPost 同形:Node 的 timeout 选项只发 'timeout' 事件,不监听就永久悬空
+    rq.on('timeout', () => { rq.destroy(); reject(new Error('请求超时')); });
+    rq.on('error', e => reject(new Error(`无法连接服务: ${e.message}`)));
   });
 }
 

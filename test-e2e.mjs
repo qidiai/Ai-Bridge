@@ -617,6 +617,8 @@ async function main () {
   check('#38a GET 挂起须自行超时并降级 isError(而非永久悬空/靠宿主超时)',
     holeErr === null && holeResp && holeResp.result && holeResp.result.isError === true && /超时/.test(holeText) && holeMs < 55000,
     holeErr ? ('harness ' + holeErr + ' / 用时=' + holeMs + 'ms') : JSON.stringify({ isError: holeResp.result.isError, text: holeText.substring(0, 80), ms: holeMs }));
+  // 耗时无条件打印:绿跑也要能取证(修复前是 60015ms 宿主超时,修复后应约 30000ms 自行回话)
+  process.stdout.write(`  ⏱ #38a 实测耗时=${holeMs}ms 黑洞命中=${holeHits} ${holeErr ? '宿主超时' : '桥自行回话'}\n`);
   check('#38b 黑洞确实收到 GET(证明是响应挂起,不是连不上)', holeHits > 0, 'hits=' + holeHits);
   check('#38c 超时后桥进程仍存活(不得因挂起请求崩溃)', holeProc.exitCode === null, 'exitCode=' + holeProc.exitCode);
   try { holeProc.stdin.end(); holeProc.kill(); } catch { /* ignore */ }
