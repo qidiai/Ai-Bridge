@@ -208,6 +208,34 @@ section('F) 超时预算关系锁(#53/#48)');
     anchor >= 0 && /Promise\s*\.\s*race\s*\(/.test(body), `bodyLength=${body.length} 命中 Promise.race=${/Promise\s*\.\s*race\s*\(/.test(body)}`);
 }
 
+// ── G) 任务态写入禁止整体替换对象(#41 结构守卫,指挥官亲笔,编码手禁改) ──
+// 背景:executeClient 入队(server.js:684)与 /api/poll 取任务(:1711/:1736)、/api/result 回写(:1760)
+//   四处都用 `connectedClients.set(key, { ...存活对象, 改动字段 })` 整体替换。危险在于 spread 取的是
+//   **局部变量的快照**:若期间另一条路径(超时清理 :672-679 就是就地 mutate 同一对象)已经改过真身,
+//   整体替换会把被清空的 pendingTask/被释放的 _busy "复活"成旧值——任务态错乱、租约误占用。
+//   真模型审计把并发窗口评为"窄",我复算后同意(单线程事件循环下检查与写入之间无 await),
+//   短期造不出稳定红用例,因此本单从"红基线修复"降级为**静态结构守卫**:禁止整体替换 + 就地写必须保留
+//   原有语义字段(防"为了过锁把清理逻辑删了")。并发正确性由 #55 北极星端到端兜。
+//   阈值全部来自规格逐条推导,不是拍脑袋:
+//     pendingTask 就地赋值 ≥4 = 入队(1)+poll(2)+超时清理(1,:673 已有)
+//     taskPending ≥3 = poll(2)+result(1);_busy ≥2 = 超时清理(1)+result(1);lastSeen ≥2 = register(1)+result(1)
+section('G) 任务态 map 禁止整体替换(#41)');
+{
+  const src = fs.readFileSync('./server.js', 'utf-8');
+  const wholeReplace = src.match(/connectedClients\.set\([^,)]+,\s*\{\s*\.\.\./g) || [];
+  check('G1 不得用 spread 整体替换存活客户端(局部快照会复活已被清空的字段)',
+    wholeReplace.length === 0, `命中 ${wholeReplace.length} 处: ` + wholeReplace.map(s => s.replace(/\s+/g, ' ').substring(0, 46)).join(' | '));
+  const cnt = (re) => (src.match(re) || []).length;
+  const nPT = cnt(/\w+\.pendingTask\s*=\s*[^=]/g);
+  const nTP = cnt(/\w+\.taskPending\s*=\s*[^=]/g);
+  const nBusy = cnt(/\w+\._busy\s*=\s*[^=]/g);
+  const nSeen = cnt(/\w+\.lastSeen\s*=\s*[^=]/g);
+  check('G2a 入队/poll/超时清理四处都必须就地写 pendingTask(≥4)', nPT >= 4, `实测=${nPT} 要求>=4`);
+  check('G2b /api/result 与 poll 必须就地写 taskPending(≥3)', nTP >= 3, `实测=${nTP} 要求>=3`);
+  check('G2c 超时清理与 /api/result 必须就地释放 _busy(≥2,否则客户端永久 busy)', nBusy >= 2, `实测=${nBusy} 要求>=2`);
+  check('G2d /api/result 必须就地刷新 lastSeen(≥2,否则回写后被判 stale)', nSeen >= 2, `实测=${nSeen} 要求>=2`);
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');
