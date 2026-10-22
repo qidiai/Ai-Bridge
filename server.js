@@ -2691,10 +2691,15 @@ setInterval(() => {
 // ── 全局库:启动时标记重启前遗留的孤儿异步任务(执行进度已丢,不谎报 running) ──
 const orphanedTasks = db.markOrphanTasks();
 if (orphanedTasks > 0) log('warn', `启动时标记 ${orphanedTasks} 个孤儿异步任务(中枢重启导致执行中断)`);
-const sweptMeetings = store.markOrphanMeetings();
-if (sweptMeetings.length > 0) {
-  sweptMeetings.forEach(m => db.recordMeeting(m)); // 终态写穿全局库,与人工中断路径(server.js:2274)同形
-  log('warn', `启动时清扫 ${sweptMeetings.length} 个孤儿会议(中枢重启导致讨论中断,已标记 interrupted 并释放并发闸门额度)`);
+try {
+  const sweptMeetings = store.markOrphanMeetings();
+  if (sweptMeetings.length > 0) {
+    sweptMeetings.forEach(m => db.recordMeeting(m)); // 终态写穿全局库,与人工中断路径同形
+    log('warn', `启动时清扫 ${sweptMeetings.length} 个孤儿会议(中枢重启导致讨论中断,已标记 interrupted 并释放并发闸门额度)`);
+  }
+} catch (e) {
+  // 启动期任何数据异常都不得阻止进程起来:崩溃遗留会触发 watchdog 重启至熔断=整体不可用
+  log('error', `启动清扫孤儿会议异常已忽略(不影响中枢启动): ${e.message}`);
 }
 if (db.available) console.log(`[ai-bridge] 全局库已就绪: ${db.dbPath}`);
 else console.warn(`[ai-bridge] ⚠️ 全局库不可用(不影响主链路): ${db.stats().lastError || 'unknown'}`);

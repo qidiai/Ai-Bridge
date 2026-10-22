@@ -318,6 +318,12 @@ function closeMeeting (meetingId, summary) {
 // 字段形状与人工中断路径(server.js /api/discuss/interrupt)逐字段一致,不改 closedAt/summary/messages。
 function markOrphanMeetings () {
   const mem = loadMemory();
+  // 形状非法与解析失败同口径处理:保全坏文件、本进程拒绝覆写,绝不抛错——
+  // 启动期数据异常只能降级功能,不能阻止进程起来(#52:该函数在 server.js 顶层启动序列被调用)
+  if (!Array.isArray(mem.meetings)) {
+    quarantine('memory', 'meetings 字段形状非法(须为数组)');
+    return [];
+  }
   const swept = [];
   (mem.meetings || []).forEach(m => {
     if (m.status === 'discussing' || m.status === 'active' || m.status === 'implementing') {
