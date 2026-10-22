@@ -161,6 +161,53 @@ section('E) no_targets 归因不得撒谎(#50 R1)');
     `gatesOnWorkspace=${gatesOnWorkspace} | ${execLines.map(l => l.trim()).join(' | ').substring(0, 200)}`);
 }
 
+// ── F) 超时预算关系锁(#53/#48,指挥官亲笔,编码手禁改) ──
+// 根因是**数值关系**而非文案:桥的 HTTP 上限(600000)比中枢的单次执行窗口(900000)还短,
+// 长任务必然先被桥侧判"请求超时",而中枢仍在执行——误报失败并写脏台账。GET 又比 POST 短一截
+// 且硬编码不可传参。这里锁"预算必须包住窗口并留余量 + GET/POST 同源 + callTool 有总超时",
+// 数值全部回源解析,不写死数字常量当答案(改窗口时锁会跟着动)。
+section('F) 超时预算关系锁(#53/#48)');
+{
+  const srv = fs.readFileSync('./server.js', 'utf-8');
+  const br = fs.readFileSync('./bridge-stdio.js', 'utf-8');
+  const sm = srv.match(/EXECUTE_TIMEOUT:\s*parseInt\([^)]*\)\s*\|\|\s*(\d+)/);
+  const S = sm ? Number(sm[1]) : NaN;
+  check('F0 能解析中枢单次执行窗口(server.js CONFIG.EXECUTE_TIMEOUT 兜底值)', Number.isFinite(S) && S > 0, `S=${S}`);
+  // 数值解析器:默认值可以写字面量,也可以写共享常量标识符(鼓励后者:GET/POST/总超时同源)
+  const resolveDefault = (expr) => {
+    if (/^\d+$/.test(expr)) return Number(expr);
+    const m2 = br.match(new RegExp('(?:const|let|var)\\s+' + expr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*=\\s*[^;]*?\\|\\|\\s*(\\d+)'));
+    return m2 ? Number(m2[1]) : NaN;
+  };
+  const pm = br.match(/function\s+httpPost\s*\([^)]*?timeoutMs\s*=\s*(\d+|[A-Za-z_$][\w$]*)/);
+  const B = pm ? resolveDefault(pm[1]) : NaN;
+  check('F1 桥的 POST 上限必须 ≥ 中枢窗口 + 30000 余量(否则长任务被桥侧误报失败)',
+    Number.isFinite(B) && B >= S + 30000, `POST=${B} 窗口=${S} 要求>=${S + 30000}`);
+  const gm = br.match(/function\s+httpGet\s*\(([^)]*)\)/);
+  check('F2 httpGet 必须形参化超时(消除 GET 硬编码 30000 与 POST 的语义不对称)',
+    !!gm && /timeoutMs/.test(gm[1]), gm ? `签名=(${gm[1].trim()})` : '未匹配到 httpGet 签名');
+  // F3:env 必须被读取且**同步类预算**的兜底值要包住中枢窗口。
+  //   注意取 matchAll 的最大值而不是首个:GET 允许有独立的短兜底(poll 快速失败是自愈路径的关键,
+  //   若把 GET 默认也抬到 960s,#38a 的黑洞测试会从 30010ms 变成永久悬空 → 制造回归)。
+  const ems = [...br.matchAll(/AI_BRIDGE_HTTP_TIMEOUT[^)\n]*\)?\s*\|\|\s*(\d+)/g)].map(m => Number(m[1]));
+  const BMAX = ems.length ? Math.max(...ems) : NaN;
+  check('F3 预算必须可用 AI_BRIDGE_HTTP_TIMEOUT 配置,且同步类兜底值同样包住中枢窗口(GET 可另设更短兜底)',
+    ems.length > 0 && BMAX >= S + 30000, ems.length ? `候选兜底=[${ems.join(',')}] 取最大=${BMAX} 窗口=${S}` : '桥侧未读取 AI_BRIDGE_HTTP_TIMEOUT');
+  // callTool 体内必须有总超时(串行多次 HTTP 的累加时间也要被包住)
+  const anchor = br.indexOf('async function callTool (');
+  let body = '';
+  if (anchor >= 0) {
+    let depth = 0, i = br.indexOf('{', anchor);
+    for (; i < br.length; i++) {
+      if (br[i] === '{') depth++;
+      else if (br[i] === '}') { depth--; if (depth === 0) { i++; break; } }
+    }
+    body = br.slice(anchor, i);
+  }
+  check('F4 callTool 必须有总超时包装(单次工具调用的累加耗时不得无界)',
+    anchor >= 0 && /Promise\s*\.\s*race\s*\(/.test(body), `bodyLength=${body.length} 命中 Promise.race=${/Promise\s*\.\s*race\s*\(/.test(body)}`);
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');

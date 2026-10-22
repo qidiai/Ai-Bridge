@@ -720,6 +720,60 @@ async function main () {
   try { holeProc.stdin.end(); holeProc.kill(); } catch { /* ignore */ }
   await new Promise(r => holeSrv.close(r));
 
+  // 9.9) HTTP 超时预算必须统一且可配(#53/#48 指定红集)
+  //   实况:服务端单次执行窗口 EXECUTE_TIMEOUT=900000(server.js:47),而桥的 httpPost 默认上限
+  //   只有 600000(bridge-stdio.js:210)且 /api/dispatch(:274)吃的就是这个默认值 → 长任务在桥侧
+  //   比中枢早 300s 被判"请求超时",中枢其实还在正常执行(误报失败 + 台账脏数据)。
+  //   同时 httpGet 的 30000ms 是硬编码字面量且无参(:242/:246),POST 能给预算、GET 不能,
+  //   两条路径语义不对称,且都无法被使用者调整(只有一个 AI_BRIDGE_SAMPLING_TIMEOUT 管反向 sampling)。
+  //   契约:一个 AI_BRIDGE_HTTP_TIMEOUT 同时管住 GET/POST 与 callTool 总超时;默认值必须高于
+  //   服务端窗口且留余量(静态关系锁见 test-audit-fixes 段 F)。
+  //   做法:黑洞端口 9815 只接连接不回包,并带 20s 泄压阀(强制销毁 socket)——修复前 POST 会等
+  //   600s、GET 会等 30s,红跑分别以 ~20s(连接被毁)与 ~30s(自行超时)返回,不会挂住整个套件;
+  //   修复后两者都应在 1.5s 预算内自行回 isError。
+  section('HTTP 超时预算统一:#53/#48 红集');
+  const HOLE2_PORT = 9815;
+  let hole2Hits = 0;
+  const hole2Srv = http.createServer(() => { hole2Hits++; /* 故意永不 res.end() */ });
+  const hole2Socks = new Set();
+  hole2Srv.on('connection', (s) => { hole2Socks.add(s); s.on('close', () => hole2Socks.delete(s)); });
+  await new Promise(r => hole2Srv.listen(HOLE2_PORT, HOST, r));
+  // 泄压阀周期触发:修复前 POST 默认 600000ms、GET 硬编码 30000ms,若不放阀红跑会被宿主 RPC 超时(60s)
+  // 兜住并拖慢套件;每 20s 主动断连,让红跑在 ~20s 定性返回(断言阈值 8s,仍判红)。
+  const valve = setInterval(() => { for (const s of hole2Socks) { try { s.destroy(); } catch { /* ignore */ } } }, 20000);
+  const hole2Proc = spawn(process.execPath, ['bridge-stdio.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(HOLE2_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-httplimit', AI_BRIDGE_HTTP_TIMEOUT: '1500' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const hole2Mcp = makeMcpChannel(hole2Proc);
+  await hole2Mcp.request('initialize', {});
+  const callBudget = async (toolName, args) => {
+    const t = Date.now();
+    let resp = null, err = null;
+    try { resp = await hole2Mcp.request('tools/call', { name: toolName, arguments: args }); } catch (e) { err = e.message; }
+    const ms = Date.now() - t;
+    const text = ((resp && resp.result && resp.result.content) || []).map(c => c.text || '').join('\n');
+    return { ms, err, isError: !!(resp && resp.result && resp.result.isError), text };
+  };
+  // GET 先测:修复前是 30000ms 硬编码(env 无效),必然 >8000ms
+  const g = await callBudget('list_tools', {});
+  process.stdout.write(`  ⏱ #53a GET(list_tools) 实测耗时=${g.ms}ms 黑洞命中=${hole2Hits} ${g.err ? '宿主超时' : '桥自行回话:' + g.text.substring(0, 40)}\n`);
+  check('#53a GET 必须吃 AI_BRIDGE_HTTP_TIMEOUT 预算(修复前硬编码 30000ms,env 完全无效)',
+    g.err === null && g.isError === true && /请求超时/.test(g.text) && g.ms < 8000, JSON.stringify({ ms: g.ms, err: g.err, text: g.text.substring(0, 60) }));
+  // POST 再测:修复前默认 600000ms,被 20s 泄压阀打断 → 同样 >8000ms
+  const p = await callBudget('dispatch', { task: '#53 长任务预算复现(黑洞,不该等满中枢窗口)' });
+  process.stdout.write(`  ⏱ #48a POST(dispatch) 实测耗时=${p.ms}ms ${p.err ? '宿主超时' : '桥自行回话:' + p.text.substring(0, 40)}\n`);
+  check('#48a POST 必须与 GET 共用同一预算(修复前 600000ms,长任务在桥侧被中枢窗口之外误报失败)',
+    p.err === null && p.isError === true && /请求超时/.test(p.text) && p.ms < 8000, JSON.stringify({ ms: p.ms, err: p.err, text: p.text.substring(0, 60) }));
+  check('#53b 黑洞确实收到请求(证明是响应挂起,不是连不上)', hole2Hits > 0, 'hits=' + hole2Hits);
+  check('#53c 预算到期后桥进程仍存活(不得因挂起请求崩溃)', hole2Proc.exitCode === null, 'exitCode=' + hole2Proc.exitCode);
+  clearTimeout(valve);
+  try { hole2Proc.stdin.end(); hole2Proc.kill(); } catch { /* ignore */ }
+  // srv.close() 会等待在途连接结束;桥里可能还有未回的挂起请求,必须先强制断干净再关,否则整节卡住
+  for (const s of hole2Socks) { try { s.destroy(); } catch { /* ignore */ } }
+  await new Promise(r => hole2Srv.close(r));
+
   // 9.5) 智能路由:关闭全部本机 CLI 工具(确定性),未指定 tools 时按综合评分自动选优
   section('智能路由:未指定 tools 使用可解释综合评分');
   const allT = await req('GET', '/api/tools');
