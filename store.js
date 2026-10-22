@@ -313,6 +313,27 @@ function closeMeeting (meetingId, summary) {
   return saveSync('memory', mem);
 }
 
+// 启动清扫:中枢崩溃/被杀会让非终态会议永久残留,而并发闸门只按这三种状态计数,
+// 累积到 MAX_CONCURRENT_MEETINGS 就把 /api/discuss 的额度占死(整体死锁且难归因),故启动时必须释放。
+// 字段形状与人工中断路径(server.js /api/discuss/interrupt)逐字段一致,不改 closedAt/summary/messages。
+function markOrphanMeetings () {
+  const mem = loadMemory();
+  const swept = [];
+  (mem.meetings || []).forEach(m => {
+    if (m.status === 'discussing' || m.status === 'active' || m.status === 'implementing') {
+      m.interrupted = true;
+      m.interruptReason = '中枢重启导致执行中断(启动清扫)';
+      m.status = 'interrupted';
+      swept.push(m);
+    }
+  });
+  // 无孤儿不写盘:避免每次重启都无谓覆写 memory.json
+  if (swept.length > 0 && !saveSync('memory', mem)) {
+    appendLog('error', `启动清扫 ${swept.length} 个孤儿会议失败:memory.json 处于隔离状态,闸门额度未释放`);
+  }
+  return swept;
+}
+
 function recordTask (task) {
   const mem = loadMemory();
   mem.tasks.unshift({
@@ -475,6 +496,6 @@ module.exports = {
   appendLog, readLogs, clearLogs,
   appendTraffic, readTraffic, clearTraffic,
   loadMemory, recordTask, writeExperience, searchMemory, getToolStats, getToolObservations, getRecentTasks,
-  createMeeting, addMessage, getMeeting, getRecentMeetings, closeMeeting,
+  createMeeting, addMessage, getMeeting, getRecentMeetings, closeMeeting, markOrphanMeetings,
   loadACL, saveACL
 };
