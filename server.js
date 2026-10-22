@@ -503,6 +503,13 @@ function isEmptyOutput (result) {
   return !(result.content || '').trim() && (result.codeBlocks || []).length === 0;
 }
 
+// 真实 CLI 失败文案通常很短或以 Error:/错误: 开头;长文报告只是"谈论"失败,不该判失败
+const ERR_HEAD_RE = /^\s*(?:\x1b\[[0-9;]*m\s*)*(error|错误|fatal|exception|usage limit|insufficient|请求超时|无法连接)/i;
+function looksLikeError (raw) {
+  const t = (raw || '').trim();
+  return t.length <= 400 || ERR_HEAD_RE.test(t);
+}
+
 function isToolFailed (result, error) {
   if (error) return { failed: true, reason: error.message || String(error), partialCode: '' };
   const text = (result.content || '').toLowerCase();
@@ -511,10 +518,12 @@ function isToolFailed (result, error) {
     return { failed: true, reason: '空产出(进程正常退出但无输出,疑似额度耗尽/静默失败)', partialCode: '' };
   }
   const failKeywords = ['insufficient balance', '额度', '限额', 'rate limit', 'quota', 'exceeded', 'unauthorized', '402', '429', '401'];
-  if (result.codeBlocks.length === 0 && failKeywords.some(k => text.includes(k))) {
+  // 关键词命中须再加 looksLikeError 前置:审计/复盘类长文会引用 429、server.js:398-401 等字样,
+  // "谈论失败"不等于"失败",否则长文交付物会被误判销毁(#37 根因 1)。
+  if (result.codeBlocks.length === 0 && looksLikeError(result.content) && failKeywords.some(k => text.includes(k))) {
     return { failed: true, reason: text.substring(0, 200), partialCode: '' };
   }
-  if (result.codeBlocks.length > 0 && result.codeBlocks[0].code.length < 50 && failKeywords.some(k => text.includes(k))) {
+  if (result.codeBlocks.length > 0 && result.codeBlocks[0].code.length < 50 && looksLikeError(result.content) && failKeywords.some(k => text.includes(k))) {
     return { failed: true, reason: text.substring(0, 200), partialCode: result.codeBlocks[0].code };
   }
   return { failed: false };
@@ -606,13 +615,15 @@ async function executeTool (name, task, opts = {}) {
     }
   }
 
+  // 单一事实来源:入向流量的 success 由同一判定函数得出,与 dispatch 判定不再双账本背离(#37 根因 4)
+  const verdict = isToolFailed(result, null);
   db.recordTraffic({
     ts: new Date().toISOString(),
     direction: 'in',
     tool: toolDef.id,
     taskId,
     type: toolDef.type || 'cli',
-    success: true,
+    success: !verdict.failed,
     duration: ((Date.now() - startTime) / 1000).toFixed(1) + 's',
     content: result.content || '',
     codeBlocks: (result.codeBlocks || []).map(b => ({ language: b.language, code: b.code })),
@@ -874,7 +885,10 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
         results.push({ tool: r.value.tool || name, toolId: res.toolId, canonicalId: res.canonicalId, displayName: res.displayName, success: true, duration: res.duration, codeBlocks: res.codeBlocks, content: res.content.substring(0, CONFIG.RESULT_MAX_CHARS), tokens: res.tokens, fallback: r.value.fallback || false, fallbackFrom: r.value.fallbackFrom, fallbackTo: r.value.fallbackTo });
       } else if (r.status === 'fulfilled' && r.value.failed) {
         const failedTool = resolveToolReference(name, availableTools);
-        results.push({ tool: name, toolId: failedTool?.id || null, canonicalId: failedTool?.canonicalId || null, success: false, reason: r.value.reason });
+        // 失败不销毁交付物:异常分支(:816 那种)没有 result,保持只带 reason
+        const fr = r.value.result || null;
+        results.push({ tool: name, toolId: failedTool?.id || null, canonicalId: failedTool?.canonicalId || null, success: false, reason: r.value.reason,
+          ...(fr ? { content: (fr.content || '').substring(0, CONFIG.RESULT_MAX_CHARS), codeBlocks: fr.codeBlocks || [], duration: fr.duration, tokens: fr.tokens || null } : {}) });
       } else {
         const failedTool = resolveToolReference(name, availableTools);
         results.push({ tool: name, toolId: failedTool?.id || null, canonicalId: failedTool?.canonicalId || null, success: false, reason: r.reason?.message });

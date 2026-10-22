@@ -91,7 +91,7 @@ function makeMcpChannel (child) {
         // 含 ERRORTEXT_MARK 标记时返回短错误行(无代码块),真实额度/限流失败必须仍被判定失败
         // 仅"以标记开头"时空产出:接力 prompt 会内嵌原任务文本,避免标记传播到接力工具
         // 评审 prompt(含"你是代码评审专家")带 REVIEW_EMPTY_MARK 时同样回空文本,验证评审空产出判失败
-        const reportText = '审计报告(长文本,无代码块)。' + 'S1 鉴权只挡 /api/*,本机进程可零凭据经 /v1 触发工具执行并烧配额;S2 设 token 后 UI 全线 401;S3 闸门在崩溃遗留 3 个孤儿时永久 429;S4 双锁互不感知;S5 用量报表口径分叉,今日 tokens=0;S6 写被拒仍报 200 success:true;S7 先删文件后落盘;S8 形状错误的 JSON 仍被覆写。'.repeat(4) + '结论:以上均为静态阅读所得,置信度高。';
+        const reportText = '审计报告(长文本,无代码块)。' + 'S1 鉴权只挡 /api/*,本机进程可零凭据经 /v1 触发工具执行并烧配额;S2 设 token 后 UI 全线 401;S3 闸门在崩溃遗留 3 个孤儿时永久 429;S4 双锁互不感知;S5 用量报表口径分叉,今日 tokens=0;S6 写被拒仍报 200 success:true;S7 先删文件后落盘;S8 形状错误的 JSON 仍被覆写。'.repeat(7) + '结论:以上均为静态阅读所得,置信度高。';
         const text = (lastSamplingTask.trimStart().startsWith('EMPTYOUT_MARK')
           || (lastSamplingTask.includes('你是代码评审专家') && lastSamplingTask.includes('REVIEW_EMPTY_MARK')))
           ? ''
