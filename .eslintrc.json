@@ -25,7 +25,7 @@
       }
     }
   ],
-  // 一次性脚本/安装器/历史散落脚本不入护栏；生产模块与四套正式测试必须入内
+  // 只排除目录/备份产物与一次性脚本入口 ocr.py；历史散落脚本已于 D2-d 全部纳入护栏(实测 0 error)
   "ignorePatterns": [
     "node_modules/",
     "test-runtime-data/",
@@ -33,19 +33,6 @@
     "workspaces/",
     "*.bak-*",
     "*.bak",
-    "check-active.js",
-    "cleanup-stuck.js",
-    "install-service.js",
-    "install-service-nodewin.js",
-    "uninstall-service-nodewin.js",
-    "qidi-sync.js",
-    "test-audit.js",
-    "test-audit2.js",
-    "test-discuss.js",
-    "test-discuss-impl.js",
-    "test-full.js",
-    "test-http.js",
-    "test-run.js",
     "ocr.py"
   ],
   "rules": {

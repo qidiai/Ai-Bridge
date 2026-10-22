@@ -222,7 +222,7 @@ function httpPost (path, body, timeoutMs = 600000) {
           if (parsedOk) resolve(parsed); else reject(new Error('服务返回格式错误'));
           return;
         }
-        const err = new Error((parsedOk && parsed.error) || ('HTTP ' + res.statusCode));
+        const err = new Error((parsedOk && (parsed.error || parsed.message)) || ('HTTP ' + res.statusCode));
         err.status = res.statusCode;
         err.body = parsedOk ? parsed : null;
         reject(err);
@@ -249,7 +249,7 @@ function httpGet (path) {
           if (parsedOk) resolve(parsed); else reject(new Error('格式错误'));
           return;
         }
-        const err = new Error((parsedOk && parsed.error) || ('HTTP ' + res.statusCode));
+        const err = new Error((parsedOk && (parsed.error || parsed.message)) || ('HTTP ' + res.statusCode));
         err.status = res.statusCode;
         err.body = parsedOk ? parsed : null;
         reject(err);
@@ -415,14 +415,27 @@ async function callTool (name, args) {
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
     if (action === 'interrupt') {
-      const r = await httpPost('/api/discuss/interrupt', args);
+      const meetingId = args.meetingId || args.meeting_id;
+      if (!meetingId) return { content: [{ type: 'text', text: '缺少 meetingId(action=interrupt 时必填)' }], isError: true };
+      // 剥离 MCP 路由字段 action,业务请求体只带归一后的 meetingId(兼容 meeting_id 回退)及 reason 等
+      const body = Object.assign({}, args);
+      delete body.action;
+      delete body.meeting_id;
+      body.meetingId = meetingId;
+      const r = await httpPost('/api/discuss/interrupt', body);
       if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
       return { content: [{ type: 'text', text: `🛑 会议 ${r.meetingId} 已中断: ${r.reason}` }] };
     }
     // action === 'inject'
-    if (!args.meetingId && !args.meeting_id) return { content: [{ type: 'text', text: '缺少 meetingId(action=inject 时必填)' }], isError: true };
+    const meetingId = args.meetingId || args.meeting_id;
+    if (!meetingId) return { content: [{ type: 'text', text: '缺少 meetingId(action=inject 时必填)' }], isError: true };
     if (!args.message) return { content: [{ type: 'text', text: '缺少 message(action=inject 时必填)' }], isError: true };
-    const r = await httpPost('/api/discuss/inject', args);
+    // 剥离 MCP 路由字段 action,业务请求体只带归一后的 meetingId(兼容 meeting_id 回退)及 message 等
+    const body = Object.assign({}, args);
+    delete body.action;
+    delete body.meeting_id;
+    body.meetingId = meetingId;
+    const r = await httpPost('/api/discuss/inject', body);
     if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
     return { content: [{ type: 'text', text: `✅ 已向会议 ${r.meetingId} 注入主持人消息` }] };
   }
