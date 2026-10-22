@@ -1,20 +1,30 @@
 {
-  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。T-D2 已合并(本提交):9.4 指定红集 4 项(X1a/X1b/X3a/X3b)清零,X2/X4a/X4b 回归防护保持绿;五套件实测 151/41/36/45/24=297 全绿(指挥官亲跑)。护栏盲区消除:13 个历史脚本入网后仍 0 error/18 warning。E2-ci 独立工作流已入库(64ad157),尚未在真实 runner 实跑,首跑若红按 bug 处理、不关门禁。",
-  "updated": "2026-10-22 (T-D2 合并后由指挥官重算)",
-  "head": "64ad157",
-  "hashes": {
+  "note": "两路方案审计裁决后的语义拆分:locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未在报告 TEST-CHANGED 段申报=测试作弊,直接 REJECT;source_faces=生产源码哈希,不是禁令,只是「本轮改动前后的对照基线」,由指挥官在每次合并提交后重算——源码该不该改由当轮规格书白名单决定(此前把源码哈希与'编码手禁改'混为一谈,导致 P1/P2/P3 需要改 .eslintrc.json/package.json/server.js 时与门禁条文自相矛盾)。本轮在途交付物=ai-bridge/store.js(P0 静默清库根治),白名单见派工单。",
+  "updated": "2026-10-22 (P0 前置红基线提交,由指挥官重算;语义拆分首次生效)",
+  "head": "83020d6",
+  "locked_tests": {
     "test-e2e.mjs": "a60c5a968a75999a89056a1b504d7865884f16ed",
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
+    "test-store-corrupt.mjs": "d16cee8975d12da81d1ad85e2456760a41e27625",
     "test-external-fixes.mjs": "be16cd3f50a5a17db5a340351902c4a7d29261c3",
-    "test-audit-fixes.mjs": "e625a0968f217a41e49d08eaf0d6d0f4a26d15d2",
-    "bridge-stdio.js": "0c147e0f770963ef2895330d0a52586a49b075ad",
+    "test-audit-fixes.mjs": "e625a0968f217a41e49d08eaf0d6d0f4a26d15d2"
+  },
+  "red_baseline": {
+    "test-store-corrupt.mjs": "7/20 通过,指定红集=13(备份产物/原始字节保全/写拒绝返回 false/拒绝期不落新文件/粘性三次全拒/switches 同规则/error 级留痕)",
+    "test-e2e.mjs": "151/151 全绿(T-D2 红集已清零),P0 交付后不得回退"
+  },
+  "source_faces": {
+    "store.js": "eae74be53ecdbf69a3633078a0dc0b76f5d31478",
     "server.js": "f4232a912e88ef05cec6b7ba19913d213c5fc4b5",
+    "db.js": "1e2374cebcae2a8e0dcebce00a81ffa54424cc15",
+    "workspace-manager.js": "dfa3f24d0ae49cd03c85413ce27bea3adab5e571",
+    "bridge-stdio.js": "0c147e0f770963ef2895330d0a52586a49b075ad",
     "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
     "adapters/cli-adapter.js": "a16b99df63c7a29e42c8c4ea453a9d62d0e47e39",
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
     ".eslintrc.json": "f8735f334ba169e9af9a9efe0fb3773c3d58a549",
-    "package.json": "7348ac4b8d1f4212142e323a36979485340982fa",
+    "package.json": "b860aaee2d698b6b76d1117f0d4d87e3ea1ebe92",
     "README.md": "e1ac9b69bde8c8118f86cba296a4870e86947486",
     "ARCHITECTURE.md": "4a9a107986fd2d507a381b028df82a217873672d"
   }
