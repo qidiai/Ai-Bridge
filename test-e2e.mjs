@@ -241,6 +241,39 @@ async function main () {
   const orphanAfter = (memAfterSweep.meetings || []).find(m => m.id === 'orphan-1') || {};
   check('#39e 清扫结果已落盘(不是只在内存里改)', orphanAfter.status === 'interrupted', JSON.stringify(orphanAfter).substring(0, 180));
 
+  // 1.6) 第二实例真启动探针(#52 指定红集):预置"合法 JSON 但形状错"的 memory.json
+  //   (meetings 为对象)后启动一个独立中枢进程。现状(修复前):markOrphanMeetings 在顶层启动序列
+  //   抛 TypeError 且调用点无 try(server.js:2694)→ 进程起不来 → watchdog 会重启至熔断=整体不可用。
+  //   要求:坏形状数据只能让功能降级,绝不能阻止进程启动。
+  section('坏形状数据不得阻止中枢启动:#52 红集(第二实例)');
+  const BOOT_PORT = 9821;
+  const bootDir = path.join(TEST_RUNTIME, 'boot-probe');
+  const bootMem = { tasks: [], experiences: [], preferences: {}, meetings: { bad: { status: 'discussing' } } };
+  fs.mkdirSync(bootDir, { recursive: true });
+  fs.writeFileSync(path.join(bootDir, 'memory.json'), JSON.stringify(bootMem), 'utf-8');
+  const bootProc = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(BOOT_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_DATA_DIR: bootDir, AI_BRIDGE_DB: path.join(bootDir, 'probe.db'), AI_BRIDGE_OBSERVE_DIR: path.join(bootDir, 'observe'), AI_BRIDGE_WORKSPACE_ROOT: path.join(bootDir, 'ws'), AI_BRIDGE_TOKEN: '' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  let bootOut = '';
+  bootProc.stderr.on('data', d => { bootOut += d.toString(); });
+  bootProc.stdout.on('data', d => { bootOut += d.toString(); });
+  await sleep(2000);
+  let bootHealth = null;
+  try {
+    bootHealth = await new Promise((resolve, reject) => {
+      const r = http.request({ hostname: HOST, port: BOOT_PORT, path: '/api/health', method: 'GET', timeout: 4000 }, res => {
+        let s = ''; res.on('data', c => s += c); res.on('end', () => { try { resolve(JSON.parse(s)); } catch (e) { resolve({ raw: s.substring(0, 80) }); } });
+      });
+      r.on('error', reject); r.on('timeout', () => { r.destroy(); reject(new Error('health timeout')); }); r.end();
+    });
+  } catch (e) { bootHealth = { err: e.message }; }
+  check('#52b1 预置畸形 memory.json 后中枢仍能启动并响应 /api/health', bootHealth && bootHealth.status === 'ok', JSON.stringify(bootHealth).substring(0, 120) + ' | stderr=' + bootOut.substring(0, 160));
+  check('#52b2 启动进程未崩溃(仍在运行)', bootProc.exitCode === null, 'exitCode=' + bootProc.exitCode);
+  try { bootProc.kill(); } catch { /* ignore */ }
+  await sleep(400);
+
   // 2) 准入管理全流程(HTTP 直连中枢)
   section('准入控制:陌生客户端 → 待审批 → 批准 → 踢出');
   const reg = await req('POST', '/api/client/register', { name: 'e2e-stranger' });

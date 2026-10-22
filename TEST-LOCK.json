@@ -1,18 +1,16 @@
 {
-  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定。#39 已合并:store.markOrphanMeetings + server 启动调用(2680-2684)写穿 db.recordMeeting。派工铁律新增:临时探针脚本禁止 require 业务模块去碰真实数据,必须显式设 AI_BRIDGE_DATA_DIR 到临时目录并在首行断言该变量存在(源于 #39 编码手越界写生产 memory.json 的申报事故,无损但记劣迹一次)。",
-  "updated": "2026-10-23 (#37 合并后由指挥官重算)",
-  "head": "484f112",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定。#52 在途交付物=store.js(markOrphanMeetings 形状守卫+按 #44 口径隔离)+server.js(顶层启动调用包 try/catch,启动期数据异常绝不得阻止进程起来)。",
+  "updated": "2026-10-23 (#52 前置红基线,由指挥官重算)",
+  "head": "4094d20",
   "locked_tests": {
-    "test-e2e.mjs": "3ae146df9897a145236164b87a24b952e42b63a3",
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
-    "test-store-corrupt.mjs": "d16cee8975d12da81d1ad85e2456760a41e27625",
     "test-external-fixes.mjs": "be16cd3f50a5a17db5a340351902c4a7d29261c3",
     "test-audit-fixes.mjs": "e625a0968f217a41e49d08eaf0d6d0f4a26d15d2"
   },
   "red_baseline": {
-    "test-store-corrupt.mjs": "20/20 通过(P0 红集 13 已清零):C1 备份保全/C2 拒绝覆写回传 false/C3 error 留痕/C4 不抛错/C5 重启恢复/C6 正常路径无副作用",
-    "test-e2e.mjs": "164/164 全绿:#37a/#37b/#37d/#37e 红集清零,#37c 防放水回归保持绿。注:#37b 首轮不可达系指挥官写的 harness 数据(742字)与阈值(>800)不匹配,编码手按铁律停手未改锁定文件,由指挥官改 .repeat(4)→.repeat(7)=1273字并声明 TEST-CHANGED(改方为指挥官)"
+    "test-store-corrupt.mjs": "20/23:新增 #52a1/a2/a3 红(启动清扫遇 meetings=对象 抛 TypeError、未保全、未拒写)",
+    "test-e2e.mjs": "164/166:新增 #52b1/b2 红(第二实例真启动:畸形 memory.json → ECONNREFUSED + exitCode=1,stderr 指向 store.js:322)"
   },
   "source_faces": {
     "store.js": "2161a4fc7e4ccf0957005f4c1eee94d87451c071",

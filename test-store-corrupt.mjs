@@ -64,6 +64,12 @@ if (scenario === 'normal') {
   const acl = store.loadACL();
   const wrote = store.saveACL({ allowlist: [], blocklist: [], pending: [] });
   out({ blocklistNow: acl.blocklist, allowlistNow: acl.allowlist, wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
+} else if (scenario === 'shapememory') {
+  // #52 回归场景:meetings 是合法 JSON 但形状错(对象)——启动清扫不得抛错
+  let threw = null, swept = null;
+  try { swept = store.markOrphanMeetings(); } catch (e) { threw = e.message; }
+  const wrote = store.saveSync('memory', { tasks: [] });
+  out({ threw, sweptLen: Array.isArray(swept) ? swept.length : -1, wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
 } else if (scenario === 'sticky') {
   store.loadMemory();
   const r = [store.saveSync('memory', { tasks: [] }), store.saveSync('memory', { tasks: [] }), store.saveSync('memory', { tasks: [] })];
@@ -129,6 +135,14 @@ check('拒绝期间不得写出新的 clients-acl.json', acl.parsed && !acl.pars
 section('C2 脏标志粘性:同进程内多次写全部拒绝');
 const sticky = runScenario('sticky', 'sticky', { 'memory.json': TRUNC_MEMORY });
 check('连续 3 次 saveSync 全部拒绝', sticky.parsed && sticky.parsed.r.every(x => x === false), sticky.parsed && sticky.parsed.r);
+
+section('#52 坏形状 meetings 不得让启动清扫抛错(指挥官回归修复)');
+const shape = runScenario('shape', 'shapememory', { 'memory.json': JSON.stringify({ tasks: [], experiences: [], preferences: {}, meetings: { bad: { status: 'discussing' } } }) });
+check('#52a1 markOrphanMeetings 遇 meetings=对象 不得抛错', shape.parsed && shape.parsed.threw === null, shape.parsed && shape.parsed.threw);
+check('#52a2 返回空清扫列表(跳过而非崩溃)', shape.parsed && shape.parsed.sweptLen === 0, shape.parsed && { sweptLen: shape.parsed.sweptLen });
+check('#52a3 形状异常同样按损坏保全(生成 .corrupt- 且拒绝覆写)',
+  shape.parsed && shape.parsed.wrote === false && corrupt(shape.parsed.dir).some(f => f.startsWith('memory.json.corrupt-')),
+  shape.parsed && shape.parsed.dir);
 
 section('C1/C2/C4 损坏 switches.json:开关状态不得被空对象持久化');
 const sw = runScenario('switches', 'switches', { 'switches.json': TRUNC_SWITCHES });
