@@ -310,17 +310,37 @@ function runCommand (cmd, args, opts = {}) {
     }
     child.stdin.end();
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (settled) return;
       settled = true;
       if (code === 0) {
         resolve(stdout);
-      } else {
-        const err = new Error(`Command exited with code ${code}: ${(stderr || stdout).substring(0, 200)}`);
-        err.code = code;
-        err.stdout = stdout;
-        reject(err);
+        return;
       }
+      // 计算真实生效的超时预算(不得写死数字,从 opts 链取)
+      const budgetMs = opts.timeout || 120000;
+      // 详情取尾部(真因几乎总在末尾),总长度有界防止巨量输出灌进台账行
+      const rawDetail = (stderr || stdout).trim();
+      const detail = rawDetail.length > 200
+        ? '...' + rawDetail.slice(-200)
+        : (rawDetail || '(无输出)');
+      let message;
+      if (code === null && signal) {
+        // 被信号终止(超时或被外部 kill):绝不出现 "code null" 无归因字面
+        message = `命令被信号 ${signal} 终止(超时预算 ${budgetMs}ms 用尽,或外部主动终止): ${detail}`;
+      } else if (signal) {
+        // 罕见:code 非 null 但 signal 也存在(Windows 少见) — 按非零退出处理,但带上 signal 信息
+        message = `Command exited with code ${code} (signal: ${signal}): ${detail}`;
+      } else {
+        // 正常非零退出
+        message = `Command exited with code ${code}: ${detail}`;
+      }
+      const err = new Error(message);
+      err.code = code;
+      err.signal = signal || null;
+      err.stdout = stdout;
+      err.timedOut = (code === null && !!signal);
+      reject(err);
     });
 
     child.on('error', (err) => {
