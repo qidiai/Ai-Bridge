@@ -590,6 +590,38 @@ async function main () {
     JSON.stringify((blockedView.body.clients || []).map(c => c.id)).substring(0, 200));
   try { blockedProc.stdin.end(); blockedProc.kill(); } catch { /* ignore */ }
 
+  // 9.6) GET 挂起必须自行超时(#38 指定红集)
+  //   根因:bridge-stdio.js 的 httpPost 在 :232 挂了 req.on('timeout') 并 destroy+reject,
+  //   而 httpGet(:241) 传了 timeout:30000 却**没有注册 timeout 监听**——Node 下无人监听 'timeout'
+  //   即不会自动销毁 socket,请求永久悬空;callTool 外层无总超时,宿主只能靠自己那条 60s RPC 超时,
+  //   桥侧 pending 与 socket 一直泄漏。两个手写 HTTP 封装的漂移就是"同一规则多处实现"的现场证据。
+  //   做法:黑洞服务器只接受连接、永不回包 → 修复前 GET 永悬(断言以桥是否在 55s 内回 isError 判红),
+  //   修复后约 30s 由 timeout 监听 destroy+reject → L2 统一降级 isError '桥调用失败: 请求超时'。
+  section('GET 挂起超时:#38 红集');
+  const HOLE_PORT = 9814;
+  let holeHits = 0;
+  const holeSrv = http.createServer((rq) => { holeHits++; /* 故意永不 res.end() */ });
+  await new Promise(r => holeSrv.listen(HOLE_PORT, HOST, r));
+  const holeProc = spawn(process.execPath, ['bridge-stdio.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(HOLE_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-hole' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const holeMcp = makeMcpChannel(holeProc);
+  await holeMcp.request('initialize', {});
+  const t0 = Date.now();
+  let holeResp = null, holeErr = null;
+  try { holeResp = await holeMcp.request('tools/call', { name: 'list_tools', arguments: {} }); } catch (e) { holeErr = e.message; }
+  const holeMs = Date.now() - t0;
+  const holeText = ((holeResp && holeResp.result && holeResp.result.content) || []).map(c => c.text || '').join('\n');
+  check('#38a GET 挂起须自行超时并降级 isError(而非永久悬空/靠宿主超时)',
+    holeErr === null && holeResp && holeResp.result && holeResp.result.isError === true && /超时/.test(holeText) && holeMs < 55000,
+    holeErr ? ('harness ' + holeErr + ' / 用时=' + holeMs + 'ms') : JSON.stringify({ isError: holeResp.result.isError, text: holeText.substring(0, 80), ms: holeMs }));
+  check('#38b 黑洞确实收到 GET(证明是响应挂起,不是连不上)', holeHits > 0, 'hits=' + holeHits);
+  check('#38c 超时后桥进程仍存活(不得因挂起请求崩溃)', holeProc.exitCode === null, 'exitCode=' + holeProc.exitCode);
+  try { holeProc.stdin.end(); holeProc.kill(); } catch { /* ignore */ }
+  await new Promise(r => holeSrv.close(r));
+
   // 9.5) 智能路由:关闭全部本机 CLI 工具(确定性),未指定 tools 时按综合评分自动选优
   section('智能路由:未指定 tools 使用可解释综合评分');
   const allT = await req('GET', '/api/tools');

@@ -1,9 +1,9 @@
 {
   "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定。#39 已合并:store.markOrphanMeetings + server 启动调用(2680-2684)写穿 db.recordMeeting。派工铁律新增:临时探针脚本禁止 require 业务模块去碰真实数据,必须显式设 AI_BRIDGE_DATA_DIR 到临时目录并在首行断言该变量存在(源于 #39 编码手越界写生产 memory.json 的申报事故,无损但记劣迹一次)。",
-  "updated": "2026-10-23 (#39 合并后由指挥官重算)",
-  "head": "a1ddb7d",
+  "updated": "2026-10-23 (#38 前置红基线,由指挥官重算)",
+  "head": "d5f852b",
   "locked_tests": {
-    "test-e2e.mjs": "4529e294727440e0251f2cedce26ecdd426ea5f3",
+    "test-e2e.mjs": "1127f91058b6f8b38b7ad723d0c0929a0e3fa30f",
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
     "test-store-corrupt.mjs": "d16cee8975d12da81d1ad85e2456760a41e27625",
@@ -12,7 +12,7 @@
   },
   "red_baseline": {
     "test-store-corrupt.mjs": "20/20 通过(P0 红集 13 已清零):C1 备份保全/C2 拒绝覆写回传 false/C3 error 留痕/C4 不抛错/C5 重启恢复/C6 正常路径无副作用",
-    "test-e2e.mjs": "156/156 全绿:#39a-#39e 红集清零,原级联项「双参与者讨论启动」恢复,主流程异常消失"
+    "test-e2e.mjs": "158/159:指定红集 #38a(GET 挂起须自行超时降级 isError,实测 harness mcp timeout 60015ms 即桥永久悬空);#38b 黑洞确实收到 GET、#38c 桥进程仍存活 交付即绿属回归防护。修复后预期 159/159"
   },
   "source_faces": {
     "store.js": "2161a4fc7e4ccf0957005f4c1eee94d87451c071",
