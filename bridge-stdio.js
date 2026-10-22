@@ -23,6 +23,11 @@ const CAP_EXEC = /^(1|true|yes|on)$/i.test(process.env.AI_BRIDGE_CAP_EXEC || '')
 let registeredClientId = CLIENT_NAME;
 let hostSupportsSampling = false;
 let hasRegistered = false;
+// 能力刷新脏标志:宿主 initialize 早于首注册回执到达时置位,首注册成功后补发一次刷新(能力不得永久丢失)
+let pendingCapRefresh = false;
+// 注册序号:毫秒基数×1000 + 进程内递增,保证"后决定的能力"序号严格更大且跨进程可比
+let _seqBase = Date.now() * 1000; let _seqN = 0;
+function nextRegisterSeq () { return _seqBase + (++_seqN); }
 
 const MCP_TOOLS = [
   {
@@ -648,8 +653,11 @@ async function handleMessage (msg) {
     hostSupportsSampling = !!params?.capabilities?.sampling;
     if (hasRegistered) {
       // 初始化通常晚于进程启动注册；能力一旦明确，立即幂等刷新到中枢。
-      httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC } })
+      httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC }, registerSeq: nextRegisterSeq() })
         .catch(() => {});
+    } else {
+      // initialize 常早于首注册回执到达:此时若直接丢弃,能力将永久停留在注册时的 false,子智能体再也拿不到执行资格
+      pendingCapRefresh = true;
     }
     result = { protocolVersion: '2024-11-05', capabilities: { tools: {}, sampling: {} }, serverInfo: { name: 'ai-bridge', version: '1.1.0' } };
     break;
@@ -742,7 +750,7 @@ async function registerWithRetry () {
     try {
       let r;
       try {
-        r = await httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC } });
+        r = await httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC }, registerSeq: nextRegisterSeq() });
       } catch (e) {
         if (e && e.status === 403 && e.body && e.body.status === 'denied') r = e.body;
         else throw e; // 连接层失败:交给外层既有 catch(指数退避)
@@ -750,6 +758,13 @@ async function registerWithRetry () {
       if (r && r.status === 'approved') {
         registeredClientId = r.clientId || CLIENT_NAME;
         hasRegistered = true;
+        if (pendingCapRefresh) {
+          // 首注册发出时宿主能力尚未明确(sampling=false 已写进中枢),此处用更大 registerSeq 补发真实能力。
+          // 发后不理:不 await,绝不阻塞注册回执路径。
+          pendingCapRefresh = false;
+          httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC }, registerSeq: nextRegisterSeq() })
+            .catch(() => {});
+        }
         process.stderr.write(`[ai-bridge] 已加入共享中枢(已批准, ID=${registeredClientId}, sampling=${hostSupportsSampling})\n`);
         return true;
       }

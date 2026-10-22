@@ -810,7 +810,40 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
     });
 
     if (targets.length === 0) {
-      return { error: `没有选中可执行的目标。当前可调度工具: ${availableNames.join(', ') || '无'}(可能被禁用,或 workspace 任务要求 exec 能力)`, code: 'no_targets' };
+      // F3/#50a4:归因分"点名派发/自动路由"两条路径,先判有没有点名再下结论,防单模板把两类真因混成一句谎话
+      const named = Array.isArray(toolNames) && toolNames.length > 0;
+      let summary;
+      if (named) {
+        // 点名派发:逐 ref 给出具体落选原因。能力/资格结论只能取自 connectedClients 的 live 对象——
+        // 能 resolve 到 availableTools 的客户端必是 getAllTools(server.js:379)过了 supportsSampling 门才进来的,
+        // 对它宣称 sampling 缺失只会反向撒谎(仅在开关并发翻转时可达),故已解析已启用者只如实报"并发漂移"
+        const why = toolNames.map(ref => {
+          const tool = resolveToolReference(ref, availableTools);
+          if (!tool) {
+            const live = connectedClients.get(ref) || connectedClients.get(assignedClientId(ref));
+            if (live) {
+              if (!live.firstPollAt) return `${ref}: 客户端尚未完成首次轮询,暂不可调度`;
+              if (live.supportsSampling !== true) return `${ref}: 客户端未声明 sampling 能力,无执行资格(宿主需在 MCP initialize 中声明 capabilities.sampling)`;
+              if (clientState(live) === 'stale') return `${ref}: 客户端连接已过期(stale)`;
+              // 已完成首 poll、已声明 sampling、未过期却不在可调度集合:同属并发漂移,如实报,不谎称过期
+              return `${ref}: 状态在并发中变化(选中后可调度集合已改变)`;
+            }
+            return `${ref}: 未知工具`;
+          }
+          if (!isToolEnabled(tool)) return `${ref}: 已被开关禁用`;
+          // 解析到且已启用却仍落选:正常单线程不可达(有它 targets 就非空),仅并发翻转可达;
+          // 真因只能是"选中后可调度集合已改变",此处绝不宣称能力缺失
+          return `${ref}: 状态在并发中变化(选中后可调度集合已改变)`;
+        });
+        summary = `点名目标: ${why.join('; ')}`;
+      } else {
+        // 自动路由(根本没点名):不得套"点名目标"模板;exec 解释须以 workspace 为条件,
+        // 因为 dispatchableTools(server.js:756-758)只在带 workspace 时才把声明不了 exec 的客户端排除出候选
+        summary = workspace
+          ? '自动路由未点名工具,且 workspace 任务需要 exec 能力,当前没有具备 exec 的可调度目标'
+          : '自动路由未点名工具,当前没有可调度目标(可能全部被开关禁用或处于失败冷却)';
+      }
+      return { error: `没有选中可执行的目标。${summary}。当前可调度工具: ${availableNames.join(', ') || '无'}`, code: 'no_targets' };
     }
 
     const rawResults = await Promise.allSettled(
@@ -1536,9 +1569,17 @@ const server = http.createServer(async (req, res) => {
           // 仍须重新完成一次 poll 才能恢复为在线。
           const wasStale = clientState(old) === 'stale';
           old.lastSeen = Date.now();
-          if (typeof body.capabilities?.sampling === 'boolean') old.supportsSampling = body.capabilities.sampling;
-          // exec 每次注册都重新判定:能力只允许严格 opt-in,防止旧值把已撤回的执行权限带进新会话
-          old.supportsExec = body.capabilities?.exec === true;
+          // 乱序保护(F2/#50):注册带单调 registerSeq,seq 更小的陈旧注册不得改动能力
+          // (防"桥启动即注册的 sampling=false 迟到覆写宿主声明的 true");
+          // 不带 registerSeq 的旧客户端 seq=null → stale 恒为 false → 行为与既往完全一致(向后兼容)。
+          // 注意这不是"只升不降":seq 更大者允许真实撤回能力(#50a3 哨兵)。
+          const seq = Number.isFinite(body.registerSeq) ? body.registerSeq : null;
+          const stale = seq !== null && typeof old.lastRegisterSeq === 'number' && seq < old.lastRegisterSeq;
+          if (!stale) {
+            if (typeof body.capabilities?.sampling === 'boolean') old.supportsSampling = body.capabilities.sampling;
+            old.supportsExec = body.capabilities?.exec === true; // 能力只允许严格 opt-in
+            if (seq !== null) old.lastRegisterSeq = seq;
+          }
           if (wasStale) {
             old.firstPollAt = null;
             old.reconnectCount = (old.reconnectCount || 0) + 1;
@@ -1559,6 +1600,7 @@ const server = http.createServer(async (req, res) => {
           reconnectCount: tombstone ? 1 : 0,
           supportsSampling: body.capabilities?.sampling === true,
           supportsExec: body.capabilities?.exec === true,
+          lastRegisterSeq: Number.isFinite(body.registerSeq) ? body.registerSeq : null,
           lastError: null,
           disconnectReason: null
         });
