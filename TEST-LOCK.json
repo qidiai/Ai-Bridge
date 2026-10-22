@@ -1,7 +1,7 @@
 {
-  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。red-baseline 说明:test-e2e 当前指定红集=4项 manage_client/清单载体断言,T-A 交付时须清零。 T-A/B/C 批次:bridge-stdio.js 解冻并已改(15 工具面+toolset 套餐);三套件哈希仍未变;red-baseline 4 项已于本合并清零。",
-  "updated": "2026-10-22 (T-A/B/C 合并后由指挥官重算)",
-  "head": "677cc9d6f37cbbed08d6401f655bc713281a4a87",
+  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。red-baseline 说明:test-e2e 当前指定红集=4项 manage_client/清单载体断言,T-A 交付时须清零。 T-A/B/C 批次:bridge-stdio.js 解冻并已改(15 工具面+toolset 套餐);三套件哈希仍未变;red-baseline 4 项已于本合并清零。 T-Doc 批次:仅文档两 md 变化(README 断言与 bridge-stdio.js 实况逐码核对通过),ARCHITECTURE.md 纳入锁面。下一步 T-D 前置:指挥官在 test-e2e 写入 3 条红断言(预期 139→142,指定红集=3),重算本工件。",
+  "updated": "2026-10-22 (T-Doc 合并后由指挥官重算)",
+  "head": "621161e5a43dde6b14cd0ea52aa51a87bf11c649",
   "hashes": {
     "test-e2e.mjs": "8c598553b7ab82c3182bf2259fbe4cef3665ec21",
     "test-external-fixes.mjs": "e1b11cf4e604ad8aaf052ca8949d2fce14f0ec5f",
@@ -11,6 +11,7 @@
     "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
     "adapters/cli-adapter.js": "a16b99df63c7a29e42c8c4ea453a9d62d0e47e39",
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
-    "README.md": "08e0a08815de40d503abf72950b90c1993883969"
+    "README.md": "57b281c7901de6d4ce5a6d844d01f88aa94adb07",
+    "ARCHITECTURE.md": "736f68a8695e9f9eb453a465bb1d13e887ed3cdc"
   }
 }

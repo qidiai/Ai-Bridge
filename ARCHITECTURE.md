@@ -1,13 +1,13 @@
 # AI Bridge 架构图
 
-> 更新：2026-10-21（工作区管理：登记/受管目录 + dispatch/handoff cwd 绑定 + 归档/租约）
+> 更新：2026-10-22（MCP 工具面三轨裁剪：20→15 + AI_BRIDGE_TOOLSET 角色套餐；字节数口径见 README）
 
 ## 模块分层
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ 接入层(仅本机 127.0.0.1:9800)                                   │
-│  bridge-stdio.js   MCP stdio 桥接器(20 个 MCP 工具)             │
+│  bridge-stdio.js   MCP stdio 桥接器(全量 15 个;lite 套餐 5 个)  │
 │  ui.html           Web UI(8 Tab:仪表盘/派发/讨论/记忆/日志/流量/用量/模型) │
 └──────────────┬─────────────────────────────────────────────────┘
 ┌──────────────▼─────────────────────────────────────────────────┐
@@ -152,3 +152,4 @@ remove: linked 仅解除登记;managed + delete_files=1 且 realpath 严格落�
 - [x] 2026-08-26 调度:tools.json 注册 codely 为 dispatch 工具(spawn 官方 CLI,30min超时,默认模型跟随 codely settings);QIDI Code 经 MCP(.mcp.json 已接 bridge-stdio.js)可派发任务给 Codely;dispatch 端到端测试通过(10.4s)。
 - [x] 2026-08-26 调度:新增 codely-k3 工具变体(--model KIMI-K3 执行),测试通过(100.2s,注意 K3 比 GLM-5.3 慢约10倍)。QIDI 侧只能用 K3 当执行模型,不能当大脑(bridge cli transport 无 tool_calls 协议,QIDI agent 循环不兼容)。
 - [x] 2026-10-21 工作区(P0-1):新增 workspace-manager.js + workspaces.json;dispatch/handoff 支持 workspace 绑定,CLI 以工作区为 cwd;登记(linked)/受管(managed)双模式、归档/恢复、独占租约;HTTP /api/workspaces* 与 MCP list_workspaces/create_workspace;测试 test-workspace.mjs + E2E 工作区链路。
+- [x] 2026-10-22 MCP 工具面裁剪:20→15(discuss 合并 action 枚举、manage_client 取代 approve/deny/kick、描述压缩、full/lite 双套餐);tools/list 响应 full 6880B / lite 1901B(-72%,口径:完整 JSON-RPC 响应字节数不含尾随换行,计换行为 6881B/1902B),commit 621161e

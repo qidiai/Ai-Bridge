@@ -54,6 +54,7 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 | `AI_BRIDGE_DAILY_TOKEN_BUDGET` | 无 | 每日 token 预算，超出时 /api/health 告警 |
 | `AI_BRIDGE_OLLAMA_BASE` | http://127.0.0.1:11434 | local-vl 模型的 Ollama 地址 |
 | `AI_BRIDGE_WORKSPACE_ROOT` | `~/.ai-bridge/workspaces` | 受管工作区根目录（托管目录创建/回收均限制在此） |
+| `AI_BRIDGE_TOOLSET` | full | 桥暴露的工具套餐：full=全部 15 个；lite=面向被派发 CLI 对端智能体的 5 工具精简面（dispatch/handoff/list_tools/memory_search/memory_recent）；非法值按 full |
 
 ## 功能
 
@@ -186,6 +187,79 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
 }
 ```
 
+### 全量工具清单（15 个）
+
+默认套餐（`AI_BRIDGE_TOOLSET=full`）下 `tools/list` 暴露以下 15 个工具，「用途」逐字摘自 `bridge-stdio.js` 的 description：
+
+| 工具 | 用途 |
+|------|------|
+| `dispatch` | 把任务分发给已开启的工具(可多个并行)。工具限额/断开时自动转给其他工具接力。返回代码产出和 token 用量。 |
+| `list_tools` | 列出所有工具:检测状态 + 开关状态 + 累计 token |
+| `toggle_tool` | 打开/关闭工具开关 |
+| `list_switches` | 查看所有工具开关状态 |
+| `list_workspaces` | 列出工作区:登记/受管模式、路径、状态、使用次数、当前活动任务数 |
+| `create_workspace` | 创建或登记工作区。不传 path 时在受管根目录创建空目录;传 path 时登记已有绝对路径(不会移动/删除用户文件)。 |
+| `token_stats` | 查看累计 token 用量统计 |
+| `handoff` | 接力:把已有代码传给另一个工具接着干 |
+| `memory_search` | 搜索历史任务记录和经验记忆 |
+| `memory_recent` | 查看最近的 dispatch 任务记录 |
+| `logs` | 查看服务运行日志(调试用) |
+| `discuss` | AI 讨论会统一管理入口,按 action 分发四种动作:start 召开讨论会(指定话题和参与者,各工具先独立发表观点再互相补充,返回会议ID);status 查看讨论会状态和实时发言;interrupt 中断正在进行的讨论会(防止无休止循环或方向偏移);inject 向正在进行的讨论会注入主持人消息(纠正方向/补充信息/指出错误)。 |
+| `list_clients` | 查看接入共享中枢的客户端:已连接 / 待审批 / 黑名单 |
+| `manage_client` | 客户端准入管理:approve 批准待准入或重纳被拒客户端(移入白名单),deny 拒绝并拉黑(若在线则踢出),kick 断开(可选拉黑) |
+| `recognize_image` | 识别图片/截图,本地处理不发云端,零token。模式:ocr快速提文字/vision理解内容布局,默认auto |
+
+### discuss — 讨论会单入口
+
+`action` 必填，枚举 `start | status | interrupt | inject`（旧会话未传时按 `start` 兼容处理）：
+
+- **start**：`topic` 必填（讨论话题）；可选 `participants`（留空=全部已开启工具）、`round2`（默认 true）、`implement`（默认 false）、`guidance` / `round2_guidance`。异步启动，立即返回会议ID。
+- **status**：`meetingId` 必填，返回会议状态与实时发言（兼容旧字段名 `meeting_id` 回退）。
+- **interrupt**：`meetingId` 必填，`reason` 可选（中断原因，防止无休止循环或方向偏移时使用）。
+- **inject**：`meetingId` + `message` 必填，向进行中的会议注入主持人消息（纠正方向/补充信息/指出错误）。
+
+会议ID 从 start 的返回文本中获取。
+
+### manage_client — 客户端准入单入口
+
+取代旧的 `approve_client` / `deny_client` / `kick_client` 三个独立工具。`action` + `client_key` 均必填（`client_key` 为 `list_clients` 返回的客户端 ID）：
+
+- **approve**：批准待准入或重纳被拒客户端（移入白名单）。
+- **deny**：拒绝并拉黑（若在线则同时踢出）。
+- **kick**：断开连接；`block` 仅对 kick 有效，默认 false（true 时同时拉黑）。
+
+### lite 套餐（面向被派发 CLI 的对端智能体）
+
+在被接入方 `.mcp.json` 的 `env` 块中加一行 `"AI_BRIDGE_TOOLSET": "lite"`，桥仅暴露 5 个工具（dispatch/handoff/list_tools/memory_search/memory_recent）：
+
+```json
+{
+  "mcpServers": {
+    "ai-bridge": {
+      "command": "node",
+      "args": ["/path/to/ai-bridge/bridge-stdio.js"],
+      "env": {
+        "AI_BRIDGE_CLIENT": "my-ai-tool",
+        "AI_BRIDGE_PORT": "9800",
+        "AI_BRIDGE_TOOLSET": "lite"
+      }
+    }
+  }
+}
+```
+
+裁剪收益：tools/list 响应 full 6880B → lite 1901B（**-72%**；测量口径：tools/list 完整 JSON-RPC 响应字节数，不含尾随换行 `\n`，计入换行则为 6881B/1902B）。非法套餐值按 full 处理。
+
+降级行为分两种，勿混淆：
+
+- **lite 套餐**下调用任何不在 5 工具清单内的名字（包括旧工具名 `kick_client` 等），被桥的 toolset 门直接拦截，返回 isError：`工具 X 在 toolset=lite 下不可用(可用: dispatch, handoff, list_tools, memory_search, memory_recent)`。
+- **full 套餐**下调用旧工具名（`approve_client`/`deny_client`/`kick_client` 已从清单移除），落入 callTool 的 default 分支，返回 isError：`未知工具: X`。
+
+### 已知问题
+
+- `httpGet`/`httpPost` 丢弃 HTTP 状态码：桥层只解析响应体 JSON，服务端 404 错误体与 200 正常体在桥层不可区分；桥层失败路径集中化错误处理（T-D）在途。
+- `TEST-LOCK.json`：仓库测试锁定机制，用于检测测试文件漂移，哈希由指挥官每次合并后重算。
+
 ## mitmproxy 流量监控（可选）
 
 ```bash
@@ -206,7 +280,7 @@ node watchdog.js    # 自动重启 + 熔断（连续崩溃5次停止）
 ai-bridge/
 ├── server.js              # HTTP 常驻服务 (40+ API 端点)
 ├── codely-client.js       # 团结 LiteLLM 客户端(凭据/签名/UA跟版/请求)
-├── bridge-stdio.js        # MCP stdio 桥接器 (20 个 MCP 工具)
+├── bridge-stdio.js        # MCP stdio 桥接器 (全量 15 个 MCP 工具;AI_BRIDGE_TOOLSET=lite 时 5 个)
 ├── tool-registry.js       # 配置驱动工具注册表
 ├── workspace-manager.js   # 工作区注册表（登记/受管/归档/租约）
 ├── routing-score.js       # 7维复合路由评分
