@@ -87,14 +87,21 @@ function makeMcpChannel (child) {
         lastSamplingTask = msg.params?.messages?.[0]?.content || '';
         // 含 LONGOUT_MARK 标记时返回超长文本,用于验证 RESULT_MAX_CHARS 截断
         // 含 EMPTYOUT_MARK 标记时返回空文本,模拟 CLI exit0/无输出的静默失败(如额度耗尽)
+        // 含 REPORT_MARK 标记时返回"谈论失败的长文"(无代码块),验证关键词判定不再误伤审计类交付物
+        // 含 ERRORTEXT_MARK 标记时返回短错误行(无代码块),真实额度/限流失败必须仍被判定失败
         // 仅"以标记开头"时空产出:接力 prompt 会内嵌原任务文本,避免标记传播到接力工具
         // 评审 prompt(含"你是代码评审专家")带 REVIEW_EMPTY_MARK 时同样回空文本,验证评审空产出判失败
+        const reportText = '审计报告(长文本,无代码块)。' + 'S1 鉴权只挡 /api/*,本机进程可零凭据经 /v1 触发工具执行并烧配额;S2 设 token 后 UI 全线 401;S3 闸门在崩溃遗留 3 个孤儿时永久 429;S4 双锁互不感知;S5 用量报表口径分叉,今日 tokens=0;S6 写被拒仍报 200 success:true;S7 先删文件后落盘;S8 形状错误的 JSON 仍被覆写。'.repeat(4) + '结论:以上均为静态阅读所得,置信度高。';
         const text = (lastSamplingTask.trimStart().startsWith('EMPTYOUT_MARK')
           || (lastSamplingTask.includes('你是代码评审专家') && lastSamplingTask.includes('REVIEW_EMPTY_MARK')))
           ? ''
-          : lastSamplingTask.includes('LONGOUT_MARK')
-            ? 'L'.repeat(5000)
-            : '```python\ndef add(a, b):\n    return a + b\n```';
+          : lastSamplingTask.includes('REPORT_MARK')
+            ? reportText
+            : lastSamplingTask.includes('ERRORTEXT_MARK')
+              ? 'Error: Go usage limit exceeded (429 Too Many Requests)'
+              : lastSamplingTask.includes('LONGOUT_MARK')
+                ? 'L'.repeat(5000)
+                : '```python\ndef add(a, b):\n    return a + b\n```';
         const result = {
           content: { type: 'text', text },
           usage: { inputTokens: 12, outputTokens: 34 }
@@ -823,6 +830,32 @@ async function main () {
   check('长产出 dispatch 往返成功', longDisp.body.successCount === 1, JSON.stringify(longDisp.body).slice(0, 120));
   const longContent = longDisp.body.results?.[0]?.content || '';
   check('结果 content 截断到默认 RESULT_MAX_CHARS=2000', longContent.length === 2000, 'content.length=' + longContent.length);
+
+  // 17) 失败判定器不得把"谈论失败"当失败,且失败不得销毁交付物(#37 指定红集)
+  //   放在主流程最末:前面几段依赖 CLIENT 的路由评分与产出记录,本段会故意制造"被判失败"的执行,
+  //   若插在智能路由段之前会污染其评分(实测曾级联弄坏 5 条路由断言——那是插桩位置错,非产品缺陷)。
+  //   实况:生产联测里 atom-code 交回 3434 字审计报告、opencode 交回 5022 字,两次都被判 success=false。
+  //   根因链:server.js:513-514 在"产出无代码块"时对文本做关键词**子串**匹配(词表含 429/401/402/
+  //   额度/限额/quota/exceeded/rate limit),报告里引用行号 `server.js:398-401` 或写"永久 429"即命中;
+  //   接着 :515 把 reason 截成 200 字,再经 server.js:877 的失败条目映射**整条 content 被丢弃**——
+  //   调用方只能去翻 SQLite 才能捞回正文。空产出判失败(:510-512)是正确行为,必须原样保留。
+  section('失败判定器与失败态内容保留:#37 红集');
+  const rep = await req('POST', '/api/dispatch', { task: '请以纯文字审计报告形式作答 REPORT_MARK,不要写代码', tools: [CLIENT], auto_fallback: false });
+  const repR = (rep.body.results || [])[0] || {};
+  check('#37a 长文报告(无代码块,内含 429/401/额度 等字样)必须判成功',
+    rep.body.successCount === 1 && repR.success === true, JSON.stringify({ sc: rep.body.successCount, s: repR.success, reason: (repR.reason || '').substring(0, 90) }));
+  check('#37b 判成功的交付物正文完整(未被截断销毁)', typeof repR.content === 'string' && repR.content.length > 800, 'content长度=' + (repR.content || '').length);
+  const errRun = await req('POST', '/api/dispatch', { task: '模拟真实额度失败 ERRORTEXT_MARK', tools: [CLIENT], auto_fallback: false });
+  const errR = (errRun.body.results || [])[0] || {};
+  check('#37c 真实错误短文本仍须判失败(不得为绕过误伤而放水)',
+    errR.success === false && /exceeded|429|限额|额度|rate limit/i.test(errR.reason || ''), JSON.stringify({ s: errR.success, reason: (errR.reason || '').substring(0, 90) }));
+  await sleep(500);
+  const errTraf = await req('GET', '/api/traffic?tool=' + encodeURIComponent('client:' + CLIENT) + '&direction=in&limit=20');
+  const errRow = (errTraf.body.traffic || []).find(t => (t.content || '').includes('Go usage limit exceeded'));
+  check('#37d 同一执行的流量账本 success 必须与 dispatch 判定一致(现恒记 true)',
+    !!errRow && errRow.success === false, errRow ? JSON.stringify({ success: errRow.success, len: (errRow.content || '').length }) : '未找到对应入向流量行');
+  check('#37e 失败条目必须保留正文(可短于成功态上限,但不得为空)',
+    typeof errR.content === 'string' && errR.content.includes('Go usage limit exceeded'), '失败态 content=' + JSON.stringify((errR.content || '').substring(0, 60)));
 }
 
 async function cleanup () {
