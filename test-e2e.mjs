@@ -190,6 +190,17 @@ async function main () {
   // 种子 ACL:预批准 e2e 客户端；另含与内置 CLI 同名的 openclaw，验证 client- 前缀 ID 回传链路
   fs.writeFileSync(testDataPath('clients-acl.json'),
     JSON.stringify({ allowlist: [CLIENT, STALE_CLIENT, REVIEWER, CONFLICT_CLIENT, CONFLICT_CLIENT_ID], blocklist: [], pending: [] }, null, 2));
+  // 种子 memory:4 个遗留会议(3 个非终态=中枢崩溃留下的孤儿, 1 个已关闭=对照不得被改动)。
+  // 用于 #39 启动清扫断言——必须在中枢启动前落盘,因为清扫只发生在启动序列里。
+  fs.writeFileSync(testDataPath('memory.json'), JSON.stringify({
+    tasks: [], experiences: [], preferences: {},
+    meetings: [
+      { id: 'orphan-1', status: 'discussing', topic: '崩溃遗留1', participants: [], messages: [], round: 1, interrupted: false },
+      { id: 'orphan-2', status: 'active', topic: '崩溃遗留2', participants: [], messages: [], round: 1, interrupted: false },
+      { id: 'orphan-3', status: 'implementing', topic: '崩溃遗留3', participants: [], messages: [], round: 2, interrupted: false },
+      { id: 'done-1', status: 'closed', topic: '正常结束', participants: [], messages: [], summary: '既有结论', closedAt: '2026-01-01T00:00:00.000Z' }
+    ]
+  }, null, 2));
 
   // 1) 启动中枢(JSON/SQLite/观测数据全部指向测试专用目录)
   serverProc = spawn(process.execPath, ['server.js'], {
@@ -200,6 +211,28 @@ async function main () {
   serverProc.stderr.on('data', d => { serverErr += d.toString(); });
   await waitServerReady();
   process.stdout.write('中枢已就绪 (127.0.0.1:' + PORT + ')\n');
+
+  // 1.5) 启动清扫:崩溃遗留的非终态会议必须被标记中断(#39 指定红集)
+  //   根因:并发闸门(server.js:2184)按 memory.json 里 discussing/active/implementing 计数,
+  //   上限 MAX_CONCURRENT_MEETINGS=3(server.js:52);中枢崩溃于讨论中途时这些状态永久残留,
+  //   而启动序列只对 async_tasks 做孤儿标记(db.js:171-175, 调用点 server.js:2678),会议侧无对应清扫
+  //   → 累积 3 个孤儿即让 /api/discuss 永久 429,讨论功能整体死锁且难以归因。
+  //   判别式(零配额消耗):合法 topic + 不存在的参与者 → 闸门在参数校验之前,
+  //   所以修复前必回 429、修复后必回 400(闸门放行后因无可用工具而 400)。
+  section('启动清扫:崩溃遗留会议(#39 红集)');
+  const bootActive = await req('GET', '/api/discuss/active');
+  check('#39a 启动后无遗留非终态会议(active 计数为 0)', bootActive.status === 200 && bootActive.body.count === 0, JSON.stringify(bootActive.body).substring(0, 200));
+  const bootMeetings = await req('GET', '/api/meetings?limit=20');
+  const bm = (bootMeetings.body.meetings || []).reduce((a, m) => { a[m.id] = m; return a; }, {});
+  check('#39b 三个遗留会议被清扫为 interrupted 且带原因',
+    ['orphan-1', 'orphan-2', 'orphan-3'].every(id => bm[id] && bm[id].status === 'interrupted' && bm[id].interrupted === true && /重启|中断/.test(bm[id].interruptReason || '')),
+    JSON.stringify(['orphan-1', 'orphan-2', 'orphan-3'].map(id => bm[id] && { s: bm[id].status, i: bm[id].interrupted, r: bm[id].interruptReason })));
+  check('#39c 已关闭会议不得被清扫改动(状态/结论/时间戳原样)', bm['done-1'] && bm['done-1'].status === 'closed' && bm['done-1'].summary === '既有结论' && bm['done-1'].closedAt === '2026-01-01T00:00:00.000Z', JSON.stringify(bm['done-1'] || null).substring(0, 200));
+  const gatePass = await req('POST', '/api/discuss', { topic: '清扫后应可通过闸门', participants: ['ghost-tool-not-exist'] });
+  check('#39d 清扫后闸门放行(合法 topic+不存在参与者 → 400 而非 429)', gatePass.status === 400 && /没有可用的参与工具/.test(gatePass.body.error || ''), 'status=' + gatePass.status + ' ' + JSON.stringify(gatePass.body).substring(0, 160));
+  const memAfterSweep = JSON.parse(fs.readFileSync(testDataPath('memory.json'), 'utf-8'));
+  const orphanAfter = (memAfterSweep.meetings || []).find(m => m.id === 'orphan-1') || {};
+  check('#39e 清扫结果已落盘(不是只在内存里改)', orphanAfter.status === 'interrupted', JSON.stringify(orphanAfter).substring(0, 180));
 
   // 2) 准入管理全流程(HTTP 直连中枢)
   section('准入控制:陌生客户端 → 待审批 → 批准 → 踢出');

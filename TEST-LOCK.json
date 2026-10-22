@@ -1,9 +1,9 @@
 {
-  "note": "两路方案审计裁决后的语义拆分:locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未在报告 TEST-CHANGED 段申报=测试作弊,直接 REJECT;source_faces=生产源码哈希,不是禁令,只是「本轮改动前后的对照基线」,由指挥官在每次合并提交后重算——源码该不该改由当轮规格书白名单决定。P0 已合并:test-store-corrupt 7/20→20/20(指定红集 13 清零),六套件合计 317 项全绿,store.js 由 eae74be5→24f11961。注意:P1(:has() 门禁)落地时 store.js:48 与 :141 两处「只有注释的空 catch」会被判 error,须当轮一并处置。",
-  "updated": "2026-10-22 (P0 合并后由指挥官重算)",
-  "head": "99379ff",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未在报告 TEST-CHANGED 段申报=测试作弊直接 REJECT;source_faces=生产源码哈希,不是禁令,只是本轮改动前后的对照基线,由指挥官在每次合并后重算——源码可否改由当轮规格白名单决定。#39 在途交付物=store.js(新增 markOrphanMeetings)+server.js(启动序列调用并写穿 db.recordMeeting)。",
+  "updated": "2026-10-23 (#39 前置红基线,由指挥官重算)",
+  "head": "d374ea7",
   "locked_tests": {
-    "test-e2e.mjs": "a60c5a968a75999a89056a1b504d7865884f16ed",
+    "test-e2e.mjs": "4529e294727440e0251f2cedce26ecdd426ea5f3",
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
     "test-store-corrupt.mjs": "d16cee8975d12da81d1ad85e2456760a41e27625",
@@ -12,7 +12,7 @@
   },
   "red_baseline": {
     "test-store-corrupt.mjs": "20/20 通过(P0 红集 13 已清零):C1 备份保全/C2 拒绝覆写回传 false/C3 error 留痕/C4 不抛错/C5 重启恢复/C6 正常路径无副作用",
-    "test-e2e.mjs": "151/151 全绿(T-D2 红集已清零),P0 交付后不得回退"
+    "test-e2e.mjs": "103/109 且级联中止:指定红集 #39a/#39b/#39d/#39e(启动清扫孤儿会议);另「双参与者讨论启动」与主流程异常属级联失败,#39c(已关闭会议不得改动)交付即绿属回归防护。修复后预期 156/156"
   },
   "source_faces": {
     "store.js": "24f119614c115a1128d8573b0e55e29b5f7c2db9",
