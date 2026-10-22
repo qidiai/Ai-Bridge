@@ -127,6 +127,40 @@ section('D) server.js 经由 output-cleaner(旧内联通配实现移除)');
   check('server.js 清理调用传入工具名前缀', /prefixes/.test(src));
 }
 
+// ── E) no_targets 归因面(#50 R1,指挥官亲笔,编码手禁改) ──
+// 背景:#50 的 F3 让 no_targets 对每个点名目标给出具体落选原因,方向对,但交付实现有两处会撒谎:
+//   ① 对"能在 availableTools 里解析到的客户端"仍可能输出"未声明 sampling 能力"——而客户端能进
+//      availableTools 就意味着 getAllTools(server.js:379) 已经核验过 supportsSampling===true,
+//      于是"有资格"被说成"没资格",正是 #50a4 要消灭的那类误导文案(它在正常单线程路径不可达,
+//      只在开关并发翻转时可达,可达即撒谎)。
+//   ② 自动路由(根本没点名)也走同一模板,why 为空数组 → 输出"点名目标: 无",既把"未点名"说成
+//      "点名了但全落选",又丢掉了 workspace 任务要求 exec 这条真实解释(server.js:755-757 的
+//      dispatchableTools 过滤就是为此存在)。
+// 锁的是行为形状,不是字符串回声:①归因行不得把 tool.*(已入册可解析)与 sampling 缺失绑在一起;
+// ②必须先判"有没有点名";③给 exec 解释时必须以 workspace 为条件。
+section('E) no_targets 归因不得撒谎(#50 R1)');
+{
+  const src = fs.readFileSync('./server.js', 'utf-8');
+  const anchor = src.indexOf('if (targets.length === 0)');
+  check('E0 能定位到 targets 为空的归因块', anchor >= 0, `indexOf=${anchor}`);
+  const retAt = src.indexOf("code: 'no_targets'", anchor);
+  const block = anchor >= 0 && retAt >= 0 ? src.slice(anchor, src.indexOf('\n', retAt)) : '';
+  const lines = block.split('\n');
+  // ① 任何一行同时出现 `tool.` 与 "未声明 sampling" ⇒ 把已入册客户端说成无资格
+  const lying = lines.filter(l => /tool\./.test(l) && /未声明 sampling/.test(l));
+  check('E1 已解析到 availableTools 的客户端绝不得被判成"未声明 sampling"', lying.length === 0, lying.map(l => l.trim()).join(' | ').substring(0, 240));
+  // ② 归因块必须先区分"点名派发"与"自动路由"(对 toolNames 做存在性判断)
+  check('E2 归因块必须区分点名派发与自动路由(不得对未点名输出"点名目标: 无")',
+    /toolNames\s*(&&|\.length\s*[>!=])/.test(block) || /if\s*\(\s*toolNames\s*\)/.test(block),
+    block.substring(0, 240));
+  // ③ exec 解释必须以 workspace 为条件(无 workspace 时谈 exec 是误导)。
+  //   锁的是"确实对 workspace 变量做了条件判断",不是块里出现过 workspace 这个词——防止只补文案不改分支。
+  const execLines = lines.filter(l => /exec/.test(l));
+  const gatesOnWorkspace = /if\s*\(\s*workspace[\s)&|]/.test(block) || /workspace\s*(&&|\?)/.test(block);
+  check('E3 exec 相关归因必须以 workspace 为条件分支', execLines.length === 0 || gatesOnWorkspace,
+    `gatesOnWorkspace=${gatesOnWorkspace} | ${execLines.map(l => l.trim()).join(' | ').substring(0, 200)}`);
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');
