@@ -1,12 +1,12 @@
 {
-  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。red-baseline 说明:test-e2e 当前指定红集=4项 manage_client/清单载体断言,T-A 交付时须清零。",
-  "updated": "2026-10-22",
-  "head": "d6f60f228e656b9a1283a5084f9f03d9ff77f847",
+  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。red-baseline 说明:test-e2e 当前指定红集=4项 manage_client/清单载体断言,T-A 交付时须清零。 T-A/B/C 批次:bridge-stdio.js 解冻并已改(15 工具面+toolset 套餐);三套件哈希仍未变;red-baseline 4 项已于本合并清零。",
+  "updated": "2026-10-22 (T-A/B/C 合并后由指挥官重算)",
+  "head": "677cc9d6f37cbbed08d6401f655bc713281a4a87",
   "hashes": {
     "test-e2e.mjs": "8c598553b7ab82c3182bf2259fbe4cef3665ec21",
     "test-external-fixes.mjs": "e1b11cf4e604ad8aaf052ca8949d2fce14f0ec5f",
     "test-audit-fixes.mjs": "e625a0968f217a41e49d08eaf0d6d0f4a26d15d2",
-    "bridge-stdio.js": "bb95f75dcd5db5551dd9a2f9915e7f5207b6ed41",
+    "bridge-stdio.js": "d3ad0782e59e56e557fd7e05426f0f1a1f920a12",
     "server.js": "f4232a912e88ef05cec6b7ba19913d213c5fc4b5",
     "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
     "adapters/cli-adapter.js": "a16b99df63c7a29e42c8c4ea453a9d62d0e47e39",

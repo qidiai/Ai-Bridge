@@ -102,7 +102,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'memory_search',
-    description: '搜索历史任务记录和经验记忆(之前调过什么工具、结果怎么样)',
+    description: '搜索历史任务记录和经验记忆',
     inputSchema: {
       type: 'object',
       properties: {
@@ -134,11 +134,14 @@ const MCP_TOOLS = [
   },
   {
     name: 'discuss',
-    description: '召开 AI 讨论会:指定话题和参与者,各工具先独立发表观点,再看到其他人的观点后补充。返回完整讨论记录。',
+    description: 'AI 讨论会统一管理入口,按 action 分发四种动作:start 召开讨论会(指定话题和参与者,各工具先独立发表观点再互相补充,返回会议ID);status 查看讨论会状态和实时发言;interrupt 中断正在进行的讨论会(防止无休止循环或方向偏移);inject 向正在进行的讨论会注入主持人消息(纠正方向/补充信息/指出错误)。',
     inputSchema: {
       type: 'object',
       properties: {
-        topic: { type: 'string', description: '讨论话题,如"这个模块用队列还是数组"' },
+        action: { type: 'string', enum: ['start', 'status', 'interrupt', 'inject'], description: '动作: start 召开讨论会(需 topic);status 查看进度(需 meetingId);interrupt 中断会议(需 meetingId);inject 注入主持人消息(需 meetingId+message)。默认 start' },
+        topic: { type: 'string', description: '讨论话题,如"这个模块用队列还是数组"(action=start 必填)' },
+        meetingId: { type: 'string', description: '会议ID(action=status/interrupt/inject 必填,start 返回中获取)' },
+        message: { type: 'string', description: '注入的消息内容,如"你们讨论的方向偏了,应该考虑XXX"(action=inject 必填)' },
         participants: {
           type: 'array',
           items: { type: 'string' },
@@ -147,44 +150,10 @@ const MCP_TOOLS = [
         round2: { type: 'boolean', description: '是否进行第二轮(看到其他人的观点后补充),默认 true', default: true },
         implement: { type: 'boolean', description: '讨论完后自动派发写代码任务(用讨论结论作为任务描述)', default: false },
         guidance: { type: 'string', description: '主持人引导信息(注入讨论方向/约束/纠正)' },
-        round2_guidance: { type: 'string', description: '第二轮的额外引导(看到第一轮结果后补充方向)' }
+        round2_guidance: { type: 'string', description: '第二轮的额外引导(看到第一轮结果后补充方向)' },
+        reason: { type: 'string', description: '中断原因(action=interrupt 可选)' }
       },
-      required: ['topic']
-    }
-  },
-  {
-    name: 'discuss_status',
-    description: '查看讨论会状态和实时发言内容',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        meetingId: { type: 'string', description: '会议ID' }
-      },
-      required: ['meetingId']
-    }
-  },
-  {
-    name: 'discuss_interrupt',
-    description: '中断正在进行的讨论会(防止无休止循环或方向偏移)',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        meetingId: { type: 'string', description: '会议ID' },
-        reason: { type: 'string', description: '中断原因' }
-      },
-      required: ['meetingId']
-    }
-  },
-  {
-    name: 'discuss_inject',
-    description: '向正在进行的讨论会注入主持人消息(纠正方向/补充信息/指出错误)',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        meetingId: { type: 'string', description: '会议ID' },
-        message: { type: 'string', description: '注入的消息内容(如"你们讨论的方向偏了,应该考虑XXX"或"这个方案有安全问题")' }
-      },
-      required: ['meetingId', 'message']
+      required: ['action']
     }
   },
   {
@@ -193,38 +162,21 @@ const MCP_TOOLS = [
     inputSchema: { type: 'object', properties: {} }
   },
   {
-    name: 'approve_client',
-    description: '批准某个待审批客户端加入共享中枢(移入白名单)',
-    inputSchema: {
-      type: 'object',
-      properties: { clientId: { type: 'string', description: '客户端ID(见 list_clients)' } },
-      required: ['clientId']
-    }
-  },
-  {
-    name: 'deny_client',
-    description: '拒绝并拉黑某个客户端,禁止其加入(移入黑名单,若在线则踢出)',
-    inputSchema: {
-      type: 'object',
-      properties: { clientId: { type: 'string', description: '客户端ID' } },
-      required: ['clientId']
-    }
-  },
-  {
-    name: 'kick_client',
-    description: '把已加入的客户端踢出中枢;block=true 时同时拉黑',
+    name: 'manage_client',
+    description: '客户端准入管理:approve 批准待准入或重纳被拒客户端(移入白名单),deny 拒绝并拉黑(若在线则踢出),kick 断开(可选拉黑)',
     inputSchema: {
       type: 'object',
       properties: {
-        clientId: { type: 'string', description: '客户端ID' },
-        block: { type: 'boolean', description: '是否同时拉黑,默认 false' }
+        action: { type: 'string', enum: ['approve', 'deny', 'kick'], description: '动作: approve 批准 / deny 拒绝并拉黑 / kick 踢出' },
+        client_key: { type: 'string', description: '客户端 ID(list_clients 返回值)' },
+        block: { type: 'boolean', description: '仅 kick:是否同时拉黑,默认 false' }
       },
-      required: ['clientId']
+      required: ['action', 'client_key']
     }
   },
   {
     name: 'recognize_image',
-    description: '识别图片/截图内容,图片在本地处理,不发送云端,零token消耗。支持两种模式:ocr(快速提取文字,适合代码截图/文档)和vision(AI理解图片内容/布局/UI)。默认 auto 自动选择。',
+    description: '识别图片/截图,本地处理不发云端,零token。模式:ocr快速提文字/vision理解内容布局,默认auto',
     inputSchema: {
       type: 'object',
       properties: {
@@ -407,34 +359,45 @@ async function callTool (name, args) {
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
   case 'discuss': {
-    const r = await httpPost('/api/discuss', args);
-    if (r.error || !r.meetingId) return { content: [{ type: 'text', text: r.error || '讨论失败' }], isError: true };
-    // 异步模式:立即返回会议ID,告诉用户怎么查进度
-    return { content: [{ type: 'text', text: `🗣️ 讨论已启动!\n\n话题: ${r.topic}\n参与者: ${(r.participants || []).join(', ')}\n会议ID: ${r.meetingId}\n状态: ${r.status}\n\n用 discuss_status 查看进度\n用 discuss_inject 注入引导信息\n用 discuss_interrupt 中断讨论` }] };
-  }
-  case 'discuss_status': {
-    const meetingId = args.meetingId || args.meeting_id;
-    if (!meetingId) return { content: [{ type: 'text', text: '缺少 meetingId' }], isError: true };
-    const r = await httpGet('/api/discuss/status/' + meetingId);
-    const lines = [`# 📋 讨论状态\n`, `话题: ${r.topic}`, `状态: ${r.status}`, `轮次: ${r.round}`, `发言: ${r.messageCount} 条, ${r.totalTokens} tokens`];
-    if (r.interrupted) lines.push(`⚠️ 已中断: ${r.interruptReason}`);
-    if (r.summary) lines.push(`摘要: ${r.summary}`);
-    lines.push('');
-    (r.messages || []).forEach(msg => {
-      const time = msg.ts?.substring(11, 19) || '';
-      const tag = msg.injected ? ' [注入]' : '';
-      lines.push(`### ${msg.speaker}${tag} (${time})`);
-      lines.push((msg.content || '(无内容)').substring(0, 500));
+    const action = args.action || 'start'; // 向后兼容:旧会话未给 action 时按 start
+    if (!['start', 'status', 'interrupt', 'inject'].includes(action)) {
+      return { content: [{ type: 'text', text: `非法 action: ${action}(合法值: start / status / interrupt / inject)` }], isError: true };
+    }
+    if (action === 'start') {
+      if (!args.topic) return { content: [{ type: 'text', text: '缺少 topic(action=start 时必填)' }], isError: true };
+      // 剥离 MCP 路由字段 action 后透传其余参数
+      const body = Object.assign({}, args);
+      delete body.action;
+      const r = await httpPost('/api/discuss', body);
+      if (r.error || !r.meetingId) return { content: [{ type: 'text', text: r.error || '讨论失败' }], isError: true };
+      // 异步模式:立即返回会议ID,告诉用户怎么查进度
+      return { content: [{ type: 'text', text: `🗣️ 讨论已启动!\n\n话题: ${r.topic}\n参与者: ${(r.participants || []).join(', ')}\n会议ID: ${r.meetingId}\n状态: ${r.status}\n\n用 discuss {action:"status", meetingId:"${r.meetingId}"} 查看进度\n用 discuss {action:"inject", meetingId:"${r.meetingId}", message:"..."} 注入引导信息\n用 discuss {action:"interrupt", meetingId:"${r.meetingId}"} 中断讨论` }] };
+    }
+    if (action === 'status') {
+      const meetingId = args.meetingId || args.meeting_id;
+      if (!meetingId) return { content: [{ type: 'text', text: '缺少 meetingId(action=status 时必填)' }], isError: true };
+      const r = await httpGet('/api/discuss/status/' + meetingId);
+      const lines = [`# 📋 讨论状态\n`, `话题: ${r.topic}`, `状态: ${r.status}`, `轮次: ${r.round}`, `发言: ${r.messageCount} 条, ${r.totalTokens} tokens`];
+      if (r.interrupted) lines.push(`⚠️ 已中断: ${r.interruptReason}`);
+      if (r.summary) lines.push(`摘要: ${r.summary}`);
       lines.push('');
-    });
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'discuss_interrupt': {
-    const r = await httpPost('/api/discuss/interrupt', args);
-    if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
-    return { content: [{ type: 'text', text: `🛑 会议 ${r.meetingId} 已中断: ${r.reason}` }] };
-  }
-  case 'discuss_inject': {
+      (r.messages || []).forEach(msg => {
+        const time = msg.ts?.substring(11, 19) || '';
+        const tag = msg.injected ? ' [注入]' : '';
+        lines.push(`### ${msg.speaker}${tag} (${time})`);
+        lines.push((msg.content || '(无内容)').substring(0, 500));
+        lines.push('');
+      });
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+    if (action === 'interrupt') {
+      const r = await httpPost('/api/discuss/interrupt', args);
+      if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
+      return { content: [{ type: 'text', text: `🛑 会议 ${r.meetingId} 已中断: ${r.reason}` }] };
+    }
+    // action === 'inject'
+    if (!args.meetingId && !args.meeting_id) return { content: [{ type: 'text', text: '缺少 meetingId(action=inject 时必填)' }], isError: true };
+    if (!args.message) return { content: [{ type: 'text', text: '缺少 message(action=inject 时必填)' }], isError: true };
     const r = await httpPost('/api/discuss/inject', args);
     if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
     return { content: [{ type: 'text', text: `✅ 已向会议 ${r.meetingId} 注入主持人消息` }] };
@@ -451,18 +414,25 @@ async function callTool (name, args) {
     lines.push((d.blocklist || []).length ? d.blocklist.map(x => `- ⛔ ${x}`).join('\n') : '(无)');
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
-  case 'approve_client': {
-    const r = await httpPost('/api/clients/approve', args);
-    if (!r.success) return { content: [{ type: 'text', text: r.error || '批准失败' }], isError: true };
-    return { content: [{ type: 'text', text: `✅ 已批准客户端 ${r.clientId} 加入共享中枢` }] };
-  }
-  case 'deny_client': {
-    const r = await httpPost('/api/clients/deny', args);
-    if (!r.success) return { content: [{ type: 'text', text: r.error || '拒绝失败' }], isError: true };
-    return { content: [{ type: 'text', text: `⛔ 已拒绝并拉黑客户端 ${r.clientId}` }] };
-  }
-  case 'kick_client': {
-    const r = await httpPost('/api/clients/kick', args);
+  case 'manage_client': {
+    const action = args.action;
+    const clientKey = args.client_key;
+    if (!['approve', 'deny', 'kick'].includes(action)) {
+      return { content: [{ type: 'text', text: `非法 action: ${action || '(空)'}(合法值: approve / deny / kick)` }], isError: true };
+    }
+    if (!clientKey) return { content: [{ type: 'text', text: '缺少 client_key' }], isError: true };
+    if (action === 'approve') {
+      const r = await httpPost('/api/clients/approve', { clientId: clientKey });
+      if (!r.success) return { content: [{ type: 'text', text: r.error || '批准失败' }], isError: true };
+      return { content: [{ type: 'text', text: `✅ 已批准客户端 ${r.clientId} 加入共享中枢` }] };
+    }
+    if (action === 'deny') {
+      const r = await httpPost('/api/clients/deny', { clientId: clientKey });
+      if (!r.success) return { content: [{ type: 'text', text: r.error || '拒绝失败' }], isError: true };
+      return { content: [{ type: 'text', text: `⛔ 已拒绝并拉黑客户端 ${r.clientId}` }] };
+    }
+    // action === 'kick'
+    const r = await httpPost('/api/clients/kick', { clientId: clientKey, block: !!args.block });
     if (!r.success) return { content: [{ type: 'text', text: r.error || '踢出失败' }], isError: true };
     return { content: [{ type: 'text', text: `👢 已踢出客户端 ${r.clientId}${r.blocked ? '(并拉黑)' : ''}` }] };
   }
@@ -613,6 +583,11 @@ async function callTool (name, args) {
   }
 }
 
+// ── 角色套餐:AI_BRIDGE_TOOLSET=full(默认)|lite(CLI 对端智能体精简面) ──
+const TOOLSET = (process.env.AI_BRIDGE_TOOLSET || 'full').toLowerCase() === 'lite' ? 'lite' : 'full';
+const LITE_TOOLS = ['dispatch', 'handoff', 'list_tools', 'memory_search', 'memory_recent'];
+function toolsForRole (list) { return TOOLSET === 'lite' ? list.filter(t => LITE_TOOLS.includes(t.name)) : list; }
+
 // ── MCP 协议 ──
 
 function sendResult (id, result) {
@@ -639,9 +614,13 @@ async function handleMessage (msg) {
     result = { protocolVersion: '2024-11-05', capabilities: { tools: {}, sampling: {} }, serverInfo: { name: 'ai-bridge', version: '1.1.0' } };
     break;
   case 'initialized': return;
-  case 'tools/list': result = { tools: MCP_TOOLS }; break;
+  case 'tools/list': result = { tools: toolsForRole(MCP_TOOLS) }; break;
   case 'tools/call':
-    result = await callTool(params.name, params.arguments || {});
+    if (TOOLSET === 'lite' && !LITE_TOOLS.includes(params.name)) {
+      result = { content: [{ type: 'text', text: `工具 ${params.name} 在 toolset=lite 下不可用(可用: ${LITE_TOOLS.join(', ')})` }], isError: true };
+    } else {
+      result = await callTool(params.name, params.arguments || {});
+    }
     break;
   case 'ping': result = {}; break;
   default: sendError(id, -32601, `未知方法: ${method}`); return;
