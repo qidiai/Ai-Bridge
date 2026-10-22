@@ -274,6 +274,66 @@ async function main () {
   try { bootProc.kill(); } catch { /* ignore */ }
   await sleep(400);
 
+  // 1.8) 取走任务后不回结果,超时必须让任务态归位(#59 指定红集)
+  //   实况:poll 取任务时置 taskPending=true(server.js:1709 立即支 / :1735 长轮询 interval 支),
+  //   而 executeClient 的超时清理(:672-679)只清 pendingTask/pendingResolve/pendingReject/_busy,
+  //   **独漏 taskPending**;clientState(:449) 又以 info.taskPending 作 online_busy 判据
+  //   → 客户端取走任务却始终没回结果时,状态位永久停在 online_busy(路由与 UI 双向误报;
+  //   打开的长轮询还会每秒续 lastSeen,连 stale 兜底都触发不了)。
+  //   做法:第二实例设 AI_BRIDGE_EXECUTE_TIMEOUT=4000 使超时确定性发生(生产窗口 900000 不可改,
+  //   故本段绝不在生产验);预置白名单免人工审批;先开一条 /api/poll 长轮询——#41 之后入队不再更换
+  //   条目对象身份,interval 支会在 ≤1s 内直接下发,因此能稳定断言"任务确被该客户端取走",
+  //   取走后故意不提交结果,等超时触发再断言状态必须回到 online_idle。
+  section('超时后任务态必须归位:#59 红集(第二实例)');
+  const TP_PORT = 9827;
+  const TP_CLIENT = 'e2e-taskpend';
+  const tpDir = path.join(TEST_RUNTIME, 'taskpend');
+  fs.mkdirSync(tpDir, { recursive: true });
+  fs.writeFileSync(path.join(tpDir, 'clients-acl.json'), JSON.stringify({ allowlist: [TP_CLIENT], blocklist: [], pending: [] }, null, 2));
+  const tpProc = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(TP_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_DATA_DIR: tpDir, AI_BRIDGE_DB: path.join(tpDir, 'tp.db'), AI_BRIDGE_OBSERVE_DIR: path.join(tpDir, 'observe'), AI_BRIDGE_WORKSPACE_ROOT: path.join(tpDir, 'ws'), AI_BRIDGE_TOKEN: '', AI_BRIDGE_EXECUTE_TIMEOUT: '4000' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  tpProc.stderr.on('data', () => {});
+  tpProc.stdout.on('data', () => {});
+  const req2 = (method, urlPath, body) => new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const r = http.request({ hostname: HOST, port: TP_PORT, path: urlPath, method, timeout: 30000, headers: data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {} }, res => {
+      let s = ''; res.on('data', c => s += c); res.on('end', () => { try { resolve({ status: res.statusCode, body: JSON.parse(s) }); } catch (e) { resolve({ status: res.statusCode, body: s }); } });
+    });
+    r.on('timeout', () => { r.destroy(); reject(new Error('req2 timeout')); });
+    r.on('error', reject);
+    if (data) r.write(data);
+    r.end();
+  });
+  const tpView = async () => {
+    try { const c = await req2('GET', '/api/clients'); return ((c.body && c.body.clients) || []).find(x => x.id === TP_CLIENT) || {}; } catch { return {}; }
+  };
+  await sleep(1800);
+  const reg2 = await req2('POST', '/api/client/register', { name: TP_CLIENT, capabilities: { sampling: true } }).catch(e => ({ err: e.message }));
+  check('#59a0 第二实例内客户端获准注册(否则走不到取任务路径)', reg2 && reg2.body && reg2.body.status === 'approved', JSON.stringify(reg2).substring(0, 150));
+  // 先开长轮询(取任务的正是它),等 firstPollAt 生效后再派发
+  let pollTask = null;
+  const pollP = req2('POST', '/api/poll', { clientId: TP_CLIENT }).then(r => { pollTask = r && r.body && r.body.task; return r; }).catch(() => {});
+  let polled = false;
+  for (let i = 0; i < 20 && !polled; i++) { const c0 = await tpView(); polled = !!c0.firstPollAt; if (!polled) await sleep(200); }
+  const dispP = req2('POST', '/api/dispatch', { task: '#59 取走任务但永不提交结果,超时必须让状态归位', tools: [TP_CLIENT], auto_fallback: false }).catch(e => ({ err: e.message }));
+  let busySeen = false;
+  for (let i = 0; i < 30; i++) { const c1 = await tpView(); if (c1.state === 'online_busy') { busySeen = true; break; } await sleep(120); }
+  const dres = await dispP;
+  await pollP;
+  await sleep(900); // 超时(4000ms)此刻必已触发
+  const after = await tpView();
+  check('#59a1 任务确被该客户端 poll 取走(证明走的是 taskPending 路径,而非从未领取)', pollTask != null && busySeen === true, JSON.stringify({ taskTaken: pollTask != null, busySeen }).substring(0, 160));
+  check('#59a2 不回结果时 dispatch 必须按超时判失败(不得假成功)', dres && dres.body && dres.body.successCount === 0 && /超时/.test(JSON.stringify(dres.body)), JSON.stringify(dres.body || {}).substring(0, 180));
+  check('#59a3 超时后客户端必须恢复 online_idle(taskPending 不得残留)', after.state === 'online_idle', JSON.stringify({ state: after.state, busy: after.busy }).substring(0, 160));
+  await sleep(1200);
+  const after2 = await tpView();
+  check('#59a4 再等 1.2s 仍为 online_idle(防靠采样时机侥幸蒙绿)', after2.state === 'online_idle', JSON.stringify({ state: after2.state, busy: after2.busy }).substring(0, 160));
+  try { tpProc.stdin.end(); tpProc.kill(); } catch { /* ignore */ }
+  await sleep(400);
+
   // 1.7) 注册能力不得被迟到的旧注册覆盖(#50 指定红集)
   //   实况(指挥官在生产上踩到):桥启动即发 register#1(sampling=false,宿主 initialize 尚未到达),
   //   宿主声明能力后桥再发 register#2(sampling=true)。两条在途请求乱序完成时,后到的旧请求会把
