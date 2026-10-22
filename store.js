@@ -29,23 +29,57 @@ const FILES = {
 
 const _locks = new Map();
 
+// 本轮进程内已确认损坏的 key 集合。为什么要它:load 读不回合法 JSON 时调用方拿到的是
+// 空结构,若随后仍然落盘就会把空结构写成"新真相"——一次手改坏/半写入即静默清库
+// (ACL blocklist 被洗空 = 准入失效;switches 被洗空 = 已关工具全部回启)。
+const _corrupt = new Set();
+
+// 保全坏文件并置脏标志:原字节改名留档,后续该 key 的写一律被闸门拒绝。
+// 绝不抛错(load 是在业务路径上被调的,抛错会让会议中途夭折并堵死并发闸门)。
+function quarantine (key, reason) {
+  if (_corrupt.has(key)) return;
+  _corrupt.add(key); // 先置脏:即使下面改名失败,这道闸门也必须生效
+  let bakInfo = '保全改名失败,原坏文件仍在但绝不覆写';
+  if (fs.existsSync(FILES[key])) {
+    const bak = FILES[key] + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-');
+    try {
+      fs.renameSync(FILES[key], bak);
+      bakInfo = `已保全为 ${path.basename(bak)}`;
+    } catch (_) { /* 权限/占用:保持无备份名,脏标志不回退 */ }
+  }
+  appendLog('error', `存储文件 ${path.basename(FILES[key])} 损坏(${bakInfo};原因: ${reason}),本进程内拒绝覆写`);
+}
+
 function load (key) {
+  const f = FILES[key];
+  if (!f || !fs.existsSync(f)) return {}; // 文件不存在:合法的空,不是损坏,不隔离
   try {
-    const f = FILES[key];
-    if (f && fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf-8'));
-  } catch (_) {}
-  return {};
+    return JSON.parse(fs.readFileSync(f, 'utf-8'));
+  } catch (e) {
+    // 读不确定即不覆写:解析失败与 EBUSY/EPERM 之类的读错误同等对待,保守保全
+    quarantine(key, e.message);
+    return {}; // 仍返回空结构保住可用性,绝不抛错
+  }
 }
 
 function loadList (key) {
+  const f = FILES[key];
+  if (!f || !fs.existsSync(f)) return []; // 文件不存在:合法的空,不是损坏,不隔离
   try {
-    const f = FILES[key];
-    if (f && fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf-8'));
-  } catch (_) {}
-  return [];
+    return JSON.parse(fs.readFileSync(f, 'utf-8'));
+  } catch (e) {
+    // 读不确定即不覆写:解析失败与读错误同等处理,保全后返回空列表
+    quarantine(key, e.message);
+    return [];
+  }
 }
 
 async function save (key, data) {
+  if (_corrupt.has(key)) {
+    // 不抛错:调用方多数忽略返回值,抛错会把存储层的保守策略升级成业务故障
+    appendLog('error', `拒绝覆写 ${path.basename(FILES[key])}:本轮已因解析损坏被隔离`);
+    return false;
+  }
   const f = FILES[key];
   while (_locks.get(f)) { await new Promise(r => setTimeout(r, 10)); }
   _locks.set(f, true);
@@ -56,11 +90,17 @@ async function save (key, data) {
   } finally {
     _locks.set(f, false);
   }
+  return true;
 }
 
 const _syncLocks = new Map();
 
 function saveSync (key, data) {
+  if (_corrupt.has(key)) {
+    // 不抛错,只回传 false:损坏期间的任何"补救性写入"都是二次破坏
+    appendLog('error', `拒绝覆写 ${path.basename(FILES[key])}:本轮已因解析损坏被隔离`);
+    return false;
+  }
   // 自旋等待锁(同步版,最多等 2 秒)
   let waited = 0;
   while (_syncLocks.get(key) && waited < 2000) {
@@ -79,6 +119,7 @@ function saveSync (key, data) {
   } finally {
     _syncLocks.set(key, false);
   }
+  return true;
 }
 
 // ── 日志(JSONL 追加,带简单锁防交错 + 按大小轮转) ──
@@ -249,8 +290,7 @@ function addMessage (meetingId, speaker, content) {
   if (meeting.messages.length > MAX_MEETING_MESSAGES) {
     meeting.messages = meeting.messages.slice(-MAX_MEETING_MESSAGES);
   }
-  saveSync('memory', mem);
-  return meeting;
+  return saveSync('memory', mem);
 }
 
 function getMeeting (meetingId) {
@@ -270,8 +310,7 @@ function closeMeeting (meetingId, summary) {
   meeting.status = 'closed';
   meeting.summary = summary || '';
   meeting.closedAt = new Date().toISOString();
-  saveSync('memory', mem);
-  return meeting;
+  return saveSync('memory', mem);
 }
 
 function recordTask (task) {
@@ -299,7 +338,7 @@ function recordTask (task) {
   });
   // 保留最近 200 条
   if (mem.tasks.length > 200) mem.tasks = mem.tasks.slice(0, 200);
-  saveSync('memory', mem);
+  return saveSync('memory', mem);
 }
 
 function writeExperience (category, content, tags = []) {
@@ -312,7 +351,7 @@ function writeExperience (category, content, tags = []) {
     tags
   });
   if (mem.experiences.length > 100) mem.experiences = mem.experiences.slice(0, 100);
-  saveSync('memory', mem);
+  return saveSync('memory', mem);
 }
 
 function searchMemory (query) {
@@ -427,7 +466,7 @@ function loadACL () {
 }
 
 function saveACL (acl) {
-  saveSync('acl', acl);
+  return saveSync('acl', acl);
 }
 
 module.exports = {

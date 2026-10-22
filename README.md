@@ -258,6 +258,7 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
 ### 已知问题
 
 - 桥层失败路径已根治：`httpGet`/`httpPost` 感知 HTTP 状态码，非 2xx 一律 reject 并在 Error 上附带 `status`/`body` 结构化上下文；`tools/call` 的任何异常统一降级为 MCP 规范的 `isError` 结果（文案前缀"桥调用失败: "），不再返回 jsonrpc -32603。两处"以非 2xx 承载业务语义"的端点按结构化字段显式处理：`/api/poll` 的 404 `未注册` 触发重新注册（中枢重启后桥可自愈）、`/api/client/register` 的 403 `denied` 走 30 秒慢重试。
+- 持久化文件损坏时的保护语义：任一 JSON（`memory.json`/`clients-acl.json`/`switches.json`/`token-stats.json`/`workspaces.json`）解析失败时，中枢把坏文件改名保全为 `<文件>.corrupt-<时间戳>`，并**在本进程内拒绝再写该文件**（防止空结构被当作"新真相"覆写，导致任务历史被洗成 1 条、或黑名单被清空/已关闭工具被静默回启）。期间不影响读取与可用性，只拒绝落盘；`logs.jsonl` 有 `error` 级留痕（含备份文件名）。恢复方式：从 `.corrupt-*` 取回原文件修复后放回，重启进程即恢复写入。
 - `TEST-LOCK.json`：仓库测试锁定机制，用于检测测试文件漂移，哈希由指挥官每次合并后重算。
 
 ## mitmproxy 流量监控（可选）
