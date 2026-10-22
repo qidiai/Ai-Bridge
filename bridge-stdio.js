@@ -214,7 +214,19 @@ function httpPost (path, body, timeoutMs = 600000) {
     }, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch (_) { reject(new Error('服务返回格式错误')); } });
+      res.on('end', () => {
+        // L1':非 2xx reject 带结构化上下文(status/body),错误体 error 原文透传(取不到则 HTTP <code>)
+        let parsed = null; let parsedOk = false;
+        try { parsed = JSON.parse(d); parsedOk = true; } catch (_) {}
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          if (parsedOk) resolve(parsed); else reject(new Error('服务返回格式错误'));
+          return;
+        }
+        const err = new Error((parsedOk && parsed.error) || ('HTTP ' + res.statusCode));
+        err.status = res.statusCode;
+        err.body = parsedOk ? parsed : null;
+        reject(err);
+      });
     });
     req.on('error', e => reject(new Error(`无法连接 AI Bridge 服务(${BRIDGE_HOST}:${BRIDGE_PORT})。请先启动: node server.js\n错误: ${e.message}`)));
     req.on('timeout', () => { req.destroy(); reject(new Error('请求超时')); });
@@ -229,7 +241,19 @@ function httpGet (path) {
     http.get({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, timeout: 30000, headers }, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch (_) { reject(new Error('格式错误')); } });
+      res.on('end', () => {
+        // L1':非 2xx reject 带结构化上下文(status/body),错误体 error 原文透传(取不到则 HTTP <code>)
+        let parsed = null; let parsedOk = false;
+        try { parsed = JSON.parse(d); parsedOk = true; } catch (_) {}
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          if (parsedOk) resolve(parsed); else reject(new Error('格式错误'));
+          return;
+        }
+        const err = new Error((parsedOk && parsed.error) || ('HTTP ' + res.statusCode));
+        err.status = res.statusCode;
+        err.body = parsedOk ? parsed : null;
+        reject(err);
+      });
     }).on('error', e => reject(new Error(`无法连接服务: ${e.message}`)));
   });
 }
@@ -619,7 +643,12 @@ async function handleMessage (msg) {
     if (TOOLSET === 'lite' && !LITE_TOOLS.includes(params.name)) {
       result = { content: [{ type: 'text', text: `工具 ${params.name} 在 toolset=lite 下不可用(可用: ${LITE_TOOLS.join(', ')})` }], isError: true };
     } else {
-      result = await callTool(params.name, params.arguments || {});
+      try {
+        result = await callTool(params.name, params.arguments || {});
+      } catch (e) {
+        // L2:tools/call 统一降级为 MCP 规范的 isError CallToolResult,不走 jsonrpc error
+        result = { content: [{ type: 'text', text: '桥调用失败: ' + (e && e.message ? e.message : String(e)) }], isError: true };
+      }
     }
     break;
   case 'ping': result = {}; break;
@@ -695,7 +724,13 @@ async function registerWithRetry () {
   const MAX_RETRIES = 100;
   while (retryCount < MAX_RETRIES) {
     try {
-      const r = await httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC } });
+      let r;
+      try {
+        r = await httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC } });
+      } catch (e) {
+        if (e && e.status === 403 && e.body && e.body.status === 'denied') r = e.body;
+        else throw e; // 连接层失败:交给外层既有 catch(指数退避)
+      }
       if (r && r.status === 'approved') {
         registeredClientId = r.clientId || CLIENT_NAME;
         hasRegistered = true;
@@ -726,7 +761,13 @@ let lastPollErrorLogAt = 0; // 限频日志:同类轮询错误每 60 秒最多�
 async function pollLoop () {
   while (true) {
     try {
-      const res = await httpPost('/api/poll', { clientId: registeredClientId });
+      let res;
+      try {
+        res = await httpPost('/api/poll', { clientId: registeredClientId });
+      } catch (e) {
+        if (e && e.status === 404 && e.body && e.body.error === '未注册') res = e.body;
+        else throw e; // 真·不可用:交给外层既有 catch(5 秒重试+限频日志)
+      }
       if (res && res.error === '未注册') {
         process.stderr.write('[ai-bridge] 已被服务端移除,重新申请加入...\n');
         const ok = await registerWithRetry();

@@ -257,7 +257,7 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
 
 ### 已知问题
 
-- `httpGet`/`httpPost` 丢弃 HTTP 状态码：桥层只解析响应体 JSON，服务端 404 错误体与 200 正常体在桥层不可区分；桥层失败路径集中化错误处理（T-D）在途。
+- 桥层失败路径已根治：`httpGet`/`httpPost` 感知 HTTP 状态码，非 2xx 一律 reject 并在 Error 上附带 `status`/`body` 结构化上下文；`tools/call` 的任何异常统一降级为 MCP 规范的 `isError` 结果（文案前缀"桥调用失败: "），不再返回 jsonrpc -32603。两处"以非 2xx 承载业务语义"的端点按结构化字段显式处理：`/api/poll` 的 404 `未注册` 触发重新注册（中枢重启后桥可自愈）、`/api/client/register` 的 403 `denied` 走 30 秒慢重试。
 - `TEST-LOCK.json`：仓库测试锁定机制，用于检测测试文件漂移，哈希由指挥官每次合并后重算。
 
 ## mitmproxy 流量监控（可选）
