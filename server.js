@@ -660,7 +660,7 @@ async function executeClient (clientName, task, opts = {}) {
     clientTask = withWorkspaceBrief(task, opts.workspace.path);
   }
 
-  // CAS: 检查并原子设置 pendingResolve
+  // check-then-act:先检查再设置待办槽位,其"不会被穿插"只来自单线程事件循环下检查与写入之间没有 await;跨 await 的并发正确性由 #55 端到端验收兜
   if (client.pendingResolve) {
     throw new Error(`客户端 ${clientName} 正在处理另一个任务,请稍后重试`);
   }
@@ -681,26 +681,23 @@ async function executeClient (clientName, task, opts = {}) {
       reject(new Error(`客户端 ${clientName} 响应超时`));
     }, opts.timeout || CONFIG.EXECUTE_TIMEOUT);
 
-    connectedClients.set(clientName, {
-      ...client,
-      pendingTask: {
-        task: clientTask,
-        taskId: opts.taskId || `${clientName}_${Date.now()}`,
-        workspace: opts.workspace ? { id: opts.workspace.id, name: opts.workspace.name, path: opts.workspace.path } : null
-      },
-      pendingResolve: (result) => {
-        clearTimeout(timeout);
-        const current = connectedClients.get(clientName);
-        if (current) current._busy = false;
-        resolve(result);
-      },
-      pendingReject: (err) => {
-        clearTimeout(timeout);
-        const current = connectedClients.get(clientName);
-        if (current) current._busy = false;
-        reject(err);
-      }
-    });
+    client.pendingTask = {
+      task: clientTask,
+      taskId: opts.taskId || `${clientName}_${Date.now()}`,
+      workspace: opts.workspace ? { id: opts.workspace.id, name: opts.workspace.name, path: opts.workspace.path } : null
+    };
+    client.pendingResolve = (result) => {
+      clearTimeout(timeout);
+      const current = connectedClients.get(clientName);
+      if (current) current._busy = false;
+      resolve(result);
+    };
+    client.pendingReject = (err) => {
+      clearTimeout(timeout);
+      const current = connectedClients.get(clientName);
+      if (current) current._busy = false;
+      reject(err);
+    };
   });
 }
 
@@ -1708,7 +1705,8 @@ const server = http.createServer(async (req, res) => {
 
       if (client.pendingTask) {
         sendJSON(res, 200, { task: client.pendingTask });
-        connectedClients.set(body.clientId, { ...client, pendingTask: null, taskPending: true });
+        client.pendingTask = null;
+        client.taskPending = true;
         return;
       }
 
@@ -1733,7 +1731,8 @@ const server = http.createServer(async (req, res) => {
         c.lastSeen = Date.now(); // 打开的长轮询就是活跃心跳
         if (c.pendingTask) {
           finish({ task: c.pendingTask });
-          connectedClients.set(body.clientId, { ...c, pendingTask: null, taskPending: true });
+          c.pendingTask = null;
+          c.taskPending = true;
         }
       }, 1000);
 
@@ -1757,7 +1756,12 @@ const server = http.createServer(async (req, res) => {
           const result = { content: body.content || '', codeBlocks: body.codeBlocks || [], usage: body.usage || null };
           client.pendingResolve(result);
         }
-        connectedClients.set(body.clientId, { ...client, pendingResolve: null, pendingReject: null, taskPending: false, _busy: false, lastSeen: Date.now(), lastError: body.failed === true ? (body.content || '客户端执行失败').substring(0, 300) : null });
+        client.pendingResolve = null;
+        client.pendingReject = null;
+        client.taskPending = false;
+        client._busy = false;
+        client.lastSeen = Date.now();
+        client.lastError = body.failed === true ? (body.content || '客户端执行失败').substring(0, 300) : null;
         sendJSON(res, 200, { success: true });
       } else {
         // pendingResolve 已过期(超时被清了),通知客户端;留 warn 日志便于事后追查丢结果
