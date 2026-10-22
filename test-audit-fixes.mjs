@@ -236,6 +236,51 @@ section('G) 任务态 map 禁止整体替换(#41)');
   check('G2d /api/result 必须就地刷新 lastSeen(≥2,否则回写后被判 stale)', nSeen >= 2, `实测=${nSeen} 要求>=2`);
 }
 
+// ── H) 超时/被杀的真实归因(#54,指挥官亲笔,编码手禁改) ──
+// 实况(生产取证 2026-10-23):atom-code 一次超时在台账里记成
+//   reason="Command exited with code null: Console code pages: input 936, output 9…"
+// ——"code null" 是被信号杀死的表征,后半段根本不是失败原因,而是 CLI 自己的启动横幅。
+// 根因在 adapters/cli-adapter.js:runCommand 的 close 处理器:
+//   ① `child.on('close', (code) => …)` 把第二参数 signal 整个丢了(本机实测 spawn({timeout}) 杀死时
+//      close 回 code=null, signal='SIGTERM', killed=true,与"进程自己以 0 以外的码退出"无法区分);
+//   ② 详情取 `(stderr || stdout).substring(0, 200)` 的**头部**,而真因几乎总在末尾,头部常是横幅。
+//   该 err.message 会经 server.js:514 `reason: error.message` 与 :600 `error: execError.message`
+//   原样进台账/流量记录 —— 中枢侧无需改动,修点只在适配器。
+// 锁的是"归因必须指向真因",不锁具体措辞:允许"被信号 SIGTERM 终止/超时"等任一表达,只要
+// ①不再出现 `code null` 这种无归因字面,②详情含尾部真因,③结构化 signal 可被上层判定器使用,
+// ④普通非零退出仍照旧如实报码(防修 signal 时把常规失败弄丢)。
+section('H) 超时归因不得误导(#54)');
+try {
+  const { CliAdapter } = require('./adapters/cli-adapter.js');
+  const mk = (script, timeout) => new CliAdapter({
+    name: 'h54', command: 'node', args: ['-e', script], inputMode: 'arg',
+    outputMode: 'stdout-text', timeout
+  });
+  const grab = async (adapter, task) => {
+    try { await adapter.execute(task, { taskId: 'h54', outputDir: path.join(tmpOut, 'h'), workspaceDir: tmpWs }); return { ok: true, err: null }; }
+    catch (e) { return { ok: false, err: e }; }
+  };
+  // H1/H3:超时被信号杀 → 必须点明信号/超时,并带结构化 signal 供上层判定
+  const hang = await grab(mk('console.log("H_BANNER_HEAD");setTimeout(()=>{},5000)', 700), 'x');
+  const hangMsg = hang.err ? String(hang.err.message) : '';
+  check('H1 被信号终止不得记成"code null"空归因(必须点明信号或超时)',
+    hang.ok === false && /SIGTERM|信号|超时|终止/.test(hangMsg) && !/code null/.test(hangMsg),
+    hang.ok ? '居然未抛错(超时没生效,视为红)' : `message=${hangMsg.substring(0, 160)}`);
+  check('H3 抛错必须携带结构化 signal(本机实测应为 SIGTERM),供判定器区分被杀与非零退出',
+    hang.ok === false && hang.err.signal === 'SIGTERM', `signal=${JSON.stringify(hang.err && hang.err.signal)} code=${JSON.stringify(hang.err && hang.err.code)}`);
+  // H2:真因在末尾,详情必须给尾部(现实现取头 200 字节,只会拿到头部噪声)
+  const tailScript = 'console.error("HEAD_NOISE_" + "x".repeat(400) + "TAIL_REAL_CAUSE");process.exit(3);';
+  const tail = await grab(mk(tailScript, 30000), 'y');
+  const tailMsg = tail.err ? String(tail.err.message) : '';
+  check('H2 失败详情必须包含尾部真因(不得只截头部 200 字节的启动噪声)',
+    tail.ok === false && tailMsg.includes('TAIL_REAL_CAUSE'), `message 头部=${tailMsg.substring(0, 120)}`);
+  // H4:普通非零退出的码不得被修丢
+  check('H4 非零正常退出仍须如实携带退出码(防修 signal 时把常规失败弄丢)',
+    tail.ok === false && tail.err.code === 3, `code=${JSON.stringify(tail.err && tail.err.code)}`);
+} catch (e) {
+  check('H 段用例执行未抛异常', false, e.message);
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');
