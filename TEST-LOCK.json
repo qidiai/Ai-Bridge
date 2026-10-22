@@ -1,7 +1,7 @@
 {
-  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#41 已合并,当前无在途交付物。遗留待办:#54(超时归因,cli-adapter:312 丢 signal)、#59(taskPending 超时不清→永久 online_busy)、#57(同宿主多会话塌成 unknown 且不可观测)。",
-  "updated": "2026-10-23 (#41 落盘:任务态就地 mutate,G1/G2a/G2b 红锁清零;当前无在途交付物)",
-  "head": "c93ff54",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#54 已合并,当前无在途交付物。遗留待办:#59(taskPending 超时不清)、#36(点名被跳过者不进分母)、#60(判定器短文本数字子串误伤)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)。",
+  "updated": "2026-10-23 (#54 落盘:超时归因真实化,H1/H2/H3 清零;当前无在途交付物)",
+  "head": "0db17d2",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
@@ -13,7 +13,7 @@
   "red_baseline": {
     "test-store-corrupt.mjs": "23/23 全绿",
     "test-e2e.mjs": "175/175 全绿(状态流转 online_busy→online_idle 三条实测 ✅)",
-    "test-audit-fixes.mjs": "38/38 全绿(#41 G1/G2a/G2b 转绿;E1-E3 与 F1-F4 不回退)",
+    "test-audit-fixes.mjs": "42/42 全绿(#54 H1/H2/H3 转绿,H4 与 A-D/E/F/G 不回退)",
     "test-unit.mjs": "41/41",
     "test-workspace.mjs": "36/36",
     "test-external-fixes.mjs": "45/0"
@@ -25,7 +25,7 @@
     "workspace-manager.js": "dfa3f24d0ae49cd03c85413ce27bea3adab5e571",
     "bridge-stdio.js": "63b8084debb16fc096cba2cae4b927ddf3198d48",
     "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
-    "adapters/cli-adapter.js": "a16b99df63c7a29e42c8c4ea453a9d62d0e47e39",
+    "adapters/cli-adapter.js": "ee8cbf700c5d9a31c311681b4f1b54785fe6b9bd",
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
     ".eslintrc.json": "f8735f334ba169e9af9a9efe0fb3773c3d58a549",
     "package.json": "b860aaee2d698b6b76d1117f0d4d87e3ea1ebe92",
@@ -39,7 +39,7 @@
     "workspace-manager.js": "T-A/B/C(621161e) 以来未变",
     "bridge-stdio.js": "#53/#48(012f828) HTTP_TIMEOUT_MS/GET_TIMEOUT_MS/CALL_BUDGET_MS + callTool 总超时",
     "tool-registry.js": "#37(4094d20) 以来未变",
-    "adapters/cli-adapter.js": "E2-lint 收尾(25) 以来未变",
+    "adapters/cli-adapter.js": "#54(0db17d2) close 收下 signal + 详情取尾部 + err.signal/timedOut",
     "tools.json": "#35 待办,当前值 07adb690",
     ".eslintrc.json": "E2-lint(22)",
     "package.json": "E2-lint(22)",
