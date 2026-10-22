@@ -676,6 +676,7 @@ async function executeClient (clientName, task, opts = {}) {
         c.pendingResolve = null;
         c.pendingReject = null;
         c._busy = false;
+        c.taskPending = false;
       }
       METRICS.clientTimeouts++;
       reject(new Error(`客户端 ${clientName} 响应超时`));
