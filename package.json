@@ -5,7 +5,13 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "edge": "node edge-agent.js"
+    "edge": "node edge-agent.js",
+    "lint": "eslint . --ext .js,.mjs",
+    "lint:fix": "eslint . --ext .js,.mjs --fix",
+    "test": "node test-unit.mjs && node test-workspace.mjs && node test-e2e.mjs",
+    "test:unit": "node test-unit.mjs",
+    "test:ws": "node test-workspace.mjs",
+    "test:e2e": "node test-e2e.mjs"
   },
   "devDependencies": {
     "node-windows": "^1.0.0-beta.8"

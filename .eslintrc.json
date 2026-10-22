@@ -1,0 +1,78 @@
+{
+  // root:true 切断向仓根配置级联，避免继承 standard 的风格规则
+  "root": true,
+  "env": {
+    "node": true,
+    "es2022": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "script"
+  },
+  "extends": [
+    "eslint:recommended"
+  ],
+  "overrides": [
+    {
+      // ai-bridge 的 .mjs 是 ESM 测试套件，按 module 解析
+      "files": ["*.mjs"],
+      "parserOptions": {
+        "sourceType": "module"
+      },
+      "env": {
+        "node": true,
+        "es2022": true
+      }
+    }
+  ],
+  // 一次性脚本/安装器/历史散落脚本不入护栏；生产模块与四套正式测试必须入内
+  "ignorePatterns": [
+    "node_modules/",
+    "test-runtime-data/",
+    "output/",
+    "workspaces/",
+    "*.bak-*",
+    "*.bak",
+    "check-active.js",
+    "cleanup-stuck.js",
+    "install-service.js",
+    "install-service-nodewin.js",
+    "uninstall-service-nodewin.js",
+    "qidi-sync.js",
+    "test-audit.js",
+    "test-audit2.js",
+    "test-discuss.js",
+    "test-discuss-impl.js",
+    "test-full.js",
+    "test-http.js",
+    "test-run.js",
+    "ocr.py"
+  ],
+  "rules": {
+    // 风格类一律关闭：ai-bridge 既有代码为无分号/紧凑回调风格，批量重排会破坏冻结面且令审阅不可读
+    "indent": "off",
+    "brace-style": "off",
+    "quotes": "off",
+    "semi": "off",
+    "object-property-newline": "off",
+    "space-before-function-paren": "off",
+    "quote-props": "off",
+    "comma-dangle": "off",
+    "keyword-spacing": "off",
+    "eol-last": "off",
+    "multiline-ternary": "off",
+    "no-mixed-spaces-and-tabs": "off",
+    // no-console 关闭：桥/中枢是 CLI 常驻服务，stdout/stderr 为正常输出通道
+    "no-console": "off",
+    // no-empty 放宽：桥/中枢大量 catch(_) {} 为有意的火后不理，允许空 catch
+    "no-empty": ["error", { "allowEmptyCatch": true }],
+    // no-unused-vars 降为警告：存在历史预留参数与捕获变量，非缺陷；不改源码故不判 error
+    "no-unused-vars": ["warn", { "args": "none", "caughtErrors": "none" }],
+    // no-constant-condition 降为警告：bridge-stdio.js:762 while(true) 为长轮询常驻循环的有意写法，非缺陷（且属冻结面，禁改源码）
+    "no-constant-condition": "warn",
+    // no-control-regex 降为警告：workspace-manager.js:79/88 正则以 \u0000-\u001f 校验/剔除非法控制字符，匹配控制字符即其本意，非缺陷
+    "no-control-regex": "warn",
+    // no-useless-escape 降为警告：adapters/base.js:49 字符类内 \[ 为冗余但无害转义，行为正确，属可改可不改的风格噪声，禁改源码故降警告
+    "no-useless-escape": "warn"
+  }
+}

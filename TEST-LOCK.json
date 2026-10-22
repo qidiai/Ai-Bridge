@@ -1,9 +1,11 @@
 {
-  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。T-D 已合并落地(本提交):section 9.3 六断言全绿(141/143→143/143),红集 D1/D2 清零,D2b/D3 回归防护保持绿;R1 返工补 L3/L4 结构化解包,修复 L1 首版把 /api/poll 404 未注册误当连接失败导致桥失去中枢重启自愈的回归。T-D2 在途:L1' 的 err.message 兼容 parsed.error || parsed.message,并补 discuss interrupt 的 meetingId 前置校验与全分支剥离 action。",
-  "updated": "2026-10-22 (T-D 合并后由指挥官重算)",
-  "head": "5247a45",
+  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。T-D 已合并(b1adcbf):section 9.3 六断言全绿,红集 D1/D2 清零,D2b/D3 回归防护保持绿;R1 补 L3/L4 结构化解包修复首版 L1 误判 /api/poll 404 未注册为连接失败导致桥失去中枢重启自愈的回归。E2-lint 已合并:ai-bridge 独立 .eslintrc.json(root:true 切断仓根级联,关风格留正确性)+ package.json scripts,实测 0 error/18 warning,13 个被 ignore 的一次脚本若入网亦为 0 error(护栏非靠排除凑绿)。四套件基线 143/41/36/24/45 全绿。待办:T-D2(err.message 兼容 parsed.message、discuss interrupt 前置校验 meetingId、全分支剥离 action;并清理指挥官自留的 test-e2e.mjs:463 deadText 未用变量)、E2-ci(等用户 WIP 的 ci.yml/package.json/.eslintrc.json 解冻)。",
+  "updated": "2026-10-22 (E2-lint 合并后由指挥官重算,锁面扩至四套件+护栏配置)",
+  "head": "b1adcbf",
   "hashes": {
     "test-e2e.mjs": "d6e16c564cdd3c58f9ba406a2807df95e12f3348",
+    "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
+    "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
     "test-external-fixes.mjs": "e1b11cf4e604ad8aaf052ca8949d2fce14f0ec5f",
     "test-audit-fixes.mjs": "e625a0968f217a41e49d08eaf0d6d0f4a26d15d2",
     "bridge-stdio.js": "718619df4768f674812cb2dc7902a08a2682c52b",
@@ -11,7 +13,9 @@
     "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
     "adapters/cli-adapter.js": "a16b99df63c7a29e42c8c4ea453a9d62d0e47e39",
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
+    ".eslintrc.json": "92b45892de58c2d0c34a9fc62e21dd49a6ecfb8e",
+    "package.json": "7348ac4b8d1f4212142e323a36979485340982fa",
     "README.md": "e1ac9b69bde8c8118f86cba296a4870e86947486",
-    "ARCHITECTURE.md": "736f68a8695e9f9eb453a465bb1d13e887ed3cdc"
+    "ARCHITECTURE.md": "4a9a107986fd2d507a381b028df82a217873672d"
   }
 }
