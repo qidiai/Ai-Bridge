@@ -196,7 +196,7 @@ async function main () {
   fs.mkdirSync(TEST_RUNTIME, { recursive: true });
   // 种子 ACL:预批准 e2e 客户端；另含与内置 CLI 同名的 openclaw，验证 client- 前缀 ID 回传链路
   fs.writeFileSync(testDataPath('clients-acl.json'),
-    JSON.stringify({ allowlist: [CLIENT, STALE_CLIENT, REVIEWER, CONFLICT_CLIENT, CONFLICT_CLIENT_ID], blocklist: [], pending: [] }, null, 2));
+    JSON.stringify({ allowlist: [CLIENT, STALE_CLIENT, REVIEWER, CONFLICT_CLIENT, CONFLICT_CLIENT_ID, 'e2e-seq-probe', 'e2e-race-probe'], blocklist: [], pending: [] }, null, 2));
   // 种子 memory:4 个遗留会议(3 个非终态=中枢崩溃留下的孤儿, 1 个已关闭=对照不得被改动)。
   // 用于 #39 启动清扫断言——必须在中枢启动前落盘,因为清扫只发生在启动序列里。
   fs.writeFileSync(testDataPath('memory.json'), JSON.stringify({
@@ -273,6 +273,61 @@ async function main () {
   check('#52b2 启动进程未崩溃(仍在运行)', bootProc.exitCode === null, 'exitCode=' + bootProc.exitCode);
   try { bootProc.kill(); } catch { /* ignore */ }
   await sleep(400);
+
+  // 1.7) 注册能力不得被迟到的旧注册覆盖(#50 指定红集)
+  //   实况(指挥官在生产上踩到):桥启动即发 register#1(sampling=false,宿主 initialize 尚未到达),
+  //   宿主声明能力后桥再发 register#2(sampling=true)。两条在途请求乱序完成时,后到的旧请求会把
+  //   supportsSampling 覆写回 false → 接入的编程软件永久失去执行资格("加载中枢把外部软件当子智能体"
+  //   这条主链的第一道门),且没有自愈路径。
+  //   契约:注册带单调 registerSeq;seq 更小的注册不得改动能力;seq 更大者允许真实撤回(必须可升可降,
+  //   否则宿主真的不再支持 sampling 时留下虚高能力);不带 registerSeq 的旧客户端维持现有语义。
+  section('注册顺序契约:#50 红集');
+  const seqReg = (sampling, seq) => req('POST', '/api/client/register', {
+    name: 'e2e-seq-probe',
+    // 中枢只接受布尔能力声明(server.js: `typeof body.capabilities?.sampling === 'boolean'`),
+    // 与桥侧 `hostSupportsSampling = !!params?.capabilities?.sampling` 的归一化结果同形
+    capabilities: { sampling: sampling === true },
+    ...(seq === undefined ? {} : { registerSeq: seq })
+  });
+  const clientView = async (id) => {
+    const c = await req('GET', '/api/clients');
+    return (c.body.clients || []).find(x => x.id === id) || {};
+  };
+  await seqReg(true, 1000);
+  await req('POST', '/api/poll', { clientId: 'e2e-seq-probe' }).catch(() => {});
+  const s1 = await clientView('e2e-seq-probe');
+  check('#50a1 新注册(sampling=true)后能力应为 true', s1.supportsSampling === true, JSON.stringify(s1).substring(0, 150));
+  await seqReg(false, 500);
+  const s2 = await clientView('e2e-seq-probe');
+  check('#50a2 迟到的旧注册(seq 更小)不得把能力降级', s2.supportsSampling === true, JSON.stringify(s2).substring(0, 150));
+  await seqReg(false, 2000);
+  const s3 = await clientView('e2e-seq-probe');
+  check('#50a3 更新的注册仍须能真实撤回能力(不得做成只升不降)', s3.supportsSampling === false, JSON.stringify(s3).substring(0, 150));
+  const noCap = await req('POST', '/api/dispatch', { task: 'x', tools: ['e2e-seq-probe'], auto_fallback: false });
+  check('#50a4 点名派发无资格客户端时错误须点名 sampling(而非泛泛的"能力/禁用")',
+    noCap.status === 400 && /sampling|推理型/i.test(JSON.stringify(noCap.body)), JSON.stringify(noCap.body).substring(0, 200));
+  await req('POST', '/api/toggle', { tool: 'client:e2e-seq-probe', enabled: false }).catch(() => {});
+  await req('POST', '/api/clients/kick', { clientId: 'e2e-seq-probe', block: false }).catch(() => {});
+
+  // 真桥乱序复现:桥一起来就立刻发 initialize(不 await),与首条注册并发在途 → 最终必须拿到执行资格
+  const raceProc = spawn(process.execPath, ['bridge-stdio.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-race-probe', AI_BRIDGE_CAP_EXEC: '1' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const raceMcp = makeMcpChannel(raceProc);
+  raceMcp.request('initialize', { capabilities: { sampling: {} } });
+  let raceLast = {};
+  let raceOk = false;
+  for (let i = 0; i < 30; i++) {
+    await sleep(400);
+    raceLast = await clientView('e2e-race-probe');
+    if (raceLast.supportsSampling === true && raceLast.executionEligible === true) { raceOk = true; break; }
+  }
+  check('#50b1 真桥并发乱序注册后仍须具备执行资格(生产踩坑复现)', raceOk, JSON.stringify(raceLast).substring(0, 150));
+  try { raceProc.stdin.end(); raceProc.kill(); } catch { /* ignore */ }
+  await req('POST', '/api/toggle', { tool: 'client:e2e-race-probe', enabled: false }).catch(() => {});
+  await req('POST', '/api/clients/kick', { clientId: 'e2e-race-probe', block: false }).catch(() => {});
 
   // 2) 准入管理全流程(HTTP 直连中枢)
   section('准入控制:陌生客户端 → 待审批 → 批准 → 踢出');

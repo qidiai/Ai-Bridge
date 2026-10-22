@@ -1,7 +1,7 @@
 {
   "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定。#52 在途交付物=store.js(markOrphanMeetings 形状守卫+按 #44 口径隔离)+server.js(顶层启动调用包 try/catch,启动期数据异常绝不得阻止进程起来)。",
-  "updated": "2026-10-23 (#52 合并后由指挥官重算)",
-  "head": "4cdbefd",
+  "updated": "2026-10-23 (#50 前置红基线,由指挥官重算)",
+  "head": "afacc4c",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
@@ -10,7 +10,7 @@
   },
   "red_baseline": {
     "test-store-corrupt.mjs": "23/23 全绿(#52a1/a2/a3 清零)",
-    "test-e2e.mjs": "166/166 全绿(#52b1/b2 真启动探针转绿:#39 组与 9.x 组全部保持绿)"
+    "test-e2e.mjs": "168/171:指定红集 #50a2(迟到的旧注册把 supportsSampling 降级)/#50a4(no_targets 未点名 sampling)/#50b1(真桥并发乱序注册后永无执行资格,生产踩坑复现);#50a1 前置条件、#50a3 防只升不降,两条为绿"
   },
   "source_faces": {
     "store.js": "140ba55dd6febe8e59d4cee0c96e29b20eae3e8c",
