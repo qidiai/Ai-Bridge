@@ -1,9 +1,9 @@
 {
-  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。red-baseline 说明:test-e2e 当前指定红集=4项 manage_client/清单载体断言,T-A 交付时须清零。 T-A/B/C 批次:bridge-stdio.js 解冻并已改(15 工具面+toolset 套餐);三套件哈希仍未变;red-baseline 4 项已于本合并清零。 T-Doc 批次:仅文档两 md 变化(README 断言与 bridge-stdio.js 实况逐码核对通过),ARCHITECTURE.md 纳入锁面。下一步 T-D 前置:指挥官在 test-e2e 写入 3 条红断言(预期 139→142,指定红集=3),重算本工件。",
-  "updated": "2026-10-22 (T-Doc 合并后由指挥官重算)",
-  "head": "621161e5a43dde6b14cd0ea52aa51a87bf11c649",
+  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。T-D 前置红基线(本提交):test-e2e 新增 section 9.3 六断言,实测 141/143,指定红集=2(D1 假会议 isError+透传'会议不存在';D2 中枢离线 tools/call 须为 isError 的 CallToolResult 形态)。D2b 存活/D3 重启自愈为绿的回归防护,交付后不得回退。RCA 更正:callTool reject 现由 handleMessage 入口 .catch(sendError) 以 jsonrpc -32603 兜底,桥不崩溃但形态不合 MCP 规范——T-D 的 L2 是把该兜底升级为 callTool 专属 try/catch + isError CallToolResult,禁止在别处新加 catch 造成双重兜底。",
+  "updated": "2026-10-22 (T-D 前置红基线提交,由指挥官重算)",
+  "head": "a455bfa",
   "hashes": {
-    "test-e2e.mjs": "8c598553b7ab82c3182bf2259fbe4cef3665ec21",
+    "test-e2e.mjs": "d6e16c564cdd3c58f9ba406a2807df95e12f3348",
     "test-external-fixes.mjs": "e1b11cf4e604ad8aaf052ca8949d2fce14f0ec5f",
     "test-audit-fixes.mjs": "e625a0968f217a41e49d08eaf0d6d0f4a26d15d2",
     "bridge-stdio.js": "d3ad0782e59e56e557fd7e05426f0f1a1f920a12",

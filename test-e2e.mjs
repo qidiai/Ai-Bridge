@@ -432,6 +432,54 @@ async function main () {
   const mcK = await mcp.request('tools/call', { name: 'manage_client', arguments: { action: 'kick', client_key: 'e2e-fake-client' } });
   check('manage_client kick 未连接 client 仍成功', !mcK.error && !mcK.result?.isError, JSON.stringify(mcK.result?.content?.[0]?.text || mcK).substring(0, 160));
 
+  // 9.3) 桥层失败路径(T-D 指定红集=3):
+  //   D1 中枢对不存在会议返回 404 {error:'会议不存在'}——桥 httpGet/httpPost 丢弃状态码,
+  //      404 错误体被当 200 正常体渲染出 undefined 字段(F5 实况)。T-D 要求:isError 且文本含"会议不存在"、不泄露 undefined。
+  //   D2 中枢离线时 tools/call 必须落成 isError 的 CallToolResult(现仅靠 handleMessage 的 jsonrpc -32603 兜底,
+  //      非 MCP 规范形态),且桥进程绝不因单次调用失败而死。
+  //   D3 中枢重启后长驻桥必须自动重注册并恢复(回归防护:根治不得破坏既有自愈路径)。
+  section('桥层失败路径:T-D 根治红集');
+  const dStatus = await mcp.request('tools/call', { name: 'discuss', arguments: { action: 'status', meetingId: 'no-such-meeting-e2e' } });
+  const dText = (dStatus.result?.content || []).map(c => c.text || '').join('\n');
+  check('D1 discuss status 假会议 → isError 且透传"会议不存在",不泄露 undefined',
+    dStatus.result?.isError === true && /会议不存在/.test(dText) && !/undefined/.test(dText),
+    JSON.stringify(dStatus).substring(0, 200));
+
+  const DEAD_PORT = 9899;
+  const deadProc = spawn(process.execPath, ['bridge-stdio.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(DEAD_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-dead-probe' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const deadMcp = makeMcpChannel(deadProc);
+  const deadCall = deadMcp.request('tools/call', { name: 'list_tools', arguments: {} });
+  const earlyExit = await Promise.race([
+    deadCall.then(() => 'answered'),
+    new Promise(res => deadProc.once('exit', code => res('exited:' + code)))
+  ]);
+  const aliveAfterDead = earlyExit === 'answered' && deadProc.exitCode === null;
+  let deadResp = null;
+  if (aliveAfterDead) { try { deadResp = await deadCall; } catch { deadResp = null; } }
+  const deadText = ((deadResp?.result?.content) || []).map(c => c.text || '').join('\n');
+  check('D2 中枢离线 tools/call → isError 优雅降级(CallToolResult 形态)', aliveAfterDead && deadResp?.result?.isError === true, JSON.stringify(deadResp || earlyExit).substring(0, 160));
+  check('D2b 桥在调用失败后进程仍存活', aliveAfterDead, String(earlyExit));
+
+  serverProc.kill();
+  let hubDown = false;
+  for (let i = 0; i < 40 && !hubDown; i++) { await sleep(150); try { await req('GET', '/api/health'); } catch { hubDown = true; } }
+  serverProc = spawn(process.execPath, ['server.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_DATA_DIR: TEST_RUNTIME, AI_BRIDGE_DB: TEST_DB, AI_BRIDGE_OBSERVE_DIR: TEST_OBSERVE, AI_BRIDGE_WORKSPACE_ROOT: path.join(TEST_RUNTIME, 'workspaces'), AI_BRIDGE_CLIENT_TTL: '1200', AI_BRIDGE_TOKEN: '' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  serverProc.stderr.on('data', d => { serverErr += d.toString(); });
+  await waitServerReady();
+  await waitClientConnected(CLIENT, 20000);
+  const dAfterRecover = await mcp.request('tools/call', { name: 'list_tools', arguments: {} });
+  const recoverText = ((dAfterRecover?.result?.content) || []).map(c => c.text || '').join('\n');
+  check('D3 中枢重启后桥自动重注册并恢复服务', !dAfterRecover.error && dAfterRecover.result?.isError !== true && /e2e-probe/.test(recoverText), JSON.stringify(dAfterRecover).substring(0, 200));
+  try { deadProc.stdin.end(); deadProc.kill(); } catch { /* ignore */ }
+
   // 9.5) 智能路由:关闭全部本机 CLI 工具(确定性),未指定 tools 时按综合评分自动选优
   section('智能路由:未指定 tools 使用可解释综合评分');
   const allT = await req('GET', '/api/tools');
