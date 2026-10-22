@@ -1,0 +1,16 @@
+{
+  "note": "锁定测试与冻结面哈希工件。哈希由指挥官在每次合并提交后重算更新;编码手禁止修改本文件与所列测试。red-baseline 说明:test-e2e 当前指定红集=4项 manage_client/清单载体断言,T-A 交付时须清零。",
+  "updated": "2026-10-22",
+  "head": "d6f60f228e656b9a1283a5084f9f03d9ff77f847",
+  "hashes": {
+    "test-e2e.mjs": "8c598553b7ab82c3182bf2259fbe4cef3665ec21",
+    "test-external-fixes.mjs": "e1b11cf4e604ad8aaf052ca8949d2fce14f0ec5f",
+    "test-audit-fixes.mjs": "e625a0968f217a41e49d08eaf0d6d0f4a26d15d2",
+    "bridge-stdio.js": "bb95f75dcd5db5551dd9a2f9915e7f5207b6ed41",
+    "server.js": "f4232a912e88ef05cec6b7ba19913d213c5fc4b5",
+    "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
+    "adapters/cli-adapter.js": "a16b99df63c7a29e42c8c4ea453a9d62d0e47e39",
+    "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
+    "README.md": "08e0a08815de40d503abf72950b90c1993883969"
+  }
+}

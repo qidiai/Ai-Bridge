@@ -315,10 +315,12 @@ async function main () {
   check('宿主声明 sampling 后客户端具备执行资格', capabilityClient?.supportsSampling === true && capabilityClient?.executionEligible === true, JSON.stringify(capabilityClient));
   const tl = await mcp.request('tools/list', {});
   const names = (tl.result?.tools || []).map(t => t.name);
+  // T-A 后精确名单(15):approve/deny/kick 并入 manage_client,discuss 三件套并入 discuss
   const expected = ['dispatch', 'list_tools', 'toggle_tool', 'list_switches', 'token_stats', 'handoff',
-    'memory_search', 'memory_recent', 'logs', 'discuss', 'list_clients', 'approve_client', 'deny_client', 'kick_client',
-    'list_workspaces', 'create_workspace'];
+    'memory_search', 'memory_recent', 'logs', 'discuss', 'list_clients', 'manage_client',
+    'list_workspaces', 'create_workspace', 'recognize_image'];
   check('tools/list 暴露全部核心工具', expected.every(n => names.includes(n)), '缺失: ' + expected.filter(n => !names.includes(n)).join(','));
+  check('被并工具已消失且总数 15', names.length === 15 && !['approve_client', 'deny_client', 'kick_client', 'discuss_status', 'discuss_interrupt', 'discuss_inject'].some(n => names.includes(n)), 'names=' + names.join(','));
   const dispatchTool = (tl.result?.tools || []).find(t => t.name === 'dispatch');
   check('dispatch 工具含 context 参数', !!dispatchTool?.inputSchema?.properties?.context);
   check('dispatch 工具含 workspace 参数', !!dispatchTool?.inputSchema?.properties?.workspace);
@@ -421,6 +423,14 @@ async function main () {
   section('MCP tools/call:list_clients');
   const lc = await mcp.request('tools/call', { name: 'list_clients', arguments: {} });
   check('list_clients 工具可调用', !lc.result?.isError && /共享中枢/.test(lc.result?.content?.[0]?.text || ''));
+
+  // 9.2) manage_client 活体闭环(T-A 载体断言,派工前红):假 clientId 走 approve→kick,
+  //      专杀 client_key→clientId 请求体重映射 bug(原样透传 args 会被 server 400"缺少 clientId")
+  section('MCP tools/call:manage_client');
+  const mcA = await mcp.request('tools/call', { name: 'manage_client', arguments: { action: 'approve', client_key: 'e2e-fake-client' } });
+  check('manage_client approve 假 clientId 成功', !mcA.error && !mcA.result?.isError, JSON.stringify(mcA.result?.content?.[0]?.text || mcA).substring(0, 160));
+  const mcK = await mcp.request('tools/call', { name: 'manage_client', arguments: { action: 'kick', client_key: 'e2e-fake-client' } });
+  check('manage_client kick 未连接 client 仍成功', !mcK.error && !mcK.result?.isError, JSON.stringify(mcK.result?.content?.[0]?.text || mcK).substring(0, 160));
 
   // 9.5) 智能路由:关闭全部本机 CLI 工具(确定性),未指定 tools 时按综合评分自动选优
   section('智能路由:未指定 tools 使用可解释综合评分');
