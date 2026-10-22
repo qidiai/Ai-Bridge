@@ -304,8 +304,9 @@ async function main () {
   const s3 = await clientView('e2e-seq-probe');
   check('#50a3 更新的注册仍须能真实撤回能力(不得做成只升不降)', s3.supportsSampling === false, JSON.stringify(s3).substring(0, 150));
   const noCap = await req('POST', '/api/dispatch', { task: 'x', tools: ['e2e-seq-probe'], auto_fallback: false });
-  check('#50a4 点名派发无资格客户端时错误须点名 sampling(而非泛泛的"能力/禁用")',
-    noCap.status === 400 && /sampling|推理型/i.test(JSON.stringify(noCap.body)), JSON.stringify(noCap.body).substring(0, 200));
+  // 修正:该分支 code=no_targets 映射 409(server.js:1118),首版我误写 400 致其数学不可达
+  check('#50a4 点名派发无资格客户端时错误须点名 sampling(而非泛泛的"未知工具/可能被禁用")',
+    noCap.status === 409 && noCap.body.code === 'no_targets' && /sampling|推理型/i.test(JSON.stringify(noCap.body)), JSON.stringify(noCap.body).substring(0, 220));
   await req('POST', '/api/toggle', { tool: 'client:e2e-seq-probe', enabled: false }).catch(() => {});
   await req('POST', '/api/clients/kick', { clientId: 'e2e-seq-probe', block: false }).catch(() => {});
 

@@ -1,6 +1,6 @@
 {
   "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定。#52 在途交付物=store.js(markOrphanMeetings 形状守卫+按 #44 口径隔离)+server.js(顶层启动调用包 try/catch,启动期数据异常绝不得阻止进程起来)。",
-  "updated": "2026-10-23 (#50 前置红基线,由指挥官重算)",
+  "updated": "2026-10-23 (#50 基线更正:指挥官自己两条断言写错,已由编码手 GAP 报告指出并复算确认)",
   "head": "afacc4c",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
@@ -10,7 +10,7 @@
   },
   "red_baseline": {
     "test-store-corrupt.mjs": "23/23 全绿(#52a1/a2/a3 清零)",
-    "test-e2e.mjs": "168/171:指定红集 #50a2(迟到的旧注册把 supportsSampling 降级)/#50a4(no_targets 未点名 sampling)/#50b1(真桥并发乱序注册后永无执行资格,生产踩坑复现);#50a1 前置条件、#50a3 防只升不降,两条为绿"
+    "test-e2e.mjs": "169/171:红集=#50a4(点名派发无资格客户端须点名 sampling,现退化文案给出未知工具;真因是 getAllTools:379 先剔除无 sampling 客户端,F3 只查 availableTools 故必然点不出名)、#50b1(桥 initialize 早于首注册回执时,刷新注册被 hasRegistered 门控跳过且永不重试 → 能力永久 false)。#50a2 已由 registerSeq 乱序保护转绿,#50a1/#50a3 绿。"
   },
   "source_faces": {
     "store.js": "140ba55dd6febe8e59d4cee0c96e29b20eae3e8c",
