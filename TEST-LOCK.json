@@ -1,7 +1,7 @@
 {
-  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定。#50 R1 在途交付物=bridge-stdio.js(pendingCapRefresh 能力补发 + registerSeq 单调序号)+server.js(register 乱序保护 + no_targets 逐目标归因);R2 返工白名单仅 server.js 的 targets.length===0 归因块,其余一律禁改。",
-  "updated": "2026-10-23 (#50 R1 审计:主契约 e2e 171/171 已绿,但归因文案两处撒谎,追加 E1/E2/E3 红锁)",
-  "head": "77e9a1c",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#50 已合并,当前无在途交付物。",
+  "updated": "2026-10-23 (#50 落盘:主契约 + E1/E2/E3 归因锁全部转绿,红集清零)",
+  "head": "148135c",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
@@ -12,12 +12,15 @@
   },
   "red_baseline": {
     "test-store-corrupt.mjs": "23/23 全绿(#52a1/a2/a3 清零)",
-    "test-e2e.mjs": "171/171 全绿(#50a1/a2/a3/a4/b1 红集已由 R1 交付清零)",
-    "test-audit-fixes.mjs": "25/28:指定红集=E1(归因行把 tool. 与'未声明 sampling'绑在一起,已入册客户端被判无资格)、E2(归因块不区分点名派发与自动路由,未点名也输出'点名目标: 无')、E3(exec 归因未以 workspace 变量为条件分支)"
+    "test-e2e.mjs": "171/171 全绿(#50a1/a2/a3/a4/b1 红集清零;双跑同数)",
+    "test-audit-fixes.mjs": "28/28 全绿(#50 R2 归因锁 E1/E2/E3 清零;双跑同数)",
+    "test-unit.mjs": "41/41",
+    "test-workspace.mjs": "36/36",
+    "test-external-fixes.mjs": "45/0(T2-4 409 no_targets 不回退)"
   },
   "source_faces": {
     "store.js": "140ba55dd6febe8e59d4cee0c96e29b20eae3e8c",
-    "server.js": "cabe815e93f61b26e2a0fff53965d4c5186ff348",
+    "server.js": "74b13f3807a06c581c78543c438471e1fa3118ec",
     "db.js": "1e2374cebcae2a8e0dcebce00a81ffa54424cc15",
     "workspace-manager.js": "dfa3f24d0ae49cd03c85413ce27bea3adab5e571",
     "bridge-stdio.js": "eb2a2fe414866301554e95c9d2d30e06ee4dcf81",
@@ -28,5 +31,19 @@
     "package.json": "b860aaee2d698b6b76d1117f0d4d87e3ea1ebe92",
     "README.md": "0d3f08bf01b261a0015c34ef83b6eae5fc424210",
     "ARCHITECTURE.md": "4a9a107986fd2d507a381b028df82a217873672d"
+  },
+  "source_faces_owner": {
+    "store.js": "#52(afacc4c) 形状守卫+启动隔离",
+    "server.js": "#50(148135c) registerSeq 乱序保护 + no_targets 分路径归因",
+    "db.js": "P0(d374ea7)",
+    "workspace-manager.js": "T-A/B/C(621161e) 以来未变",
+    "bridge-stdio.js": "#50(148135c) pendingCapRefresh + nextRegisterSeq",
+    "tool-registry.js": "#37(4094d20) 以来未变",
+    "adapters/cli-adapter.js": "E2-lint 收尾(25) 以来未变",
+    "tools.json": "#35 待办,当前值 07adb690",
+    ".eslintrc.json": "E2-lint(22)",
+    "package.json": "E2-lint(22)",
+    "README.md": "T-Doc(19)",
+    "ARCHITECTURE.md": "T-Doc(19)"
   }
 }
