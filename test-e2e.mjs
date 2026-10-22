@@ -460,7 +460,6 @@ async function main () {
   const aliveAfterDead = earlyExit === 'answered' && deadProc.exitCode === null;
   let deadResp = null;
   if (aliveAfterDead) { try { deadResp = await deadCall; } catch { deadResp = null; } }
-  const deadText = ((deadResp?.result?.content) || []).map(c => c.text || '').join('\n');
   check('D2 中枢离线 tools/call → isError 优雅降级(CallToolResult 形态)', aliveAfterDead && deadResp?.result?.isError === true, JSON.stringify(deadResp || earlyExit).substring(0, 160));
   check('D2b 桥在调用失败后进程仍存活', aliveAfterDead, String(earlyExit));
 
@@ -479,6 +478,84 @@ async function main () {
   const recoverText = ((dAfterRecover?.result?.content) || []).map(c => c.text || '').join('\n');
   check('D3 中枢重启后桥自动重注册并恢复服务', !dAfterRecover.error && dAfterRecover.result?.isError !== true && /e2e-probe/.test(recoverText), JSON.stringify(dAfterRecover).substring(0, 200));
   try { deadProc.stdin.end(); deadProc.kill(); } catch { /* ignore */ }
+
+  // 9.4) discuss 路由字段与前置校验(T-D2 指定红集):
+  //   用假中枢(spy)抓桥实际发出的请求体——这是 F5 那轮测试从未覆盖的盲区:
+  //   桥侧的"本地前置校验"与"MCP 路由字段不得污染业务请求体"只有抓到出网报文才可机器验证。
+  //   X1 红:interrupt 缺 meetingId 必须桥本地拦截(文案含"缺少 meetingId"),且不得打到中枢。
+  //   X3 红:interrupt/inject 的 POST 请求体必须已剥离路由字段 action(status/inject 现有实现在透传 args)。
+  section('discuss 前置校验与路由字段剥离:T-D2 红集');
+  const SPY_PORT = 9813;
+  const spyCalls = [];
+  const spySrv = http.createServer((rq, rs) => {
+    let b = '';
+    rq.on('data', c => b += c);
+    rq.on('end', () => {
+      let j = null; try { j = JSON.parse(b || '{}'); } catch { /* 非 JSON 忽略 */ }
+      spyCalls.push({ url: rq.url, body: j });
+      rs.writeHead(200, { 'Content-Type': 'application/json' });
+      rs.end(JSON.stringify({ ok: true, meetingId: 'spy-1', topic: 'spy', status: 'running', participants: [], messageCount: 0, totalTokens: 0 }));
+    });
+  });
+  await new Promise(r => spySrv.listen(SPY_PORT, HOST, r));
+  const spyProc = spawn(process.execPath, ['bridge-stdio.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(SPY_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-spy' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const spyMcp = makeMcpChannel(spyProc);
+  await spyMcp.request('initialize', {});
+  await sleep(500); // 放行启动期注册请求,随后只考察工具调用报文
+
+  spyCalls.length = 0;
+  const xItc = await spyMcp.request('tools/call', { name: 'discuss', arguments: { action: 'interrupt' } });
+  const xItcText = (xItc.result?.content || []).map(c => c.text || '').join('\n');
+  const hitInterrupt = spyCalls.filter(c => c.url === '/api/discuss/interrupt');
+  check('X1a discuss interrupt 缺 meetingId → 桥本地 isError 且文案含"缺少 meetingId"',
+    xItc.result?.isError === true && /缺少 meetingId/.test(xItcText), JSON.stringify(xItc).substring(0, 200));
+  check('X1b 本地拦截后不得把空 meetingId 打到中枢', hitInterrupt.length === 0, JSON.stringify(spyCalls.map(c => c.url)));
+
+  spyCalls.length = 0;
+  const xItc2 = await spyMcp.request('tools/call', { name: 'discuss', arguments: { action: 'interrupt', meetingId: 'm-spy', reason: '止损' } });
+  const itcBody = (spyCalls.find(c => c.url === '/api/discuss/interrupt') || {}).body;
+  check('X3a interrupt 业务请求体已剥离路由字段 action(且保留 meetingId/reason)',
+    !xItc2.result?.isError && !!itcBody && itcBody.meetingId === 'm-spy' && itcBody.reason === '止损' && !('action' in itcBody), JSON.stringify(itcBody));
+
+  spyCalls.length = 0;
+  const xInj2 = await spyMcp.request('tools/call', { name: 'discuss', arguments: { action: 'inject', meetingId: 'm-spy', message: '方向偏了' } });
+  const injBody = (spyCalls.find(c => c.url === '/api/discuss/inject') || {}).body;
+  check('X3b inject 业务请求体已剥离路由字段 action(且保留 meetingId/message)',
+    !xInj2.result?.isError && !!injBody && injBody.meetingId === 'm-spy' && injBody.message === '方向偏了' && !('action' in injBody), JSON.stringify(injBody));
+
+  spyCalls.length = 0;
+  const xInj = await spyMcp.request('tools/call', { name: 'discuss', arguments: { action: 'inject', message: '无会议ID' } });
+  const xInjText = (xInj.result?.content || []).map(c => c.text || '').join('\n');
+  check('X2 inject 缺 meetingId 本地拦截且不打到中枢(回归防护)',
+    xInj.result?.isError === true && /缺少 meetingId/.test(xInjText) && spyCalls.filter(c => c.url === '/api/discuss/inject').length === 0,
+    JSON.stringify(xInj).substring(0, 160));
+
+  try { spyProc.stdin.end(); spyProc.kill(); } catch { /* ignore */ }
+  await new Promise(r => spySrv.close(r));
+
+  // 9.4b) 被拉黑客户端的桥必须走 403 denied 慢重试(而非连接失败退避),且不得混入在线列表
+  section('准入拒绝:403 denied 走慢重试(T-D L4 回归防护)');
+  const blockedDeny = await req('POST', '/api/clients/deny', { clientId: 'e2e-blocked-probe' });
+  const blockedAclView = await req('GET', '/api/clients');
+  check('deny 端点把 e2e-blocked-probe 拉黑', blockedDeny.status === 200 && blockedDeny.body.success === true && (blockedAclView.body.blocklist || []).includes('e2e-blocked-probe'), JSON.stringify(blockedDeny.body).substring(0, 160));
+  const blockedProc = spawn(process.execPath, ['bridge-stdio.js'], {
+    cwd: __dirname,
+    env: { ...process.env, AI_BRIDGE_PORT: String(PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-blocked-probe' },
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+  let blockedErr = '';
+  blockedProc.stderr.on('data', d => { blockedErr += d.toString(); });
+  await sleep(2500);
+  check('X4a 黑名单客户端:桥按 403 denied 打"已被管理员拒绝"并存活(非崩溃非退出)',
+    blockedProc.exitCode === null && /已被管理员拒绝/.test(blockedErr), blockedErr.substring(0, 240));
+  const blockedView = await req('GET', '/api/clients');
+  check('X4b 黑名单客户端未混入在线客户端列表', !(blockedView.body.clients || []).some(c => c.id === 'e2e-blocked-probe' && c.online === true),
+    JSON.stringify((blockedView.body.clients || []).map(c => c.id)).substring(0, 200));
+  try { blockedProc.stdin.end(); blockedProc.kill(); } catch { /* ignore */ }
 
   // 9.5) 智能路由:关闭全部本机 CLI 工具(确定性),未指定 tools 时按综合评分自动选优
   section('智能路由:未指定 tools 使用可解释综合评分');

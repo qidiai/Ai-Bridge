@@ -322,7 +322,11 @@ async function main () {
 main().catch(e => {
   process.stderr.write('测试框架异常: ' + e.stack + '\n');
   process.exitCode = 1;
-}).finally(() => {
+}).finally(async () => {
   for (const p of [probeProc, otherProc, serverProc]) { try { p && p.kill(); } catch { /* ignore */ } }
-  setTimeout(() => process.exit(failed ? 1 : 0), 300);
+  // 收尾:先等子进程释放文件句柄再删临时目录——Windows 上 node:sqlite 的 .db 仍被占用时 rmSync 会失败,
+  // 留下 test-runtime-data-ext/ 污染工作区(实测:中断的运行会让孤儿 hub 长期占端口)
+  await new Promise(r => setTimeout(r, 800));
+  try { fs.rmSync(TEST_RUNTIME, { recursive: true, force: true }); } catch { /* ignore */ }
+  process.exit(failed ? 1 : 0);
 });
