@@ -18,6 +18,17 @@ const CLIENT_NAME = process.env.AI_BRIDGE_CLIENT || 'unknown';
 // 宿主是否具备真实文件执行能力(默认否:sampling 反向调用只是模型补全,无法在工作区改文件)。
 // 有能力的宿主封装(如带本地 runner 的边缘代理)显式设 AI_BRIDGE_CAP_EXEC=1 后才可承接 workspace 任务。
 const CAP_EXEC = /^(1|true|yes|on)$/i.test(process.env.AI_BRIDGE_CAP_EXEC || '');
+// ── HTTP 超时预算(#53/#48) ──
+// 为什么 POST 预算必须大于中枢单次执行窗口(server.js CONFIG.EXECUTE_TIMEOUT,默认 900000):
+// 桥若先判死,中枢其实还在正常执行——宿主收到的是误报失败,桥侧台账还会写进一条脏失败记录。
+// 960000 = 900000(窗口) + 30000(余量)。AI_BRIDGE_HTTP_TIMEOUT 可覆盖;未设/NaN/0 落回默认。
+const HTTP_TIMEOUT_MS = parseInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 10) || 960000;
+// GET 预算独立且更短:pollLoop 用 httpGet 拉任务,30s 快速失败是桥自愈路径的节奏;
+// 若把 GET 默认也抬到同步预算,#38a 的"黑洞约 30010ms 自行回 isError"会变成永久悬空(回归)。
+// 设了 AI_BRIDGE_HTTP_TIMEOUT 时与 POST 同源覆盖。
+const GET_TIMEOUT_MS = parseInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 10) || 30000;
+// callTool 总预算:必须严格大于内层 HTTP 预算,保证单请求工具由内层先判死、错误文案稳定为"请求超时"
+const CALL_BUDGET_MS = HTTP_TIMEOUT_MS + 30000;
 // 服务端会在客户端名与内置 CLI 重名时分配 client- 前缀 ID。
 // 后续 poll/result/unregister 必须使用服务端返回的 ID，否则会陷入“未注册→重注册”死循环。
 let registeredClientId = CLIENT_NAME;
@@ -207,7 +218,7 @@ const MCP_TOOLS = [
 
 // ── HTTP 请求 ──
 
-function httpPost (path, body, timeoutMs = 600000) {
+function httpPost (path, body, timeoutMs = HTTP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) };
@@ -239,11 +250,11 @@ function httpPost (path, body, timeoutMs = 600000) {
   });
 }
 
-function httpGet (path) {
+function httpGet (path, timeoutMs = GET_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const headers = {};
     if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;
-    const rq = http.get({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, timeout: 30000, headers }, res => {
+    const rq = http.get({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, timeout: timeoutMs, headers }, res => {
       let d = '';
       res.on('data', c => d += c);
       res.on('end', () => {
@@ -268,7 +279,20 @@ function httpGet (path) {
 
 // ── MCP 工具调用 → HTTP API ──
 
+// 总超时包装(#53/F4):串行多次 HTTP 累加耗时也必须被预算包住;拒绝走 handleMessage
+// 既有的"桥调用失败: "+isError:true 降级路径,桥进程绝不因此抛出。
+// finally 必 clearTimeout:否则每次工具调用都遗留一个 16 分钟孤儿定时器,进程无法自然退出且内存漂移。
 async function callTool (name, args) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      dispatchToolCall(name, args),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`请求超时(工具调用总预算 ${CALL_BUDGET_MS}ms)`)), CALL_BUDGET_MS); })
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
+async function dispatchToolCall (name, args) {
   switch (name) {
   case 'dispatch': {
     const r = await httpPost('/api/dispatch', args);

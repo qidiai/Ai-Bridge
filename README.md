@@ -49,6 +49,7 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 | `AI_BRIDGE_TOKEN` | 无 | API 鉴权 token（不设则无鉴权） |
 | `AI_BRIDGE_CLIENT` | unknown | 作为 MCP 客户端时的身份名 |
 | `AI_BRIDGE_EXECUTE_TIMEOUT` | 900000 | 单次执行超时(ms) |
+| `AI_BRIDGE_HTTP_TIMEOUT` | 960000 | 桥侧同步工具调用总预算(毫秒)，必须 ≥ 中枢 `AI_BRIDGE_EXECUTE_TIMEOUT`(桥先判死=误报失败+脏台账)；GET/轮询在未设该 env 时仍为 30000ms 快速失败(自愈节奏) |
 | `AI_BRIDGE_CACHE_TTL` | 600000 | 反代幂等缓存 TTL(ms) |
 | `AI_BRIDGE_CACHE_MAX` | 100 | 反代幂等缓存条目上限(LRU) |
 | `AI_BRIDGE_DAILY_TOKEN_BUDGET` | 无 | 每日 token 预算，超出时 /api/health 告警 |
