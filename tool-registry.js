@@ -95,7 +95,14 @@ function getLoadDiagnostics () {
 }
 
 function loadTools () {
-  const configPath = path.join(__dirname, 'tools.json');
+  // #80 载入路径接缝:AI_BRIDGE_TOOLS_PATH 存在时按该文件装载(否则行为逐字节不变,生产中性)。
+  //   目的是让测试能把本地假 CLI 塞进真派发链路,而无需触碰仓库内 tools.json ——
+  //   缺此接缝时 #40/#79 类"CLI 侧到底收到什么"的缺陷只能靠弱源码结构锁兜住。
+  //   仍走 path.resolve(env) 而非 path.resolve('tools.json'),避免随 cwd 漂移;
+  //   缺失/损坏时照常落到既有 missing/corrupt-* 分支,file 报 basename 以便归因到实际配置源。
+  const configPath = process.env.AI_BRIDGE_TOOLS_PATH
+    ? path.resolve(process.env.AI_BRIDGE_TOOLS_PATH)
+    : path.join(__dirname, 'tools.json');
   const tools = [];
   const seen = new Set();
   let status = 'ok';

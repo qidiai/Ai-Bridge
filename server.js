@@ -1299,7 +1299,10 @@ const server = http.createServer(async (req, res) => {
         };
       });
       const total = stats.total || { input: 0, output: 0, total: 0, calls: 0 };
-      sendJSON(res, 200, { tools, total });
+      // #80 registry:把注册表载入归因原样带出(status/file/entryCount),
+      //   使派发失败时能定位到实际使用的配置源;字段必须来自 getLoadDiagnostics 单一写手,
+      //   不得在此另行拼装(那是 #74 的"第二写手"反模式)。
+      sendJSON(res, 200, { tools, total, registry: getLoadDiagnostics() });
       return;
     }
 
