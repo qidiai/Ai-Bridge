@@ -124,13 +124,14 @@ API Key:  随便填（如 sk-1234）
 node test-unit.mjs          # 41 项  纯单元测试
 node test-workspace.mjs     # 36 项  工作区管理（独立临时数据目录）
 node test-store-corrupt.mjs # 23 项  坏 JSON 隔离/拒绝覆写（子进程 + 隔离 DATA_DIR）
-node test-audit-fixes.mjs   # 42 项  审计修复验收（含结构锁 E/F/G/H 段）
+node test-audit-fixes.mjs   # 45 项  审计修复验收（含结构锁 E/F/G/H/I 段）
 node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
-node test-e2e.mjs           # 180 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827，均不影响生产）
-npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线）
+node test-e2e.mjs           # 184 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827，均不影响生产）
+npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
 ```
 
-合计 **367 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"。
+合计 **374 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+
 
 ### 派发长任务前必读（超时口径）
 

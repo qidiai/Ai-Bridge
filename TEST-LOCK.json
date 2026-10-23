@@ -1,30 +1,31 @@
 {
-  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#59 已合并,当前无在途交付物。遗留待办:#36(被跳过的点名目标不进分母+无归因+三处分母漂移)、#60(判定器短文本数字子串误伤)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#42/#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29。",
-  "updated": "2026-10-23 (文档同步:README/ARCHITECTURE 追平 #50/#53+#48/#41/#54/#59 与未修清单;无在途交付物)",
-  "head": "a8c30d6",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#36 已合并,当前无在途交付物。遗留待办:#62(store.recordTask 字段白名单丢 total/requested/skipped,历史视图因此只能回退 results 长度)、#63(测试残留:cleanup 在 Windows 下删不净 SQLite 句柄)、#60(判定器短文本数字子串误伤)、#61(文档保真锁)、#57(同宿主多会话塌成 unknown 且静默)、#58(MCP 异步面)、#42/#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29。",
+  "updated": "2026-10-23 (#36 落盘:requested + skipped{ref,reason} + 桥侧分母口径统一;I1-I3 与 #36a1/a2 清零)",
+  "head": "ae58da1",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
     "test-external-fixes.mjs": "be16cd3f50a5a17db5a340351902c4a7d29261c3",
-    "test-audit-fixes.mjs": "e9462e7eb1d42b521cbd000b3a132233e041eecc",
-    "test-e2e.mjs": "8d2a49fa9c1ffc2f5f4b2e9d12fcbb1b734a63bd",
+    "test-audit-fixes.mjs": "c858c414de0a0a6fcca1838999c494e01f451e50",
+    "test-e2e.mjs": "a03df88076344108cfbe64c918cc937e8be9683e",
     "test-store-corrupt.mjs": "d975b8f2e850845892f823e96b5555965749df82"
   },
   "red_baseline": {
     "test-store-corrupt.mjs": "23/23 全绿",
-    "test-e2e.mjs": "180/180 全绿(#59a3/#59a4 转绿,#59a1 任务确被取走必须同绿以排除假绿;#50/#53/#48/#37/#38/#39/#52 各段不回退)",
-    "test-audit-fixes.mjs": "42/42 全绿(#54 H1/H2/H3 转绿,H4 与 A-D/E/F/G 不回退)",
+    "test-e2e.mjs": "184/184 全绿(#36a1/a2 转绿;#36a0/#36a3 是防假红骨架,证明场景真执行;#37/#38/#39/#50/#52/#53/#48/#59 各段不回退)",
+    "test-audit-fixes.mjs": "45/45 全绿(I1/I2/I3 转绿;E1-E3 的 #50 归因块形状锁、F1-F4 关系锁、G1-G2 结构锁、H1-H4 归因锁均不回退)",
     "test-unit.mjs": "41/41",
     "test-workspace.mjs": "36/36",
-    "test-external-fixes.mjs": "45/0"
+    "test-external-fixes.mjs": "45/0(含 S-4/S-5/S-10 三条 README 锁,文档改动未碰它们)"
   },
   "source_faces": {
     "store.js": "140ba55dd6febe8e59d4cee0c96e29b20eae3e8c",
-    "server.js": "7f84cb8fefa8fccf483a5a31e7ebff4d8820f353",
+    "server.js": "d45856a81b52a0bd7325935f78d2cc08f9bde19d",
     "db.js": "1e2374cebcae2a8e0dcebce00a81ffa54424cc15",
     "workspace-manager.js": "dfa3f24d0ae49cd03c85413ce27bea3adab5e571",
-    "bridge-stdio.js": "63b8084debb16fc096cba2cae4b927ddf3198d48",
+    "bridge-stdio.js": "e93e4fb7264862499e901609730eb2acc9d589c5",
     "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
+    "tool-identity.js": "c3a69a85df0ba2c826fcfc62b58f66b6b4ef1880",
     "adapters/cli-adapter.js": "ee8cbf700c5d9a31c311681b4f1b54785fe6b9bd",
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
     ".eslintrc.json": "f8735f334ba169e9af9a9efe0fb3773c3d58a549",
@@ -33,17 +34,18 @@
     "ARCHITECTURE.md": "5560af46b0e925870c9bcc69fcf51562a22fe78a"
   },
   "source_faces_owner": {
-    "store.js": "#52(afacc4c) 形状守卫+启动隔离",
-    "server.js": "#59(a8c30d6) 超时清理补 c.taskPending=false;(#41/#50 面未回退)",
-    "db.js": "P0(d374ea7)",
+    "store.js": "#52(afacc4c) 形状守卫+启动隔离;#36 未动(白名单外,其 recordTask 字段白名单缺口见 #62)",
+    "server.js": "#36(ae58da1) requested + skipped{ref,reason};#59/#50/#41 各面未回退",
+    "db.js": "P0(d374ea7);#36 未加列——recordDispatch 用显式列名,多余字段安全忽略",
     "workspace-manager.js": "T-A/B/C(621161e) 以来未变",
-    "bridge-stdio.js": "#53/#48(012f828) HTTP_TIMEOUT_MS/GET_TIMEOUT_MS/CALL_BUDGET_MS + callTool 总超时",
+    "bridge-stdio.js": "#36(ae58da1) skippedLabel 双形状兼容 + 汇总行抬入点名数 + 三处分母统一",
     "tool-registry.js": "#37(4094d20) 以来未变",
+    "tool-identity.js": "T-A/B/C 系列以来未变(#36 未动)",
     "adapters/cli-adapter.js": "#54(0db17d2) close 收下 signal + 详情取尾部 + err.signal/timedOut",
     "tools.json": "#35 待办,当前值 07adb690",
     ".eslintrc.json": "E2-lint(22)",
     "package.json": "E2-lint(22)",
-    "README.md": "2026-10-23 文档同步(env 全表/六套件 367 项/超时口径/已修与未修清单)",
-    "ARCHITECTURE.md": "2026-10-23 新增超时与预算模型、客户端注册·能力·状态契约两节;影响链与配置消费者补行;修复清单补至今"
+    "README.md": "2026-10-23 文档同步;#36 后套件数已变(45/184,合计 374),该数字待随 #61 同源化",
+    "ARCHITECTURE.md": "2026-10-23 新增超时与预算模型、客户端注册·能力·状态契约两节;影响链与配置消费者补行"
   }
 }
