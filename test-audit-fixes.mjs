@@ -304,6 +304,22 @@ section('I) 桥侧汇总口径统一(#36)');
     dStart >= 0 && !!reqRef, dStart < 0 ? '未定位到 dispatch 分支' : `dispatch 渲染块长度=${dBlock.length},块内 requested 命中=${!!reqRef}`);
 }
 
+// ── J) Web UI 必须能自证身份(#42 结构锁,指挥官亲笔) ──
+// 中枢设了 AI_BRIDGE_TOKEN 后,/api/* 全部要求 Bearer;而 ui.html 的取数辅助函数
+// (ui.html:318 `async function api(path,opts){const r=await fetch(path,opts);return r.json()}`)
+// 从不带 Authorization —— 实测全文件 grep 'Authorization' = 0 命中。
+// 结果是"要安全就得牺牲自己":一设 token,自己的管理界面就被 401 打死,只能回去关 token。
+// 本锁只要求最小能力:能出示凭据(Authorization/Bearer)且有一个拿到凭据的来源
+// (localStorage 或用户输入),不锁具体实现与文案。
+section('J) Web UI 凭据自证(#42)');
+{
+  const ui = fs.readFileSync('./ui.html', 'utf-8');
+  const hasAuth = /Authorization/.test(ui) && /Bearer/.test(ui);
+  const hasSource = /localStorage|sessionStorage|prompt\s*\(/.test(ui);
+  check('J1 ui.html 必须能出示凭据(Authorization: Bearer …)', hasAuth, 'Authorization 命中=' + /Authorization/.test(ui) + ' Bearer 命中=' + /Bearer/.test(ui));
+  check('J2 ui.html 必须有拿到凭据的来源(存储或用户输入),否则设 token 即自锁', hasSource, 'storage/prompt 命中=' + hasSource);
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');

@@ -1060,6 +1060,54 @@ async function main () {
   check('#37e 失败条目必须保留正文(可短于成功态上限,但不得为空)',
     typeof errR.content === 'string' && errR.content.includes('Go usage limit exceeded'), '失败态 content=' + JSON.stringify((errR.content || '').substring(0, 60)));
 
+  // 9.13) 鉴权覆盖面:能执行/能烧配额的入口一律要凭据(#42 指定红集)
+  //   实况(全部只读回源):门只在 server.js:1232 `if (p.startsWith('/api/') && !checkAuth(req))`,
+  //   而 `/v1/chat/completions`(:1967)在"model=<工具名>"分支里直接 executeTool(:1995)——
+  //   本机任意进程可零凭据触发真实工具执行并烧配额;GET /v1/models 同样零凭据可枚举工具与模型面。
+  //   另一面:ui.html:318 的 api() 辅助函数完全不带 Authorization(全文件 grep 'Authorization' = 0),
+  //   所以一旦设了 AI_BRIDGE_TOKEN,自己的 Web UI 会被 401 打死——"能锁"与"可用"互相牺牲,是同一个缺陷的两半。
+  //   本段用带 token 的第二实例(端口 9830,数据/DB/工作区/观测目录四重隔离)取证:
+  //   执行面必须挡住、哨兵面(首页/带凭据访问/健康检查)必须仍然可用。
+  //   注意成本纪律:触发执行的断言一律用**不存在的 model 名**,保证红跑也不会真的调用任何模型。
+  section('鉴权覆盖面:#42 红集(第二实例·带 token)');
+  {
+    const AUTH_PORT = 9830, AUTH_TOK = 'e2e-42-token';
+    const authDir = path.join(TEST_RUNTIME, 'auth-probe');
+    fs.mkdirSync(authDir, { recursive: true });
+    const authProc = spawn(process.execPath, ['server.js'], {
+      cwd: __dirname,
+      env: { ...process.env, AI_BRIDGE_PORT: String(AUTH_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_DATA_DIR: authDir, AI_BRIDGE_DB: path.join(authDir, 'auth.db'), AI_BRIDGE_OBSERVE_DIR: path.join(authDir, 'observe'), AI_BRIDGE_WORKSPACE_ROOT: path.join(authDir, 'ws'), AI_BRIDGE_TOKEN: AUTH_TOK },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    authProc.stderr.on('data', () => {}); authProc.stdout.on('data', () => {});
+    const reqAuth = (method, urlPath, body, withToken) => new Promise((resolve, reject) => {
+      const data = body ? JSON.stringify(body) : null;
+      const headers = {};
+      if (withToken) headers.Authorization = 'Bearer ' + AUTH_TOK;
+      if (data) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = Buffer.byteLength(data); }
+      const r = http.request({ hostname: HOST, port: AUTH_PORT, path: urlPath, method, timeout: 15000, headers }, res => {
+        let s = ''; res.on('data', c => s += c); res.on('end', () => resolve({ status: res.statusCode, text: s }));
+      });
+      r.on('timeout', () => { r.destroy(); reject(new Error('auth 请求超时')); });
+      r.on('error', reject); if (data) r.write(data); r.end();
+    });
+    let authUp = false;
+    for (let i = 0; i < 40 && !authUp; i++) { await sleep(400); try { const h = await reqAuth('GET', '/api/health', null, true); authUp = h.status === 200; } catch (_) {} }
+    check('#42a0 带 token 的第二实例可启动且带凭据可访问(哨兵:防把门焊死后无从取证)', authUp, 'authUp=' + authUp);
+    if (authUp) {
+      const m1 = await reqAuth('GET', '/v1/models', null, false);
+      check('#42a1 零凭据不得枚举 /v1/models(现状 200 全量泄露模型与工具面)', m1.status === 401, 'status=' + m1.status + ' body=' + m1.text.substring(0, 70));
+      const m2 = await reqAuth('POST', '/v1/chat/completions', { model: 'e2e-42-nonexistent-model', messages: [{ role: 'user', content: 'x' }] }, false);
+      check('#42a2 零凭据不得进入 /v1 执行路径(model=<工具名> 会直接 executeTool 烧配额)', m2.status === 401, 'status=' + m2.status + ' body=' + m2.text.substring(0, 70));
+      const m3 = await reqAuth('GET', '/v1/models', null, true);
+      check('#42a3 带正确 token 访问 /v1/models 必须仍可用(反代接入不能被本轮改坏)', m3.status === 200, 'status=' + m3.status);
+      const m4 = await reqAuth('GET', '/', null, false);
+      check('#42a4 Web UI 首页本身不得被锁死(锁的是数据面,不是让页面消失)', m4.status === 200 && /<html|<!DOCTYPE/i.test(m4.text), 'status=' + m4.status + ' len=' + m4.text.length);
+    }
+    try { authProc.stdin.end(); authProc.kill(); } catch { /* ignore */ }
+    await sleep(400);
+  }
+
   // 9.12) 点名派发中被跳过的目标必须诚实呈现(#36 指定红集)
   //   实况:targets 只收"可解析且已启用"的工具(server.js:765-770),而"可解析但被禁用"的落进
   //   skipped(:804-807)。响应的 total = targets.length(:973)→ 被跳过者**不进分母**。
