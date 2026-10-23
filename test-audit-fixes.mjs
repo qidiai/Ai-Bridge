@@ -456,6 +456,83 @@ process.stdout.write(JSON.stringify({
     !rawWrite, '仍在写上游原样的处数=' + (srv.match(/usage:\s*parsed\.usage\s*\|\|/g) || []).length);
 }
 
+// ── M) 吞异常棘轮门禁(#26 指定红集) ──
+//   采纳口径(全部经实测定死,写在基线里可追溯):
+//     CatchClause:not(:has(CallExpression)):not(:has(ThrowStatement)):not(:has(ReturnStatement))
+//   语义 = catch 块里既不记录(无调用)、也不做任何决定(无 return / throw) —— 纯吞。
+//   为什么不用更严的"无 CallExpression"一刀切:catch { return false } 这类"有决定的降级"
+//   (db.js / sse-replay.js 的命中全属此类)不是留白;把它们也算红,只会逼出无意义的 log 换绿灯。
+//   为什么门禁是"旁挂脚本 + 基线棘轮"而不是写进 .eslintrc.json:实测源码 45 处 / 11 文件,
+//   写成 error 会当场把 lint 基线从 0 error 打成 45 error(等于毁掉那道"必须 0 error"的门),
+//   写成 warn 又无人看 —— 只有"逐文件只降不升 + 基线与实测同源"能既不爆破又真咬人。
+section('M) 吞异常棘轮门禁不存在(#26 红集)');
+{
+  const SELECTOR = 'CatchClause:not(:has(CallExpression)):not(:has(ThrowStatement)):not(:has(ReturnStatement))';
+  const GATE = path.join(import.meta.dirname, 'check-swallow-ratchet.mjs');
+  const BASELINE = path.join(import.meta.dirname, 'swallow-baseline.json');
+  const gateRun = (args) => spawnSync(process.execPath, [GATE, ...args], { cwd: import.meta.dirname, encoding: 'utf-8', timeout: 180000 });
+
+  // 三个语义夹具:空吞 / 注释伪装的空吞 / 有决定的 catch
+  fs.writeFileSync(path.join(tmpRoot, 'sw-empty.js'),
+    "'use strict';\nfunction a () {\n  try { throw new Error('x'); } catch (e) { }\n}\nmodule.exports = a;\n", 'utf-8');
+  fs.writeFileSync(path.join(tmpRoot, 'sw-comment.js'),
+    "'use strict';\nfunction b () {\n  try { throw new Error('x'); } catch (e) { /* 有意忽略 */ }\n}\nmodule.exports = b;\n", 'utf-8');
+  fs.writeFileSync(path.join(tmpRoot, 'sw-decided.js'),
+    "'use strict';\nfunction c () {\n  try { throw new Error('x'); } catch (e) { return false; }\n}\nfunction d () {\n  try { throw new Error('x'); } catch (e) { console.log('降级留痕'); }\n}\nmodule.exports = { c, d };\n", 'utf-8');
+  const countOf = (name) => String(gateRun(['--count', path.join(tmpRoot, name)]).stdout || '');
+
+  const run1 = gateRun([]);
+  const out1 = String(run1.stdout || '');
+  check('#26m1 棘轮门禁必须存在且能在真实树上跑通(退出码 0 并自报 STATUS=ok)',
+    run1.status === 0 && /STATUS=ok/.test(out1),
+    'status=' + run1.status + ' out=' + out1.substring(0, 120) + ' err=' + String(run1.stderr || '').substring(0, 120));
+  check('#26m2 基线必须记录口径原文与逐文件计数,且其 total 必须等于脚本实测 TOTAL(防换口径悄悄降数 / 基线与源码漂移)',
+    fs.existsSync(BASELINE) && JSON.parse(fs.readFileSync(BASELINE, 'utf-8')).selector === SELECTOR
+      && /TOTAL=(\d+)/.test(out1)
+      && JSON.parse(fs.readFileSync(BASELINE, 'utf-8')).total === Number((out1.match(/TOTAL=(\d+)/) || [])[1]),
+    '基线在=' + fs.existsSync(BASELINE) + ' out1=' + out1.substring(0, 100));
+  check('#26m3 --count 计数语义:纯吞的空 catch 必须算 1 处',
+    /COUNT=1/.test(countOf('sw-empty.js')), 'out=' + countOf('sw-empty.js').substring(0, 100));
+  check('#26m4 注释不是 AST 节点:带 /*有意忽略*/ 的空 catch 同样必须算 1 处(写注释绕不过门禁)',
+    /COUNT=1/.test(countOf('sw-comment.js')), 'out=' + countOf('sw-comment.js').substring(0, 100));
+  check('#26m5 哨兵(防逼出噪声):有决定的 catch(return 值 / 调用记录函数)必须算 0 处',
+    /COUNT=0/.test(countOf('sw-decided.js')), 'out=' + countOf('sw-decided.js').substring(0, 120));
+  // #26m6 棘轮必须真咬:把基线里某个文件的计数改成"实测-1"(假装它已更干净),必须非 0 退出并点名该文件
+  const tamperedDir = path.join(tmpRoot, 'sw-tamper');
+  fs.mkdirSync(tamperedDir, { recursive: true });
+  const tampered = path.join(tamperedDir, 'tampered-baseline.json');
+  let target = '';
+  if (fs.existsSync(BASELINE)) {
+    const bl = JSON.parse(fs.readFileSync(BASELINE, 'utf-8'));
+    const files = bl.files || {};
+    target = Object.keys(files).sort((a, b) => files[b] - files[a])[0] || '';
+    if (target && files[target] > 1) {
+      bl.files[target] = files[target] - 1;
+      bl.total = bl.total - 1;
+      fs.writeFileSync(tampered, JSON.stringify(bl, null, 2), 'utf-8');
+      const runT = gateRun(['--baseline', tampered]);
+      const shown = String(runT.stdout || '') + String(runT.stderr || '');
+      check('#26m6 棘轮必须真咬:基线比源码"更干净"一分(' + target + ' 少计 1)时,必须以非 0 退出并点名该文件',
+        runT.status !== 0 && shown.includes(target),
+        'status=' + runT.status + ' out=' + shown.substring(0, 180));
+    } else {
+      check('#26m6 棘轮必须真咬:基线比源码"更干净"一分时,必须以非 0 退出并点名该文件',
+        false, '基线里找不到计数 >1 的文件,无法构造增长场景: files=' + JSON.stringify(files).substring(0, 120));
+    }
+  } else {
+    check('#26m6 棘轮必须真咬:基线比源码"更干净"一分时,必须以非 0 退出并点名该文件',
+      false, '基线文件不存在,无从构造篡改场景');
+  }
+  const lintRun = spawnSync('npx', ['eslint', '.', '-f', 'json'], { cwd: import.meta.dirname, encoding: 'utf-8', timeout: 180000, shell: process.platform === 'win32' });
+  let lintErr = 0, lintWarn = 0; // -f json 无汇总行,逐文件累加(上一版误从 -1 起算,把 0/18 读成 -1/17)
+  try {
+    const arr = JSON.parse(String(lintRun.stdout || '[]'));
+    for (const f of arr) { lintErr += f.errorCount; lintWarn += f.warningCount; }
+  } catch (_) { /* 交给断言判失败 */ }
+  check('#26m7 哨兵(不回退):门禁必须是旁挂脚本 —— npx eslint . 仍 0 error / 18 warning(把它写进 .eslintrc 的 error 会当场把源码 45 处打成 45 error,爆破"必须 0 error"这道门)',
+    lintErr === 0 && lintWarn === 18, 'errors=' + lintErr + ' warnings=' + lintWarn + ' (解析失败时会是 0/0 或负值,均判失败)');
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');
