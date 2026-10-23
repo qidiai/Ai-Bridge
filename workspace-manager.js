@@ -230,10 +230,17 @@ function nextManagedDir (root, slug) {
 }
 
 function create (input = {}) {
+  // #51: path "提供了但为空白"(''/空白符)是调用方输入错误,不得折叠成"未提供"
+  //      而静默新建空受管目录;必须在任何 mkdirSync / saveState 之前以 400 拒绝。
+  //      文案点名 path 并说清真因(空白),不得伪装成"路径不存在"(防 #54/#74 同族归因误导)。
+  if (input.path != null && String(input.path).trim() === '') {
+    throw fail(400, 'path 已提供但为空白:如需新建受管工作区请去掉 path 参数');
+  }
   const state = loadState();
   if (state.workspaces.length >= MAX_WORKSPACES) throw fail(409, `工作区数量已达上限(${MAX_WORKSPACES})`);
 
-  const wantsLinked = input.path != null && String(input.path).trim() !== '';
+  // 到这里 input.path 若存在必然 trim 后非空,空白分支已在上方 400 拒绝
+  const wantsLinked = input.path != null;
   const mode = wantsLinked ? MODE_LINKED : MODE_MANAGED;
   const wsPath = wantsLinked ? resolveExistingDirectory(String(input.path)) : null;
   const name = normalizeName(input.name, wantsLinked ? path.basename(wsPath) : undefined);
