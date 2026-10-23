@@ -315,7 +315,36 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang S
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function showPage(name,btn){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.getElementById('page-'+name).classList.add('active');document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));if(btn)btn.classList.add('active')}
 
-async function api(path,opts){const r=await fetch(path,opts);return r.json()}
+// ── 凭据自证(#42):中枢设了 AI_BRIDGE_TOKEN 时,UI 必须能出示 Bearer,否则自己的管理界面会被 401 打死 ──
+// 单一凭据来源:localStorage 优先,取不到时允许用户输入一次(prompt);api() 是唯一的注入点,
+// post() 等取数辅助函数全部复用这条路径 —— 不允许出现第二份凭据逻辑。
+// 未设 token 的中枢永不返回 401 → 不会弹输入框(本机自用零负担不变)。
+var TOKEN_KEY='aiBridgeToken';
+var _tokenAsked=false;
+function getToken(){try{return localStorage.getItem(TOKEN_KEY)||''}catch(e){return ''}}
+function setToken(t){try{localStorage.setItem(TOKEN_KEY,t||'')}catch(e){}_tokenAsked=!!t}
+function withAuth(opts){
+  var o=Object.assign({},opts||{});
+  var t=getToken();
+  if(t){var h=Object.assign({},o.headers);h['Authorization']='Bearer '+t;o.headers=h}
+  return o
+}
+function authBanner(msg){
+  var el=document.getElementById('authBanner');
+  if(!el){el=document.createElement('div');el.id='authBanner';el.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:999;padding:10px 16px;font-size:13px;background:#3b1220;color:#f8d7da;border-top:1px solid var(--red)';document.body.appendChild(el)}
+  el.innerHTML='🔒 '+esc(msg)+' — <a href="#" onclick="setToken(\'\');this.parentNode.remove();return false">清除 Token 并重新输入</a>';
+  return el
+}
+async function api(path,opts){
+  var r=await fetch(path,withAuth(opts));
+  if(r.status===401&&!getToken()&&!_tokenAsked){
+    _tokenAsked=true;
+    var t=window.prompt('该中枢已启用鉴权,请输入访问 Token(AI_BRIDGE_TOKEN 的值):');
+    if(t&&t.trim()){setToken(t.trim());r=await fetch(path,withAuth(opts))} // 最多重试一次,不递归
+  }
+  if(r.status===401)authBanner(getToken()?'鉴权失败(401):已保存的 Token 不被中枢接受':'鉴权失败(401):尚未提供有效 Token');
+  return r.json()
+}
 async function post(path,body){return api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
 
 var allTools=[];
@@ -588,7 +617,29 @@ async function doChat(){
   var messages=chatHistory.filter(function(m){return m.content!=='⏳ 思考中...'}).map(function(m){return {role:m.role,content:m.content}});
   try{
     if(stream){
-      var resp=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:model,messages:messages,stream:true})});
+      // SSE 不能走 api()(它 return r.json() 会毁流),故在此调用点复用同一凭据注入函数 withAuth()。
+      var streamBody={model:model,messages:messages,stream:true};
+      var resp=await fetch('/v1/chat/completions',withAuth({method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(streamBody)}));
+      // 读取响应前先判失败分支:401/429/500/502 的错误体绝不能被当 SSE 喂进解析器(那会渲染成"(空响应)"——静默空白正是 #42 要消灭的病)。
+      if(!resp.ok){
+        var st=resp.status;
+        // 401 且本地尚无 token:复用 api() 内置的"提示输入一次并重试至多一次"(凭据来源仍只有 getToken/setToken 这一份,不复制逻辑)。
+        // api() 在这里只当"取到凭据的探针"用:它走自己的 r.json(),不碰本流的 resp.body。
+        if(st===401&&!getToken()){
+          try{await api('/v1/models')}catch(_){}
+          if(getToken())resp=await fetch('/v1/chat/completions',withAuth({method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(streamBody)}));
+          st=resp.status;
+        }
+        if(!resp.ok){
+          var raw='';
+          try{raw=await resp.text()}catch(_){raw=''} // 只读一次:先 text,再尝试按 JSON 解析,失败退化为原文截断
+          var detail='';
+          try{var ej=JSON.parse(raw);detail=ej.error||ej.detail||ej.message||JSON.stringify(ej)}catch(__){detail=String(raw||'').replace(/\s+/g,' ').substring(0,200)}
+          chatHistory[chatHistory.length-1].content='❌ '+(st===401?'鉴权失败(401)':'请求失败('+st+')')+': '+(detail||'无错误详情')+(st===401?' — 请在界面提示中输入 Token 后重试':'');
+          renderChat();
+          return; // 终止本次流解析,不继续读 body
+        }
+      }
       var reader=resp.body.getReader();
       var decoder=new TextDecoder();
       var fullContent='';

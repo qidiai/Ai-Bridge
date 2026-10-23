@@ -1228,8 +1228,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 鉴权:API 端点需要 Token(如果配置了)
-    if (p.startsWith('/api/') && !checkAuth(req)) {
+    // 鉴权:API 端点 + /v1 反代面需要 Token(如果配置了)
+    // /v1 不是"只读展示面":GET /v1/models 会枚举模型/工具全清单,POST /v1/chat/completions 的
+    // model=<工具名> 分支直接 executeTool(烧真实配额) —— 能泄露、能执行、能花钱的入口一律要凭据。
+    // 401 形状复用同一处 sendJSON,外部调用方(反代/桥)看到的错误体与 /api/ 完全一致,不得新造。
+    if ((p.startsWith('/api/') || p.startsWith('/v1/')) && !checkAuth(req)) {
       sendJSON(res, 401, { error: '未授权' });
       return;
     }
