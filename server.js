@@ -566,11 +566,13 @@ async function executeTool (name, task, opts = {}) {
   const startTime = Date.now();
 
   // 客户端工作区任务会把目录简报拼进任务文本,流量记录记实际下发的载荷。
+  // 简报是"只在工作区内动文件"的唯一文字护栏,对 CLI 与 exec 型客户端一视同仁;
   // T5 自报协议:仅 CLI 类型工具(type!=='client')追加用量自报后缀;
   // 连接的客户端豁免——MCP sampling 已上报真实用量,追加后缀会污染对话。
+  const brief = opts.workspace ? withWorkspaceBrief(task, opts.workspace.path) : task;
   const outboundTask = toolDef.type === 'client'
-    ? (opts.workspace ? withWorkspaceBrief(task, opts.workspace.path) : task)
-    : ((toolDef.type === 'client' && opts.workspace) ? withWorkspaceBrief(task, opts.workspace.path) : task) + USAGE_REPORT_SUFFIX;
+    ? brief
+    : brief + USAGE_REPORT_SUFFIX;
 
   // 流量保真:exec 准入预检——未声明 exec 的客户端在 "'out' 流量记录" 之前就被拒绝,
   // 否则会把"注入过工作区简报但从未发出"的文本假如实入流量。
@@ -597,7 +599,7 @@ async function executeTool (name, task, opts = {}) {
   let execError = null;
   try {
     if (toolDef.type === 'client') {
-      result = await executeClient(toolDef.clientKey || executionName, task, opts);
+      result = await executeClient(toolDef.clientKey || executionName, outboundTask, opts);
     } else {
       const tool = TOOLS.find(t => t.name === executionName);
       result = await tool.execute(outboundTask, {
@@ -666,8 +668,10 @@ async function executeTool (name, task, opts = {}) {
   return { tool: executionName, toolId: toolDef.id, canonicalId: toolDef.canonicalId, displayName: toolDef.displayName, success: true, duration: `${duration}s`, codeBlocks: result.codeBlocks || [], content: result.content, tokens: usage };
 }
 
-/** 反向调用客户端(防并发:一个 client 同时只处理一个任务) */
-async function executeClient (clientName, task, opts = {}) {
+/** 反向调用客户端(防并发:一个 client 同时只处理一个任务)
+ * outboundTask:executeTool 一次组装好的出站任务文本(client 型按需已含目录简报,
+ * 永不追加 CLI 专用的 [USAGE] 自报后缀),本函数不再二次组装——台账所记即实发。 */
+async function executeClient (clientName, outboundTask, opts = {}) {
   const client = connectedClients.get(clientName);
   if (!client) throw new Error(`客户端未连接: ${clientName}`);
   if (!client.firstPollAt) throw new Error(`客户端尚未完成首次轮询: ${clientName}`);
@@ -675,14 +679,11 @@ async function executeClient (clientName, task, opts = {}) {
 
   // 工作区任务准入(入队前判定,不占用 pendingTask 槽位):
   // sampling 反向调用只能拿宿主模型做文本补全,没有文件工具,派了也无法在工作区里干活——
-  // 与其静默"成功"不如显式失败;仅客户端注册时声明 capabilities.exec=true 才放行,
-  // 并把目录路径拼进任务文本(sampling 载荷只透传 task 字符串)。
-  let clientTask = task;
-  if (opts.workspace) {
-    if (!client.supportsExec) {
-      throw new Error(`客户端 ${clientName} 是推理型(sampling)子智能体,无法在工作区执行文件任务;workspace 任务请派给 CLI 工具,或去掉 workspace 参数`);
-    }
-    clientTask = withWorkspaceBrief(task, opts.workspace.path);
+  // 与其静默"成功"不如显式失败;仅客户端注册时声明 capabilities.exec=true 才放行
+  // (目录简报已在 executeTool 组装 outboundTask 时拼好,sampling 载荷只透传 task 字符串)。
+  // 此处校验与 executeTool 的前置守卫刻意双存:防直接调用路径绕过准入。
+  if (opts.workspace && !client.supportsExec) {
+    throw new Error(`客户端 ${clientName} 是推理型(sampling)子智能体,无法在工作区执行文件任务;workspace 任务请派给 CLI 工具,或去掉 workspace 参数`);
   }
 
   // check-then-act:先检查再设置待办槽位,其"不会被穿插"只来自单线程事件循环下检查与写入之间没有 await;跨 await 的并发正确性由 #55 端到端验收兜
@@ -708,7 +709,7 @@ async function executeClient (clientName, task, opts = {}) {
     }, opts.timeout || CONFIG.EXECUTE_TIMEOUT);
 
     client.pendingTask = {
-      task: clientTask,
+      task: outboundTask,
       taskId: opts.taskId || `${clientName}_${Date.now()}`,
       workspace: opts.workspace ? { id: opts.workspace.id, name: opts.workspace.name, path: opts.workspace.path } : null
     };
