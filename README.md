@@ -123,14 +123,14 @@ API Key:  随便填（如 sk-1234）
 ```bash
 node test-unit.mjs          # 41 项  纯单元测试
 node test-workspace.mjs     # 44 项  工作区管理（独立临时数据目录 + 写失败注入）
-node test-store-corrupt.mjs # 37 项  坏 JSON 与坏形状隔离/拒绝覆写（子进程 + 隔离 DATA_DIR）
+node test-store-corrupt.mjs # 43 项  坏 JSON 与坏形状隔离/拒绝覆写 + 配置损坏只降级（子进程 + 隔离 DATA_DIR）
 node test-audit-fixes.mjs   # 63 项  审计修复验收（含结构锁 E/F/G/H/I/J/K/L 段）
 node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
 node test-e2e.mjs           # 199 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827/9830 + 第四实例 9841，均不影响生产）
 npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
 ```
 
-合计 **429 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+合计 **435 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
 
 
 ### 派发长任务前必读（超时口径）
@@ -291,11 +291,12 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
   - **形状非法与解析失败同口径（#44）**：`switches/stats/memory/acl/workspaces` 五类文件里，"能解析但形状非法"（顶层是 null/数组/primitive、`tasks`/`meetings`/`allowlist` 等字段类型错）不再被"补成合法空结构"后覆写——与解析失败同走保全(改名 `.corrupt-*`)+置脏+拒写+不抛错。#52 当年只给了 `meetings` 一个点，本轮是同一把尺子。
   - **写被拒不再谎报成功（#43）**：`/api/toggle` 在开关未能持久化时返回 **503** 并明示 `persisted:false, runtimeOnly:true`，不再回 `200 {success:true}`（实测修复前：`switches.json` 已被隔离改名 `.corrupt-*`、磁盘上根本没有该文件，接口却宣称成功——重启后全部回启）。工作区删除改为**先落盘后回收**：注册表未能落盘就绝不碰目录（修复前实测：真实工作区已被 `rmSync` 删除，注册表却仍指向它，留下必然失败的悬空记录）；目录回收失败则回滚登记，回滚也失败才升级为"注册表与磁盘不一致，需人工核查"的 error 留痕。`create/archive/restore` 与 `remove` 共用同一入口区分**拒写（该 key 已隔离）**与**写入故障（抛异常）**两态，错误消息必须带底层原因（有界 200、截断时补回 `EISDIR/EPERM/ENOSPC` 这类错误码前缀）。
   - **用量报表不再恒 0（#45）**：`traffic.usage` 曾有三种形状各写一遍（上游原样 / 归一化 / 客户端上报），而 `db.js` 的报表与 `todayTokens()` 只 SUM `prompt_tokens`+`completion_tokens`。生产实测：最近 500 条里 usage 非空的 52 条**全是**归一化形状 → `/api/usage/report` 每行 `tokens:0`，带凭据 `/api/health` 的 `usage.todayTokens=0`，`AI_BRIDGE_DAILY_TOKEN_BUDGET` 预算告警因此**永不触发**（同库 `dispatches.tokens=638931`，账在、报表看不见）。现：`db.usageTokensSql()` 单点定义 `COALESCE(input, prompt_tokens, input_tokens, 0) + COALESCE(output, completion_tokens, output_tokens, 0)三处聚合共用；**取第一个非空键而非相加**（混合键名行实测 260 而非 520）。写侧两处入站反代不再把上游原样 usage 落库，改存 `{input,output,total}`，无 usage 写 `null`（不猜）；**对外响应体一个字节都没改**（落库发生在 `res.end(respData)` 之后）。
+  - **`tools.json` 损坏不再拖垮进程（#46）**：加载器原先把 `JSON.parse` 放在 try 之外、又在模块加载期执行，配置坏掉 = `server.js` 一 require 就抛 = 进程起不来 = watchdog 重启到熔断。现分 `ok / missing / corrupt-parse / corrupt-shape` 四态：损坏时静态工具按空处理、**绝不抛**、照常加载自动同步工具，并把事实写进 `logs.jsonl`（error 级）与 stderr —— 消息含状态、原因、后果（"静态工具全部缺席"）、以及"原件未被改动需人工修复"四件事；诊断经 `getLoadDiagnostics()` 暴露（`file` 只给 basename）。**与数据文件的差别是刻意的**：`tools.json` 是 git 跟踪的配置原件，服务进程**不改名、不覆写、不隔离**它（P0 那套 `.corrupt-*` 只用于运行数据）。`missing`（文件不存在）是合法部署态，不写 error 级。
 - **未修（如实列示，按当前队列序）**：
   - #57 桥默认身份是常量 `unknown`：`connectedClients` 以名字为键，同一宿主的多个派生会话必然塌进**一个**在册条目，共享 `pendingTask` 槽与能力字段；后启动会话的 `registerSeq` 基数天然更大，于是"后来者覆写全体能力"成为合法行为。且注册复用分支**静默无日志**，中枢也无 `hostCount`/poll 计数面——该缺陷目前**无法从可观测面证明有几个会话在共享身份**。
   - #58 MCP 面无异步派发：中枢支持 `body.async === true`，但 `dispatch` 工具没有 `async` 入参、也没有取回异步结果的工具，宿主只能吃同步窗口。
   - #60 失败判定器仍会被**短文本里的数字子串**误伤：`looksLikeError` 只要正文 ≤400 字符即返回 true，而关键词表含裸 `'401'/'402'/'429'`，于是"耗时 4021ms""见 `:398-401`"这类成功产出可能被记成失败（#37 只修了长文那一半）。
-  - 其余：#46 `tools.json` 损坏即崩（与 P0 双重标准；现已确认为"只发生在启动时"，运行期不重读）、#47 幂等缓存命中流式写出畸形 SSE、#40 恒假分支致 CLI 拿不到工作区简报、#51 工作区 path 无效时静默改建空目录、#26 吞异常门禁、#49 两个 HTTP 封装单点化（含负数 env 钳制：`parseInt(env) || 默认` 对负数不成立，而 Node 的 `setTimeout(<0)` 语义是"超时失效"）、#27/#28/#29 结构性重构、#55 北极星端到端验收、#32 HTTP 入口坏 JSON 伪装成参数缺失（本轮实测再现：非法 JSON 的 toggle 请求回的是 `400 缺少 tool 参数`，不是"body 解析失败"）、#33/#34 损坏与隔离状态上报到 `/api/health` 与 UI、#35 `tools.json` 模型漂移。
+  - 其余：#47 幂等缓存命中流式写出畸形 SSE、#40 恒假分支致 CLI 拿不到工作区简报、#51 工作区 path 无效时静默改建空目录、#26 吞异常门禁、#49 两个 HTTP 封装单点化（含负数 env 钳制：`parseInt(env) || 默认` 对负数不成立，而 Node 的 `setTimeout(<0)` 语义是"超时失效"）、#27/#28/#29 结构性重构、#55 北极星端到端验收、#32 HTTP 入口坏 JSON 伪装成参数缺失（本轮实测再现：非法 JSON 的 toggle 请求回的是 `400 缺少 tool 参数`，不是"body 解析失败"）、#33/#34 损坏与隔离状态上报到 `/api/health` 与 UI、#35 `tools.json` 模型漂移。
   - 鉴权面残项（#42/#68 之后仍然成立的口子）：**#64** `/proxy/*` 在鉴权门**之前**免凭据透传（与 `/v1` 同属"能执行能花钱"面，另含 `checkAuth` 非恒定时间比较）、**#65** `check-active.js`/`cleanup-stuck.js` 硬连生产 9800 却不带凭据（设 token 后必然 401，运维脚本自己失效）、**#66** 把 #42/#68 的一次性凭据取证 harness 固化成第 7 套常驻套件（防"第二个调用点漏网"复发；禁止"复制一份 JS 进测试"那种永远绿假锁）、**#67** UI 流式解析三缺陷（无跨块缓冲、`TextDecoder` 未开 `stream` 会碎中文、`catch(_){}` 静默吞）。
   - #43 之后核准新增：**#72** `beginRun` 是第 5 个丢弃 `saveState` 返回值的站点（隔离/写故障时租约与 `useCount` 静默漂移，本单规格明令不动）、**#73** key 被隔离期间对已知 id 的写/删返回 404「不存在」而非 5xx 降级（`store.load` 返回 `{}` 使记录不可见，与 #33/#34 同源）、**#74** `causeOf` 与 #54 的"取尾部且有界"是同一规则的两处实现，且 `REFUSED_CAUSE` 文案只写"解析损坏"、窄于 #44 之后"解析失败或形状非法"的事实。
   - 本轮（#68）核准新增：**#69** `edge-agent` 漏配 `AI_BRIDGE_TOKEN` 时，`bridge:health` 会**静默**降级成 7 字段存活视图（运维无从归因），应启动自检并告警——属 `edge-agent.js` 面，另行派工；**#70** `?probe=1` 在仓内**零代码调用方**（只有两处文档提及），若确认无运维使用方，整段删除才是根除"签名放大器"面的正解，删除须与文档同批修订。

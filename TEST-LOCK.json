@@ -1,17 +1,17 @@
 {
-  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#68 已合并(00a7894),**编码手劣迹记账**:2026-10-23 #44 首次交付贴出\"37/37 全绿\"但 store.js 与基线 blob 逐字节相同、grep assertShape 零命中、我复跑仍 27/37=假完成,已重派并自此在派工单常驻四条硬性自证(diff --stat 非空 / hash≠基线 / grep 计数达标 / 套件总计真值)。遗留待办:#69(edge-agent 漏配 token 静默降级)、#70(?probe=1 零调用方,裁定存废)、#64(/proxy 免凭据透传)、#65(运维脚本不带凭据)、#66(凭据取证 harness 常驻化)、#67(UI 流式三缺陷)、#61(文档保真锁,本轮又抓到 45/184/374 三处漂移)、#62(recordTask 白名单丢字段)、#63(测试残留+未忽略的 .bak-cleanup-*)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#60(短文本数字子串)、#56(别名回查)、#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29/#55。#43 已合并(289e017),#31 已合并(539fee3),#45 已合并(eba52a7)。当前无在途交付物。#43 审计要点:编码手首次交付把异常一律折成布尔、底层原因被吞,判为归因回归(#54 同族)不予合并,出返工单 R1 修好;我自己新加的 #43b6/#43c1 首版把 create 尝试放在撤注入之后,测的不是我以为的东西(已改正并让 archive/restore 两把锁带真实前置);核准遗留 #72/#73/#74/#75。#31 规格债记账:我在验收里写死\"0 error/19 warning 不得新增\",而删 async save 必然新造 _locks 孤儿(+1 unused)、删 loadList 又 -1 → 首轮实为 20;编码手为凑 19 保留了孤儿并如实申报,是我这条基线数逼出来的,已补 K5 红锁与 #76(基线应随源码快照成锁)。#45 教训两条(记进流程):① 改锁定测试文件后必须逐个点名断言、比对断言名清单——我上轮把 K4 写成 K3b 的副本,锁数量对而内容少一把,还顺着合了 #31;② grep 型结构锁有盲区(L5 漏抓 server.js:2209/2215 的 Ollama 形状①写手),涉及\"数据落库形状\"的锁应升级为行为锁(断言落库行键集合),已登记 #77。另新增 lint_baseline 字段,作为 #76 的落地起点。",
-  "updated": "2026-10-23 (#45 落盘:usageTokensSql 单点认全三种形状 + 写侧归一;套件合计 422→429,audit 56→63;lint 基线 19→18 的真因是我上轮写坏的 K4)",
-  "head": "eba52a7",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#68 已合并(00a7894),**编码手劣迹记账**:2026-10-23 #44 首次交付贴出\"37/37 全绿\"但 store.js 与基线 blob 逐字节相同、grep assertShape 零命中、我复跑仍 27/37=假完成,已重派并自此在派工单常驻四条硬性自证(diff --stat 非空 / hash≠基线 / grep 计数达标 / 套件总计真值)。遗留待办:#69(edge-agent 漏配 token 静默降级)、#70(?probe=1 零调用方,裁定存废)、#64(/proxy 免凭据透传)、#65(运维脚本不带凭据)、#66(凭据取证 harness 常驻化)、#67(UI 流式三缺陷)、#61(文档保真锁,本轮又抓到 45/184/374 三处漂移)、#62(recordTask 白名单丢字段)、#63(测试残留+未忽略的 .bak-cleanup-*)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#60(短文本数字子串)、#56(别名回查)、#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29/#55。#43 已合并(289e017),#31 已合并(539fee3),#45 已合并(eba52a7),#46 已合并(6ba0ff1,含我修基线 lint error 的 2de1196)。当前无在途交付物。#43 审计要点:编码手首次交付把异常一律折成布尔、底层原因被吞,判为归因回归(#54 同族)不予合并,出返工单 R1 修好;我自己新加的 #43b6/#43c1 首版把 create 尝试放在撤注入之后,测的不是我以为的东西(已改正并让 archive/restore 两把锁带真实前置);核准遗留 #72/#73/#74/#75。#31 规格债记账:我在验收里写死\"0 error/19 warning 不得新增\",而删 async save 必然新造 _locks 孤儿(+1 unused)、删 loadList 又 -1 → 首轮实为 20;编码手为凑 19 保留了孤儿并如实申报,是我这条基线数逼出来的,已补 K5 红锁与 #76(基线应随源码快照成锁)。#45 教训两条(记进流程):① 改锁定测试文件后必须逐个点名断言、比对断言名清单——我上轮把 K4 写成 K3b 的副本,锁数量对而内容少一把,还顺着合了 #31;② grep 型结构锁有盲区(L5 漏抓 server.js:2209/2215 的 Ollama 形状①写手),涉及\"数据落库形状\"的锁应升级为行为锁(断言落库行键集合),已登记 #77。另新增 lint_baseline 字段,作为 #76 的落地起点。#46 流程教训:①**取红基线那一格也必须跑 eslint**——我把 function 写进块级作用域,提交进基线的 no-inner-declarations error 直到编码手验收 0 才被报出;\"文件锁定\"与\"0 error\"冲突时唯一正解是指挥官亲笔改锁并重算哈希。②不指认他人前先查自己:9849/9850 的残留实例经查是我自己脚本的 taskkill 在 git-bash 下 PID 空间不匹配所致,非编码手未清理。",
+  "updated": "2026-10-23 (#46 落盘:tools.json 损坏只降级不拦启动 + 四态诊断;套件合计 429→435,store-corrupt 37→43;我修了自己写进基线的 lint error)",
+  "head": "6ba0ff1",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
     "test-workspace.mjs": "fe97ddeb0031a00dddca2c1bd4573721f97cb57f",
     "test-external-fixes.mjs": "be16cd3f50a5a17db5a340351902c4a7d29261c3",
     "test-audit-fixes.mjs": "6a32be13f4034640dbc4ba466de522f27fbf88da",
     "test-e2e.mjs": "9455ce0bc2fdfd1b48a14d2ee6a3a7043396de2a",
-    "test-store-corrupt.mjs": "5e475b0ecb3ae2e5f4e9c998fe8fc118a3ae67a1"
+    "test-store-corrupt.mjs": "925899529c0ea125849200e0f455f6c15d329df8"
   },
   "red_baseline": {
-    "test-store-corrupt.mjs": "37/37 全绿(#44 红集 10 条 a2/a3/a4/b1/b2/b3/c1/c2/d1/e2 转绿;哨兵 a1/e1/s1/s2 不回退——s1/s2 专防\"守卫把合法路径一起拒掉\"的偷懒实现;C1~C6 与 #52 三条零回退)",
+    "test-store-corrupt.mjs": "43/43 全绿(#46 红集 a1/a2/a3/a4/a5 转绿;哨兵 a6 合法数组照旧全量加载不回退;C1~C6/#52/#44 各段零回退)",
     "test-e2e.mjs": "195/195 全绿(#44 后仍不回退)(#68a1 无凭据外带 [codely,usage] 转绿;新增 #68b1 无凭据 ?probe=1 必须 401 且无 upstream、#68b2 源码顺序守卫判权先于 getCodelyCliApiKey/requestCodelyLiteLLM——c837c9e 上 pass:false(iA=-1)、交付树 pass:true(iA<iK<iR) 已证非空洞;#42a0~a4/#36a*/#59a*/#50/#53/#48/#54/#37/#38/#39/#52 各段不回退)",
     "test-audit-fixes.mjs": "63/63 全绿(#45 红集 L1/L2/L3/L5 转绿,实测 150→460 与\"原样写处数 2→0\";L0 保险栓/L3b null 行/L4 events 反向锁零回退;K1~K5 与 A~J 段零回退)",
     "test-unit.mjs": "41/41",
@@ -20,40 +20,40 @@
   },
   "source_faces": {
     "store.js": "02a894f69f1f518f0ea9cf4eec55e93f3e8cdad6",
-    "server.js": "6183e276f24302f6d7d86a0ee9e1a1068f3130ae",
+    "server.js": "d8fbc8b089694f5fb0aeba198fee9e45fe56ddde",
     "db.js": "c6c74391de6e536940c1f7e5bdbc0a3713cd599f",
     "workspace-manager.js": "58867b11c2d291824209dc010bbc9e2a167b48ea",
     "bridge-stdio.js": "e93e4fb7264862499e901609730eb2acc9d589c5",
-    "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
+    "tool-registry.js": "31a7b3ca2fcc50a1c94015fa62a556737d2713df",
     "tool-identity.js": "c3a69a85df0ba2c826fcfc62b58f66b6b4ef1880",
     "adapters/cli-adapter.js": "ee8cbf700c5d9a31c311681b4f1b54785fe6b9bd",
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
     ".eslintrc.json": "f8735f334ba169e9af9a9efe0fb3773c3d58a549",
     "package.json": "b860aaee2d698b6b76d1117f0d4d87e3ea1ebe92",
-    "README.md": "9bed2b19216f7cf2169f992fae45f5ea2823ee72",
-    "ARCHITECTURE.md": "1aa11f57836e7b9674083ec937d1c0e920527616",
+    "README.md": "5f0d3be46c4ea7a2ae04fd637af717c72c97dee6",
+    "ARCHITECTURE.md": "",
     "ui.html": "354156232ef4bde9e9f85436f0cca549a29ab22b"
   },
   "source_faces_owner": {
     "store.js": "#31(539fee3) 删 JSONL 流量死账本+async save+loadList+_locks 孤儿;(#44/afacc4c 形状守卫与 #52 点守卫未回退)",
-    "server.js": "#45(eba52a7) 两处入站反代落库改归一化 {input,output,total}(响应体未改);(#43/#68/#41/#59 面未回退)",
+    "server.js": "#46(6ba0ff1) 启动期把 corrupt-* 诊断落 logs.jsonl+stderr;(#45/#43/#68/#41/#59 面未回退)",
     "db.js": "#45(eba52a7) usageTokensSql 单点 COALESCE 链,byDay/byTool/todayTokens 三处共用",
     "workspace-manager.js": "#43(289e017) remove 先落盘后回收 + create/archive/restore 统一 trySaveState 区分拒写与写故障 + causeOf 有界归因",
     "bridge-stdio.js": "#36(ae58da1) skippedLabel 双形状兼容 + 汇总行抬入点名数 + 三处分母统一",
-    "tool-registry.js": "#37(4094d20) 以来未变",
+    "tool-registry.js": "#46(6ba0ff1) loadTools 四态诊断 + getLoadDiagnostics 导出(boundedReason 有界)",
     "tool-identity.js": "T-A/B/C 系列以来未变(#36 未动)",
     "adapters/cli-adapter.js": "#54(0db17d2) close 收下 signal + 详情取尾部 + err.signal/timedOut",
     "tools.json": "#35 待办,当前值 07adb690",
     ".eslintrc.json": "E2-lint(22)",
     "package.json": "E2-lint(22)",
-    "README.md": "#45 同轮文档同步(429 项、audit 63 含 L 段、已根治补 #45、其余清单去 #43/#45 并补 #32 再现与 #76/#77)",
-    "ARCHITECTURE.md": "#45 同轮文档同步(修复清单补 #45、测试面现状 429、未修清单去 #45 补 #77)",
+    "README.md": "#46 同轮文档同步(435 项、store-corrupt 43、已根治补 #46、未修去 #46)",
+    "ARCHITECTURE.md": "#46 同轮文档同步(修复清单补 #46、测试面现状 435、未修去 #46)",
     "ui.html": "#42(765271c) withAuth 单一注入点 + 流式调用点凭据 + resp.ok 可读失败(此前全文件无任何凭据处理)"
   },
   "lint_baseline": {
     "errors": 0,
     "warnings": 18,
-    "as_of": "eba52a7",
-    "note": "#76 的第一步:基线随源码快照记录。18 = server.js 6(5 unused + 1 no-control-regex) + store.js 4 + workspace-manager.js 2 + base.js 1 + bridge-stdio.js 1 + edge-agent.js 1 + test-external-fixes 1 + test-full 1 + test-unit 1。上一轮记的 19 里有一条是我把 K4 写坏成 K3b 副本后 srvSrc 变 unused 造成的,恢复 K4 后归 18。"
+    "as_of": "6ba0ff1",
+    "note": "#76 第一步。18 = server.js 6 + store.js 4 + workspace-manager 2 + base/bridge-stdio/edge-agent/test-external/test-full/test-unit 各 1。本轮实测 #46 的改动 delta=0(前后各 6 条)。上一格我把 no-inner-declarations 的 error 提交进红基线(取基线时漏跑 eslint),已由 2de1196 修复。"
   }
 }
