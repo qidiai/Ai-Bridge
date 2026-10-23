@@ -171,16 +171,25 @@ section('F) 超时预算关系锁(#53/#48)');
 {
   const srv = fs.readFileSync('./server.js', 'utf-8');
   const br = fs.readFileSync('./bridge-stdio.js', 'utf-8');
-  // 兜底值的两种写法都必须认:旧式 parseInt(env)||N 与新式 parsePositiveInt(env,N)(#49 的目标形态)。
-  // 只认一种就会"照规格修完反而判红"(锁与规格互斥,#47 那次同款病)——取语句末尾那个数字。
-  const sm = srv.match(/EXECUTE_TIMEOUT:[^\n]*?(\d+)\s*\)?[,;]/);
-  const S = sm ? Number(sm[1]) : NaN;
+  // 兜底值的三形态必须同尺(编码手 #49a 实测出第三种):
+  //   旧式 parseInt(env)||N 、 新式 parsePositiveInt(env,N) 、 带变量名的 parsePositiveInt(env,N,'NAME')。
+  //   我先前"取语句末尾那个数字"的取法在第三形态下抓不到 N(末尾是字符串实参),结果锁的形状要求反过来
+  //   逼迫实现**省略 name 参数**——那是锁的缺陷,不是需求(编码手如实披露了这个取舍,记合格)。
+  //   规则:先认 `) || N`(旧式);否则认 `, N` 后紧跟 `,` 或 `)`(新式默认值 = 最后一个数值实参之前那层)。
+  //   已知局限:默认值写成算术表达式(如 `10 * 60 * 1000`)时会取到末尾的 1000;本文件三条锁都不依赖那类站点。
+  const defaultOf = (stmt) => {
+    const old = (stmt || '').match(/\)\s*\|\|\s*(\d+)/);
+    if (old) return Number(old[1]);
+    const nw = (stmt || '').match(/,\s*(\d+)\s*(?:[,)])/);
+    return nw ? Number(nw[1]) : NaN;
+  };
+  const S = defaultOf((srv.match(/EXECUTE_TIMEOUT:[^\n]*/) || [''])[0]);
   check('F0 能解析中枢单次执行窗口(server.js CONFIG.EXECUTE_TIMEOUT 兜底值)', Number.isFinite(S) && S > 0, `S=${S}`);
   // 数值解析器:默认值可以写字面量,也可以写共享常量标识符(鼓励后者:GET/POST/总超时同源)
   const resolveDefault = (expr) => {
     if (/^\d+$/.test(expr)) return Number(expr);
-    const m2 = br.match(new RegExp('(?:const|let|var)\\s+' + expr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*=\\s*[^;]*?(\\d+)\\s*\\)?;'));
-    return m2 ? Number(m2[1]) : NaN;
+    const line = br.match(new RegExp('(?:const|let|var)\\s+' + expr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*=\\s*[^;]*;'));
+    return line ? defaultOf(line[0]) : NaN;
   };
   const pm = br.match(/function\s+httpPost\s*\([^)]*?timeoutMs\s*=\s*(\d+|[A-Za-z_$][\w$]*)/);
   const B = pm ? resolveDefault(pm[1]) : NaN;
@@ -194,7 +203,7 @@ section('F) 超时预算关系锁(#53/#48)');
   //   若把 GET 默认也抬到 960s,#38a 的黑洞测试会从 30010ms 变成永久悬空 → 制造回归)。
   const brCode = br.split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
   const ems = [...brCode.matchAll(/^.*AI_BRIDGE_HTTP_TIMEOUT.*$/gm)]
-    .map(mm => { const n = mm[0].match(/(\d+)\s*\)?[;,]/); return n ? Number(n[1]) : NaN; })
+    .map(mm => defaultOf(mm[0]))
     .filter(Number.isFinite);
   const BMAX = ems.length ? Math.max(...ems) : NaN;
   check('F3 预算必须可用 AI_BRIDGE_HTTP_TIMEOUT 配置,且同步类兜底值同样包住中枢窗口(GET 可另设更短兜底)',

@@ -1096,9 +1096,18 @@ async function main () {
     const negMcp = makeMcpChannel(negProc);
     await negMcp.request('initialize', {}).catch(() => {});
     const n = await budgetCall(negMcp, 'list_tools', {}, 12000);
+    // 【我自己的锁缺陷,当场纠正】原判据要求 list_tools 的输出里匹配 /name/,但桥的 list_tools 返回的是中文
+    //   Markdown 表(bridge-stdio.js:343-348:`| 工具 | 检测 | 开关 | tokens | 次数 |`),工具名都是 openclaw/
+    //   codely 之类,**任何正确实现都不可能让它为真** —— 这是流水线第 4 次"锁数量对、内容错"(#47a1/a3 互斥、
+    //   K4 被我写成 K3b 副本、#80 探针漏 commandPaths,同一族病)。编码手没有改测试也没有改响应文案,而是
+    //   带证据报 SPEC GAP —— 判定成立,记合格。
+    // 判据换成与响应文案**无关**的直接证据:① 桥侧这轮调用不出错;② 中枢确实看见该客户端注册上来
+    //   (注册本身要走一次 httpPost 出站,egress 通不通由此直证;`ERR_OUT_OF_RANGE` 也必须不出现)。
+    const negClients = await jreq(NEG_HUB_PORT, 'GET', '/api/clients');
+    const negSeen = JSON.stringify(negClients.body || {}).includes('e2e-neg-env');
     check('#49n4 红:负数 AI_BRIDGE_HTTP_TIMEOUT 不得让桥彻底失联(现状 parseInt(env)||默认 让 -1 直通 → http.request 同步抛 ERR_OUT_OF_RANGE)',
-      n.capped === false && n.isError === false && /name/.test(n.text),
-      JSON.stringify({ capped: n.capped, err: n.err, isError: n.isError, text: n.text.substring(0, 80) }) + ' stderr=' + negErr.substring(0, 80));
+      n.capped === false && n.isError === false && !/ERR_OUT_OF_RANGE/.test(n.text) && negSeen === true,
+      JSON.stringify({ capped: n.capped, err: n.err, isError: n.isError, 中枢在册: negSeen, httpStatus: negClients.status, text: n.text.substring(0, 60) }) + ' stderr=' + negErr.substring(0, 80));
     check('#49n5 非法 env 必须留痕:stderr 要同时出现变量名与"非法/回落/正数"字样(静默落默认 = 设了却不生效且无人知道)',
       /AI_BRIDGE_HTTP_TIMEOUT/.test(negErr) && /非法|无效|不是正数|必须为正|回落/.test(negErr),
       'stderr=' + negErr.substring(0, 200));
