@@ -284,7 +284,7 @@ process.stdout.write(JSON.stringify(out) + '\\n');
 process.exit(0);
 `, 'utf-8');
 
-  function runRegistryCase (name, toolsContent) {
+  const runRegistryCase = (name, toolsContent) => {
     const dir = path.join(TMP, `reg-${name}`);
     fs.mkdirSync(path.join(dir, 'adapters'), { recursive: true });
     for (const f of ['tool-registry.js', 'kimi-models.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, f));
@@ -297,7 +297,7 @@ process.exit(0);
     let parsed = null;
     try { parsed = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch { /* 交给断言判失败 */ }
     return { dir, parsed, stderr: r.stderr || '' };
-  }
+  };
 
   const TRUNC_TOOLS = '[{"name":"ok-tool","transport":"cli"},{"id":';
   const cTrunc = runRegistryCase('trunc', TRUNC_TOOLS);
