@@ -1,6 +1,6 @@
 {
   "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#59 已合并,当前无在途交付物。遗留待办:#36(被跳过的点名目标不进分母+无归因+三处分母漂移)、#60(判定器短文本数字子串误伤)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#42/#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29。",
-  "updated": "2026-10-23 (#59 落盘:超时清理补 taskPending,#59a3/a4 红锁清零;当前无在途交付物)",
+  "updated": "2026-10-23 (文档同步:README/ARCHITECTURE 追平 #50/#53+#48/#41/#54/#59 与未修清单;无在途交付物)",
   "head": "a8c30d6",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
@@ -29,8 +29,8 @@
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
     ".eslintrc.json": "f8735f334ba169e9af9a9efe0fb3773c3d58a549",
     "package.json": "b860aaee2d698b6b76d1117f0d4d87e3ea1ebe92",
-    "README.md": "7c931c3e4140082ec50f1ac85c226c909231cf6c",
-    "ARCHITECTURE.md": "4a9a107986fd2d507a381b028df82a217873672d"
+    "README.md": "0aedaf79dbfa9748183a5fb37b5406856d02da10",
+    "ARCHITECTURE.md": "5560af46b0e925870c9bcc69fcf51562a22fe78a"
   },
   "source_faces_owner": {
     "store.js": "#52(afacc4c) 形状守卫+启动隔离",
@@ -43,7 +43,7 @@
     "tools.json": "#35 待办,当前值 07adb690",
     ".eslintrc.json": "E2-lint(22)",
     "package.json": "E2-lint(22)",
-    "README.md": "#53/#48(012f828) 加 AI_BRIDGE_HTTP_TIMEOUT 一行",
-    "ARCHITECTURE.md": "T-Doc(19)"
+    "README.md": "2026-10-23 文档同步(env 全表/六套件 367 项/超时口径/已修与未修清单)",
+    "ARCHITECTURE.md": "2026-10-23 新增超时与预算模型、客户端注册·能力·状态契约两节;影响链与配置消费者补行;修复清单补至今"
   }
 }

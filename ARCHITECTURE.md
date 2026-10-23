@@ -115,6 +115,34 @@ archive/restore 切换 status;运行中工作区禁止归档/删除
 remove: linked 仅解除登记;managed + delete_files=1 且 realpath 严格落在根内才递归删除
 ```
 
+## 超时与预算模型（三层，2026-10-23 起）
+
+一次"把任务派给外部软件/CLI"的调用，最长能活多久由**三层**独立预算决定，它们必须同向，否则会出现"下游还在干活、上游已判死刑"的假失败：
+
+| 层 | 位置 | 取值 | 说明 |
+|----|------|------|------|
+| 中枢执行窗口 | `server.js:47` `CONFIG.EXECUTE_TIMEOUT` | `AI_BRIDGE_EXECUTE_TIMEOUT`，默认 900000 | 用于 CLI 执行链 `:580`（`opts.timeout ‖ tool.timeout ‖ EXECUTE_TIMEOUT`）与客户端反向执行 `:683` |
+| 桥侧 HTTP 预算 | `bridge-stdio.js:25` `HTTP_TIMEOUT_MS` | `AI_BRIDGE_HTTP_TIMEOUT`，默认 **960000** | POST/同步类默认值；**不变式：≥ 中枢窗口 + 30000**（桥先判死＝误报失败 + 脏台账）。由 `test-audit-fixes` 段 F 数值关系锁守护（不写死常量，改窗口时锁跟着动） |
+| 桥侧工具总超时 | `bridge-stdio.js:31` `CALL_BUDGET_MS = HTTP_TIMEOUT_MS + 30000` | 派生 | `callTool` 用 `Promise.race` 包住整个工具调用（`:285`），串行多跳（handoff 的 POST→GET、discuss 的 POST→轮询）的**累加**耗时不再无界；`finally` 必 `clearTimeout`，不留孤儿定时器 |
+| 适配器进程超时 | `adapters/cli-adapter.js:321` `budgetMs = opts.timeout ‖ 120000` | tools.json 的 `tool.timeout` | 与 `:281` 传给 `spawn({timeout})` 的是**同一表达式**，错误文案里的预算数字因此是真实生效值，不是第二个写死的数 |
+
+两处**有意不同源**的例外（都是被锁定测试钉住的，不得"顺手统一"）：
+
+- `GET_TIMEOUT_MS`（`bridge-stdio.js:29`）未设 env 时仍为 **30000**：`pollLoop` 的 30s 快速失败是桥自愈节奏，抬到 960s 会让 `test-e2e #38a`（无 env 时黑洞约 30010ms 自行回 `isError`）当场回归。设了 `AI_BRIDGE_HTTP_TIMEOUT` 时 GET/POST 同源覆盖。
+- 关停期注销预算 `httpPost('/api/client/unregister', …, 1500)` 是**具名调用点例外**（既有代码），删掉它会让关停挂满 16 分钟，收敛单点封装时再统一命名。
+
+**超时归因的真实形状（#54）**：`spawn({timeout})` 杀死子进程时 `close` 回 `code=null, signal='SIGTERM'`（本机实测）。适配器必须收下 `signal` 并分三支归因，且失败详情取 **`stderr‖stdout` 的尾部**（有界）——头部往往是 CLI 自己的启动横幅，历史上曾被当成"失败原因"写进台账（`Command exited with code null: Console code pages…`，实测流量 18 行 + `fallbackLog` 12 处）。
+
+## 客户端注册·能力·状态契约（2026-10-23 起）
+
+外部编程软件经 `bridge-stdio.js` 接入后的三条硬契约：
+
+1. **能力只认"更晚的决定"，但允许真撤回**（#50）。注册带单调 `registerSeq`（毫秒基数×1000＋进程内递增，跨进程可比且在 2^53 内）。`server.js` 的 register 处理器对 **seq 更小者拒绝改动能力字段**（防"桥启动即发的 `sampling=false` 迟到覆写宿主声明的 true"），而 **seq 更大者允许把能力改回 false**（宿主真的不再支持时不留虚高）。不带 `registerSeq` 的旧客户端 `seq=null` → 行为与既往完全一致。桥侧：宿主 `initialize` 若早于首注册回执到达，置 `pendingCapRefresh`，首注册 `approved` 后用更大 seq **补发一次**（发后不理，不阻塞回执）。准入前提：只有"完成过首轮 poll、未 stale、`supportsSampling===true`"的客户端才进入执行调度面（`server.js:379`）。
+2. **任务态条目禁止整体替换**（#41）。`connectedClients` 的存活条目只能用 `client.x = …` 就地写；`set(key, {...存活对象, …})` 取的是**局部变量快照**，会与就地 mutate 的超时清理互相"复活"已清空字段。此不变式由 `test-audit-fixes` 段 G 的结构锁守护（`spread-set` 必须为 0；注册**新建**条目用 `set` 是合法的，不属禁止面）。
+3. **状态判据是三个字段之或**（`server.js:449`）：`pendingResolve ‖ _busy ‖ taskPending → online_busy`。因此**每个置 true 的字段都必须有对应的清理出口**——#59 补的就是超时清理里漏掉的 `taskPending`（`:679`），否则"取走任务却没回结果"的客户端会被永久误判 busy，而打开的长轮询每秒还在 `:1732` 续 `lastSeen`，连 `stale` 兜底都触发不了。`taskPending` 的写点：`:1710`/`:1736`（poll 取走）、`:1762`（result 复位）、`:679`（超时复位）。
+
+已知未修（见 README「已知问题」）：同默认名 `unknown`（`bridge-stdio.js:18`）的多会话会塌进**同一个**在册条目，且复用的是静默分支（无日志）→ 不可观测（#57）；`no_targets` 归因对"别名点名的无资格在册客户端"仍报"未知工具"（#56）。
+
 ## 影响链（改 A 影响谁）
 
 | 改动点 | 影响 |
@@ -126,6 +154,11 @@ remove: linked 仅解除登记;managed + delete_files=1 且 realpath 严格落�
 | Ollama 未运行 | local-vl 模型返回 502/503 明确指引 |
 | /v1 反代不可用 | 所有 Base URL 指向 9800 的客户端(zcode/Claude Code 等)报错 |
 | nssm 服务环境变量 | AI_BRIDGE_HOST 改 0.0.0.0 会暴露无鉴权端点(已改回 127.0.0.1) |
+| tools.json | **仅在进程启动时被 `tool-registry.js:84 const TOOLS = loadTools()` 读一次**，全仓无第二处调用、无写 tools.json 的端点 → 运行中的中枢不会重读；改文件只影响下一次启动（实测：临时给文件加一个假工具后，在跑的生产中枢仍只报原 12 个）。推论：#46「tools.json 损坏即崩」只在启动时发生，运行期改坏不会立刻炸 |
+| CONFIG.EXECUTE_TIMEOUT | 桥侧 `HTTP_TIMEOUT_MS`/`CALL_BUDGET_MS` 的下界依据（不变式：桥预算 ≥ 窗口 + 30000，`test-audit-fixes` 段 F 锁死）；改窗口不同步改桥默认值 → 长任务假失败回归 |
+| clientState 判据 | `/api/clients`、Web UI 在线态、按 state 打分的可观测面；新增/删除判据字段必须同时补齐所有清理出口（#59 的教训：置 true 有 3 处、置 false 只 1 处 = 状态位烂死） |
+| dispatch 响应的 total/skipped | 桥侧三处渲染（`bridge-stdio.js:317/318` 汇总与跳过、`:382`/`:397` 历史列表用 `results.length`）——**同一件事已有三种分母实现**，改任一分母语义必须三处同批统一（#36） |
+| 非 2xx 承载业务语义的端点 | 桥按结构化字段解包（`/api/poll` 404 未注册→重注册自愈、`/api/client/register` 403 denied→30s 慢重试、`no_targets`→409）。新增此类端点必须同步桥侧解包，否则宿主只看到 `isError` 文案 |
 
 ## 配置消费者
 
@@ -140,6 +173,14 @@ remove: linked 仅解除登记;managed + delete_files=1 且 realpath 严格落�
 | AI_BRIDGE_CACHE_TTL/MAX | 反代幂等缓存 |
 | AI_BRIDGE_DAILY_TOKEN_BUDGET | /api/health 预算告警 |
 | AI_BRIDGE_OLLAMA_BASE | local-vl 上游地址 |
+| AI_BRIDGE_EXECUTE_TIMEOUT | 中枢单次执行窗口（`server.js:47` → CLI 执行链 `:580`、客户端反向执行 `:683`、超时清理 `:672-680`） |
+| AI_BRIDGE_HTTP_TIMEOUT | 桥侧同步预算（`bridge-stdio.js:25/29/31` → `httpPost`/`httpGet`/`callTool` 总超时）；未设时 GET 仍走 30000ms 自愈节奏 |
+| AI_BRIDGE_SAMPLING_TIMEOUT | 桥侧反向 `sampling/createMessage` 的防泄漏兜底（默认 900000，节奏由中枢窗口管控） |
+| AI_BRIDGE_CAP_EXEC | 桥是否声明 exec 能力（严格 opt-in：`1/true/yes/on`）；决定能否承接 workspace 任务 |
+| AI_BRIDGE_CLIENT | 桥在册身份名（默认 `unknown`，见 #57 的多会话塌缩风险） |
+| AI_BRIDGE_DATA_DIR | store 层 JSON 数据目录（测试/沙箱实例的隔离锚点） |
+| AI_BRIDGE_DB | 全局 SQLite 路径（默认 `~/.ai-bridge/bridge.db`；沙箱实例必须同时隔离它，否则写穿生产台账） |
+| AI_BRIDGE_TOOLSET | 桥暴露工具套餐 full(15)/lite(5)，直接决定 `tools/list` 响应体积 |
 
 ## 修复/演进清单
 
@@ -155,3 +196,16 @@ remove: linked 仅解除登记;managed + delete_files=1 且 realpath 严格落�
 - [x] 2026-10-22 MCP 工具面裁剪:20→15(discuss 合并 action 枚举、manage_client 取代 approve/deny/kick、描述压缩、full/lite 双套餐);tools/list 响应 full 6880B / lite 1901B(-72%,口径:完整 JSON-RPC 响应字节数不含尾随换行,计换行为 6881B/1902B),commit 621161e
 - [x] 2026-10-22 桥层失败路径根治(T-D):httpGet/httpPost 感知 HTTP 状态码,非 2xx reject 且 Error 附带 status/body;tools/call 异常统一降级为 MCP 规范 isError;`/api/poll` 404 未注册与 `/api/client/register` 403 denied 显式解包以保中枢重启后桥自愈。红→绿载体 test-e2e section 9.3,commit 4fc1c4a→b1adcbf
 - [x] 2026-10-22 ai-bridge 独立 lint 护栏(E2-lint):`ai-bridge/.eslintrc.json` 以 `root:true` 切断仓根 eslint-config-standard 级联,关闭 12 项风格规则、保留 eslint:recommended 正确性规则,`.mjs` 测试按 ESM 解析;`package.json` 增 lint/test 脚本。实测 0 error/18 warning(13 项被排除的一次性脚本若入网亦 0 error)。CI 接线待仓根 ci.yml 解冻后接 `npm --prefix ai-bridge run lint`
+- [x] 2026-10-23 P0 静默清库根治:坏 JSON 改名保全 `<file>.corrupt-<时间戳>` + 进程内脏标志拒绝覆写(不抛错),防任务历史被洗成 1 条 / 黑名单被清空 / 已关工具被静默回启。commit d374ea7
+- [x] 2026-10-23 #39 会议孤儿启动清扫:并发闸门按 memory.json 的 discussing/active/implementing 计数(上限 3),崩溃残留会永久 429 死锁讨论。新增 `store.markOrphanMeetings()`,无孤儿不写盘、落盘被拒只留 error 日志绝不抛错。实测 156/156,commit d5f852b
+- [x] 2026-10-23 #38 桥侧 `httpGet` 补 `timeout` 监听:Node 的 timeout 选项只发事件不自动中断,中枢半死时 GET 类工具永久悬空。实测黑洞耗时由"60015ms 靠宿主 RPC 超时"变为"30010ms 桥自行回 isError",commit 752aedd
+- [x] 2026-10-23 #37 失败判定器根治:"谈论失败"的长文交付物被关键词子串判失败并销毁正文。引入 `looksLikeError`(≤400 字符或以错误头开头才算错误文本,ANSI 容忍)为关键词分支加门;失败条目保留正文;流量 `success` 与判定同一次裁决。实测 164/164,commit 4094d20
+- [x] 2026-10-23 #52 【指挥官自己的回归】坏形状 `memory.json.meetings` 令中枢启动即崩:P0 只隔离"解析失败"，管不了"能解析但形状非法"。补形状守卫 + 启动期 try/catch(注释即约束:"启动期任何数据异常都不得阻止进程起来")。实测 335 项全绿,commit afacc4c
+- [x] 2026-10-23 #50 乱序注册与能力补发根治(北极星主链第一道门):`registerSeq` 单调保护 + `pendingCapRefresh`;seq 更大者仍可真撤回(不做只升不降)。生产真验:探针桥故意乱序注册后仍取得 `supportsSampling/executionEligible`,并发乱序 515ms 收敛。commit 148135c
+- [x] 2026-10-23 #53+#48 超时预算统一:桥 POST 预算 600000→**960000**(≥ 中枢窗口 900000+余量)且可 `AI_BRIDGE_HTTP_TIMEOUT` 配置;GET 形参化但**有意保持 30000** 自愈节奏;`callTool` 加 `Promise.race` 总超时并 `finally` 清定时器。实测 353 项双跑全绿,commit 012f828
+- [x] 2026-10-23 #41 任务态 map 禁止整体替换:四处 `set(key, {...存活对象})` 改就地 mutate(局部快照会"复活"已清空字段);`:663` 名不副实的"CAS"注释改为如实的 check-then-act。副产物:入队不再更换条目对象身份,"先开长轮询后入队"时守卫通过,任务 ≤1s 直达。实测 358 项双跑全绿,commit c93ff54
+- [x] 2026-10-23 #54 超时归因真实化:适配器 close 收下 `signal`、三分支归因、详情取**尾部且有界**、结构化 `err.signal/timedOut`;台账不再把 CLI 启动横幅当失败原因(实测历史污染:流量 18 行 + fallbackLog 12 处)。实测 362 项双跑全绿,commit 0db17d2
+- [x] 2026-10-23 #59 超时清理补 `taskPending=false`:状态判据三字段之或里有置 true 无对应清理出口 → 客户端取走任务不回结果会被永久误判 `online_busy`。修复为**一行**；主验只能在中枢第二实例(`AI_BRIDGE_EXECUTE_TIMEOUT=4000` 造确定性超时,生产窗口不可改)，生产侧仅验结果路径未回退。实测 367 项双跑全绿,commit a8c30d6
+- [x] 2026-10-23 测试面现状:六套件合计 **367 项**(unit 41 / workspace 36 / store-corrupt 23 / audit-fixes 42 / external-fixes 45 / e2e 180),两轮同数才允许合并;`TEST-LOCK.json` 已拆分 `locked_tests`(行为冻结,编码手禁改) / `source_faces`(对照基线,指挥官每轮重算) / `source_faces_owner`(归属轮次,防并发覆盖只能靠哈希漂移反推)
+- [ ] 未修清单(2026-10-23 快照,按队列序):#36 点名被跳过者不进分母 + `skipped` 无归因 + 三处分母漂移;#42 鉴权只挡 `/api/*`(`server.js:1217`)且设 token 后 Web UI 自锁;#44 合法但形状错的 JSON 仍被静默覆写(#52 是点补);#43 写被拒却报 200、删工作区先删文件后落盘;#31 死代码与双账本;#45 usage 三处形状各写一遍;#46 tools.json 损坏即崩(与 P0 双重标准,现知只发生在启动时);#47 幂等缓存命中流式写出畸形 SSE;#40 恒假分支致 CLI 拿不到工作区简报;#51 工作区 path 无效时静默改建空目录;#26 吞异常门禁;#49 两个 HTTP 封装单点化 + slow-drip 兜底(含负数 env 钳制与 `:734` 注销预算具名化);#27/#28/#29 表驱动化/出口归一/仓库卫生;#56 别名点名的在册客户端被报"未知工具";**#57 同宿主多会话塌成 `unknown` 且塌缩静默不可观测**;**#58 MCP 面缺 `async` 派发与结果取回(中枢 `:1443` 支持而 15 工具面无入口)**;**#60 判定器短文本数字子串(401/402/429)仍会误伤**;#55 北极星端到端子智能体加载验收
+

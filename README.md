@@ -47,9 +47,13 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 | `AI_BRIDGE_PORT` | 9800 | 服务端口 |
 | `AI_BRIDGE_HOST` | 127.0.0.1 | 监听地址（**仅本机**；改 0.0.0.0 前务必设 TOKEN） |
 | `AI_BRIDGE_TOKEN` | 无 | API 鉴权 token（不设则无鉴权） |
-| `AI_BRIDGE_CLIENT` | unknown | 作为 MCP 客户端时的身份名 |
-| `AI_BRIDGE_EXECUTE_TIMEOUT` | 900000 | 单次执行超时(ms) |
-| `AI_BRIDGE_HTTP_TIMEOUT` | 960000 | 桥侧同步工具调用总预算(毫秒)，必须 ≥ 中枢 `AI_BRIDGE_EXECUTE_TIMEOUT`(桥先判死=误报失败+脏台账)；GET/轮询在未设该 env 时仍为 30000ms 快速失败(自愈节奏) |
+| `AI_BRIDGE_CLIENT` | unknown | 作为 MCP 客户端时的身份名（**注意**：默认值是常量 `unknown`，同一宿主开多个会话会全部塌进同一个在册条目且复用是静默无日志的，见「已知问题」） |
+| `AI_BRIDGE_EXECUTE_TIMEOUT` | 900000 | 中枢单次执行窗口(ms)：CLI 执行链与客户端反向执行都吃它。**桥侧 `AI_BRIDGE_HTTP_TIMEOUT` 必须 ≥ 本值 + 30000**，否则长任务会被桥早判死而中枢仍在执行（`test-audit-fixes` 段 F 锁死该数值关系） |
+| `AI_BRIDGE_HTTP_TIMEOUT` | 960000 | 桥侧同步工具调用总预算(毫秒)，同时驱动 `httpPost` 默认值与 `callTool` 总超时；**未设时 GET/轮询仍为 30000ms 快速失败**（自愈节奏，有意不与 POST 同源抬高） |
+| `AI_BRIDGE_SAMPLING_TIMEOUT` | 900000 | 桥侧反向 `sampling/createMessage` 的防泄漏兜底；实际节奏由中枢 `AI_BRIDGE_EXECUTE_TIMEOUT` 管控，慢宿主可放宽 |
+| `AI_BRIDGE_CAP_EXEC` | 否 | 严格 opt-in（`1/true/yes/on`）声明 exec 能力；不带 exec 的客户端可被派发但不能承接 workspace 任务 |
+| `AI_BRIDGE_DATA_DIR` | `ai-bridge/` 内默认位置 | store 层 JSON 数据目录。**跑任何探针/沙箱实例必须显式隔离它**，否则写穿生产台账 |
+| `AI_BRIDGE_DB` | `~/.ai-bridge/bridge.db` | 全局 SQLite 路径。沙箱实例须**同时**隔离它（只隔离 DATA_DIR 不够，流量/派发行会写穿生产库） |
 | `AI_BRIDGE_CACHE_TTL` | 600000 | 反代幂等缓存 TTL(ms) |
 | `AI_BRIDGE_CACHE_MAX` | 100 | 反代幂等缓存条目上限(LRU) |
 | `AI_BRIDGE_DAILY_TOKEN_BUDGET` | 无 | 每日 token 预算，超出时 /api/health 告警 |
@@ -117,10 +121,22 @@ API Key:  随便填（如 sk-1234）
 ## 测试
 
 ```bash
-node test-unit.mjs       # 纯单元测试
-node test-workspace.mjs  # 工作区管理单元测试（独立临时数据目录）
-node test-e2e.mjs        # 全链路 E2E（使用端口 9810，不影响生产）
+node test-unit.mjs          # 41 项  纯单元测试
+node test-workspace.mjs     # 36 项  工作区管理（独立临时数据目录）
+node test-store-corrupt.mjs # 23 项  坏 JSON 隔离/拒绝覆写（子进程 + 隔离 DATA_DIR）
+node test-audit-fixes.mjs   # 42 项  审计修复验收（含结构锁 E/F/G/H 段）
+node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
+node test-e2e.mjs           # 180 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827，均不影响生产）
+npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线）
 ```
+
+合计 **367 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"。
+
+### 派发长任务前必读（超时口径）
+
+- MCP 的 `dispatch` 工具是**同步** HTTP 往返：中枢窗口默认 15 分钟（`AI_BRIDGE_EXECUTE_TIMEOUT`），桥预算默认 16 分钟（`AI_BRIDGE_HTTP_TIMEOUT`）。**超过窗口的任务现在没有可用的规避路径**——中枢本身支持 `async: true` 异步队列（`/api/dispatch`），但 15 个 MCP 工具既没有 `async` 入参、也没有取回异步结果的工具（见「已知问题」#58）。
+- 中枢侧**不会**因为宿主放弃而停止执行：客户端断开/超时后，任务照常跑完并烧配额，只是结果回不到调用方。这也是台账里曾出现 `Command exited with code null` 的同一族问题。
+- 桥侧对超时已改为如实归因：`命令被信号 SIGTERM 终止(超时预算 Nms 用尽…): <输出尾部>`，不再输出 `code null` + 启动横幅。要看真因请查 `/api/traffic` 的 `error` 字段（持久化在 SQLite 流量表，含正文）。
 
 ## 工作区管理
 
@@ -260,7 +276,22 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
 
 - 桥层失败路径已根治：`httpGet`/`httpPost` 感知 HTTP 状态码，非 2xx 一律 reject 并在 Error 上附带 `status`/`body` 结构化上下文；`tools/call` 的任何异常统一降级为 MCP 规范的 `isError` 结果（文案前缀"桥调用失败: "），不再返回 jsonrpc -32603。两处"以非 2xx 承载业务语义"的端点按结构化字段显式处理：`/api/poll` 的 404 `未注册` 触发重新注册（中枢重启后桥可自愈）、`/api/client/register` 的 403 `denied` 走 30 秒慢重试。
 - 持久化文件损坏时的保护语义：任一 JSON（`memory.json`/`clients-acl.json`/`switches.json`/`token-stats.json`/`workspaces.json`）解析失败时，中枢把坏文件改名保全为 `<文件>.corrupt-<时间戳>`，并**在本进程内拒绝再写该文件**（防止空结构被当作"新真相"覆写，导致任务历史被洗成 1 条、或黑名单被清空/已关闭工具被静默回启）。期间不影响读取与可用性，只拒绝落盘；`logs.jsonl` 有 `error` 级留痕（含备份文件名）。恢复方式：从 `.corrupt-*` 取回原文件修复后放回，重启进程即恢复写入。
-- `TEST-LOCK.json`：仓库测试锁定机制，用于检测测试文件漂移，哈希由指挥官每次合并后重算。
+- `TEST-LOCK.json`：仓库测试锁定机制，用于检测测试文件漂移，哈希由指挥官每次合并后重算。现分三类语义：`locked_tests`（行为冻结面，编码手禁改，未申报而变=测试作弊）、`source_faces`（生产源码对照基线，每轮合并后重算，可否改动由当轮规格白名单决定）、`source_faces_owner`（每个面最近被哪一轮改动并验收，用于并发派工时不再靠哈希漂移反推）。
+- 2026-10-23 已根治（均有锁定测试与生产验真，细节见 `ARCHITECTURE.md` 的「超时与预算模型」「客户端注册·能力·状态契约」两节）：
+  - **注册顺序契约**：桥启动即发的 `sampling=false` 注册若迟到，不再能覆写宿主声明的能力（单调 `registerSeq`，seq 更大者仍允许真撤回）；宿主 `initialize` 早于首注册回执时，桥会补发一次能力刷新——此前接入的编程软件会**永久**失去执行资格且无自愈路径。
+  - **超时预算**：桥侧同步预算 600000→960000（≥ 中枢窗口 900000 + 余量）并可 `AI_BRIDGE_HTTP_TIMEOUT` 配置；`callTool` 有总超时，串行多跳不再无界；GET/轮询保持 30s 快速失败（自愈节奏，有意不抬高）。
+  - **超时归因**：适配器不再丢弃 `signal`，失败详情取输出**尾部**且有界，台账不再出现 `Command exited with code null: <启动横幅>` 这类误导行。
+  - **任务态写入**：在册客户端条目只允许就地 mutate（禁止 `set(key, {...快照})` 整体替换），避免"已清空的 `pendingTask`/已释放的 `_busy` 被复活"。
+  - **状态位归位**：超时清理补 `taskPending` 复位，"取走任务却没回结果"不再把客户端永久钉在 `online_busy`。
+  - **启动期健壮性**：坏形状（能解析但字段类型非法）的 `memory.json` 不再阻止进程起来；讨论孤儿会议启动清扫，避免并发闸门被崩溃残留堵成永久 429。
+- **未修（如实列示，按当前队列序）**：
+  - #36 点名派发时被禁用的目标**不进分母**：响应 `total = 实际被调度数`，桥侧汇总因此显示 `1/1 成功`，"点名 2 个只跑了 1 个"只能靠后一行小字 `⚠️ 跳过(关闭)` 察觉；且 `skipped` 只有名字、没有原因。另发现同一件事有**三种分母实现**（`bridge-stdio.js` 的 `:317` 用 `total`、`:382`/`:397` 用 `results.length`）。
+  - #42 鉴权只覆盖 `/api/*`（`server.js:1217`），`/v1/*` 与 Web UI 静态面不设防；且一旦设 token，Web UI 自身会被 401 锁死。
+  - #57 桥默认身份是常量 `unknown`：`connectedClients` 以名字为键，同一宿主的多个派生会话必然塌进**一个**在册条目，共享 `pendingTask` 槽与能力字段；后启动会话的 `registerSeq` 基数天然更大，于是"后来者覆写全体能力"成为合法行为。且注册复用分支**静默无日志**，中枢也无 `hostCount`/poll 计数面——该缺陷目前**无法从可观测面证明有几个会话在共享身份**。
+  - #58 MCP 面无异步派发：中枢支持 `body.async === true`，但 `dispatch` 工具没有 `async` 入参、也没有取回异步结果的工具，宿主只能吃同步窗口。
+  - #60 失败判定器仍会被**短文本里的数字子串**误伤：`looksLikeError` 只要正文 ≤400 字符即返回 true，而关键词表含裸 `'401'/'402'/'429'`，于是"耗时 4021ms""见 `:398-401`"这类成功产出可能被记成失败（#37 只修了长文那一半）。
+  - 其余：#44 合法但形状非法的 JSON 仍可能被静默覆写（#52 是点补而非根治）、#46 `tools.json` 损坏即崩（与 P0 双重标准；现已确认为"只发生在启动时"，运行期不重读）、#43 写被拒却报 200 / 删工作区先删文件后落盘、#31 死代码与双账本、#45 usage 三处形状各写一遍、#47 幂等缓存命中流式写出畸形 SSE、#40 恒假分支致 CLI 拿不到工作区简报、#51 工作区 path 无效时静默改建空目录、#26 吞异常门禁、#49 两个 HTTP 封装单点化（含负数 env 钳制：`parseInt(env) || 默认` 对负数不成立，而 Node 的 `setTimeout(<0)` 语义是"超时失效"）、#27/#28/#29 结构性重构、#55 北极星端到端验收。
+
 
 ## mitmproxy 流量监控（可选）
 
