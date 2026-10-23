@@ -337,6 +337,44 @@ section('J) Web UI 凭据自证(#42)');
     chatAt < 0 ? '未找到流式调用点' : '块内状态检查命中=' + /resp\.ok|resp\.status|\.ok\b/.test(chatBlock));
 }
 
+// ── K) 死码账本必须归零,活账本不得被顺手删(#31,指挥官亲笔,编码手禁改) ──
+// 背景:"流量"同时存在两套账 —— store.js 的 JSONL(traffic.jsonl)与 db.js 的 SQLite traffic 表。
+//   实测(JSONL 那套早已是死账):生产 traffic.jsonl 停在 07-26 19:14、1274 字节,此后再无写入;
+//   原因是 store.appendTraffic / readTraffic / clearTraffic **全仓零调用方**(grep 只命中定义与导出本身),
+//   而 /api/traffic 读的是 db.queryTraffic(...) 再并上 AgnesCode 外部日志。
+//   留着这套死码的真实代价不是"几行没人跑的代码":store 与 db **导出同名 clearTraffic**,
+//   而 server.js:1880 调的是 db.clearTraffic() —— 清库清的是活账本,死文件原样留在数据目录里;
+//   后来者按名字找会清错对象。同理 store 侧 `async save` 与 `loadList` 也零调用方,
+//   且 loadList 在 #44 之后已成"名叫 List 却拒绝顶层数组"的名实不符者(#44 规格明令本单才删)。
+// 本段是**双向锁**:既锁"死的必须真删干净",也锁"活的半条腿不许一起删"(K3/K4/K5)。
+section('K) 死码账本归零 + 活账本不被误删(#31)');
+{
+  const storeSrc = fs.readFileSync('./store.js', 'utf-8');
+  const dbSrc = fs.readFileSync('./db.js', 'utf-8');
+  const srvSrc = fs.readFileSync('./server.js', 'utf-8');
+  const expBlock = storeSrc.slice(storeSrc.indexOf('module.exports'));
+  const deadSyms = ['appendTraffic', 'readTraffic', 'rotateTrafficIfNeeded', 'flushTrafficQueue', '_trafficQueue', '_trafficWriting', 'TRAFFIC_MAX_FILE_SIZE'];
+  const hits = deadSyms.filter(t => storeSrc.includes(t));
+  check('K1 store.js 不得残留 JSONL 流量账本的写入/轮转/读取面(零调用方的死账本,留着只会与 SQLite 活账本同名混淆)',
+    hits.length === 0, '仍命中 ' + hits.length + ' 处: ' + hits.join(','));
+  check('K2 store.js 不得再有零调用方的异步 save 与名实不符的 loadList(含导出与注释里的自我声明)',
+    !/function loadList\s*\(/.test(storeSrc) && !/async function save\s*\(/.test(storeSrc) && !/\bloadList\b/.test(storeSrc),
+    'loadList 提及=' + (storeSrc.match(/\bloadList\b/g) || []).length + ' 异步 save=' + /async function save\s*\(/.test(storeSrc));
+  check('K2b 导出面必须同步收窄(删了实现却还导出 = 悬空符号,比死码更坏)',
+    !/\bsave\b/.test(expBlock) && !/\bloadList\b/.test(expBlock) && !/\bappendTraffic\b/.test(expBlock) && !/\breadTraffic\b/.test(expBlock) && !/\bclearTraffic\b/.test(expBlock),
+    '导出仍含死符号: ' + ['save', 'loadList', 'appendTraffic', 'readTraffic', 'clearTraffic'].filter(t => new RegExp('\\b' + t + '\\b').test(expBlock)).join(','));
+  check('K3 FILES 不得再声明 traffic 路径(声明着就会让读者以为还有第二本账),但日志账本 FILES.logs 必须原样在',
+    !/traffic:/.test(storeSrc) && /logs:\s*path\.join/.test(storeSrc),
+    'traffic 声明=' + /traffic:/.test(storeSrc) + ' logs 声明=' + /logs:\s*path\.join/.test(storeSrc));
+  // 反向锁(现状即绿,专防"清理死码时顺手把活的也删了"):活账本 SQLite traffic 必须一条腿不断
+  check('K3b 反向锁:db.js 的活账本三件套 recordTraffic/queryTraffic/clearTraffic 必须仍在导出里',
+    ['recordTraffic', 'queryTraffic', 'clearTraffic'].every(t => new RegExp('\\b' + t + '\\b').test(dbSrc)),
+    '缺失: ' + ['recordTraffic', 'queryTraffic', 'clearTraffic'].filter(t => !new RegExp('\\b' + t + '\\b').test(dbSrc)).join(','));
+  check('K4 反向锁:/api/traffic 仍必须走 db.queryTraffic,/api/traffic/clear 仍必须调 db.clearTraffic()(读路径与清库都不许断链)',
+    /db\.queryTraffic\(/.test(srvSrc) && /db\.clearTraffic\(\)/.test(srvSrc),
+    'queryTraffic=' + /db\.queryTraffic\(/.test(srvSrc) + ' clearTraffic=' + /db\.clearTraffic\(\)/.test(srvSrc));
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');
