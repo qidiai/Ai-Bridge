@@ -318,6 +318,23 @@ section('J) Web UI 凭据自证(#42)');
   const hasSource = /localStorage|sessionStorage|prompt\s*\(/.test(ui);
   check('J1 ui.html 必须能出示凭据(Authorization: Bearer …)', hasAuth, 'Authorization 命中=' + /Authorization/.test(ui) + ' Bearer 命中=' + /Bearer/.test(ui));
   check('J2 ui.html 必须有拿到凭据的来源(存储或用户输入),否则设 token 即自锁', hasSource, 'storage/prompt 命中=' + hasSource);
+  // J3:凭据注入必须覆盖**每一个**网络调用点。#42 R1 的真实教训:api() 被改造了,但 UI 的流式聊天
+  //   走的是另一条裸 fetch(ui.html:620 → /v1/chat/completions),门一扩就 401 打死,而锁看不见它。
+  //   合法实现有两种:每个调用点显式 withAuth(…),或全文件装一个对所有请求生效的注入点(window.fetch 包装)。
+  //   两者都算通过——本锁禁止的是"漏掉某个调用点",不指定写法。
+  const fetchSites = ui.split(/\r\n|\n/).map((l, i) => ({ n: i + 1, l })).filter(x => /\bfetch\s*\(/.test(x.l) && !/function\s+fetch/.test(x.l));
+  const unwrapped = fetchSites.filter(x => !/withAuth\s*\(/.test(x.l) && !/window\.fetch\s*=/.test(x.l));
+  const hasGlobalWrapper = /window\.fetch\s*=/.test(ui);
+  check('J3 每个 fetch 调用点都必须被凭据注入覆盖(不得有漏网调用点)',
+    fetchSites.length > 0 && (unwrapped.length === 0 || hasGlobalWrapper),
+    `调用点=${fetchSites.length} 未包裹=[${unwrapped.map(x => ':' + x.n).join(',')}] 全局包装=${hasGlobalWrapper}`);
+  // J4:流式对话分支必须检查响应状态,否则 401 的 JSON 会被当 SSE 解析,界面渲染成"(空响应)"——
+  //   静默空白正是 #42 要消灭的病,不能一边修好一边留着。
+  const chatAt = ui.indexOf('/v1/chat/completions');
+  const chatBlock = chatAt >= 0 ? ui.slice(chatAt, chatAt + 2200) : '';
+  check('J4 流式请求分支必须检查 resp.ok/resp.status(401 不得被当 SSE 静默吞掉)',
+    chatAt >= 0 && /resp\.ok|resp\.status|\.ok\b/.test(chatBlock),
+    chatAt < 0 ? '未找到流式调用点' : '块内状态检查命中=' + /resp\.ok|resp\.status|\.ok\b/.test(chatBlock));
 }
 
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
