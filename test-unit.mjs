@@ -174,8 +174,12 @@ async function main () {
       rawOut = String(replay.sseFromChatJson(OK_JSON, { model: 'glm-5.3' }));
       frames = rawOut.split('\n\n').filter(x => x.length > 0);
       const dataFrames = frames.filter(x => x.startsWith('data: '));
-      try { firstChunk = JSON.parse(dataFrames[0].slice(6)); } catch (_) { firstChunk = null; }
-      try { lastChunk = JSON.parse(dataFrames[dataFrames.length - 1].slice(6)); } catch (_) { lastChunk = null; }
+      // 我自己的 off-by-one(编码手申报 SPEC GAP、我复算成立):#47a1 要求末帧恰为 `data: [DONE]`,
+      // 而 #47a3 又要 JSON.parse 末帧取 finish_reason —— 二者互斥,任何正确实现都过不了 a3。
+      // 判"末帧必须是 [DONE]"看的是**全部帧**;取"最后一个数据帧"必须先排除 [DONE] 这个控制帧。
+      const payloadFrames = dataFrames.filter(f => f !== 'data: [DONE]');
+      try { firstChunk = JSON.parse(payloadFrames[0].slice(6)); } catch (_) { firstChunk = null; }
+      try { lastChunk = JSON.parse(payloadFrames[payloadFrames.length - 1].slice(6)); } catch (_) { lastChunk = null; }
     }
     check('#47a1 回放每一帧都必须以 `data: ` 开头、以空行分帧、最后一帧严格 `data: [DONE]`（无 data: 前缀的行会被 SSE 解析器丢弃 = 客户端看到空流）',
       Array.isArray(frames) && frames.length >= 2 && frames.every(f => f.startsWith('data: ')) && frames[frames.length - 1] === 'data: [DONE]',
@@ -186,7 +190,7 @@ async function main () {
       firstChunk && JSON.stringify(firstChunk).substring(0, 160));
     check('#47a3 usage 必须随回放透传，且末帧 finish_reason=stop（丢了 usage 就是"看着成功、账上没有"，与 #45 同族）',
       !!rawOut && /"total_tokens"\s*:\s*18/.test(rawOut) && !!lastChunk && lastChunk.choices?.[0]?.finish_reason === 'stop',
-      rawOut && rawOut.substring(rawOut.lastIndexOf('data: '), rawOut.lastIndexOf('data: ') + 200));
+      rawOut && ('末 240 字符=' + rawOut.slice(-240)));
 
     const BAD = [null, undefined, '', 'not json at all', '{"choices":[]}', '{"id":"x"}', '{"choices":[{"index":0}]}'];
     const misjudge = [];
