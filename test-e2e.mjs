@@ -1168,6 +1168,59 @@ async function main () {
     await sleep(400);
   }
 
+  // 9.11) 写被拒却报成功(#43 指定红集 · 第四实例)
+  //   store.saveSync 在 key 被隔离后返回 false,而写端点把这个布尔**整个丢弃**
+  //   (server.js:1319 saveJSONSync 不返回值;workspace-manager.js:99 saveState 亦然),
+  //   随后照样 sendJSON(200,{success:true})。
+  //   探针实测现状(端口 9841、独立 DATA_DIR):预置解析失败的 switches.json → GET /api/tools
+  //   触发隔离(switches.json 被改名 .corrupt-*)→ POST /api/toggle 返回 200
+  //   {"success":true,"tool":"openclaw","enabled":false},而磁盘上 switches.json 并不存在
+  //   ——调用方以为工具被关了,重启后全部回启(与 P0 同族:静默配置丢失 + 谎言式成功)。
+  section('写被拒不得报成功:#43a 红集(第四实例·switches 已隔离)');
+  {
+    const RW_PORT = 9841;
+    const rwDir = path.join(TEST_RUNTIME, 'refuse-write-probe');
+    fs.rmSync(rwDir, { recursive: true, force: true });
+    fs.mkdirSync(rwDir, { recursive: true });
+    fs.writeFileSync(path.join(rwDir, 'switches.json'), '{"openclaw":tru', 'utf-8'); // 截断=解析失败→隔离
+    const rwProc = spawn(process.execPath, ['server.js'], {
+      cwd: __dirname,
+      env: { ...process.env, AI_BRIDGE_PORT: String(RW_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_DATA_DIR: rwDir, AI_BRIDGE_DB: path.join(rwDir, 'rw.db'), AI_BRIDGE_OBSERVE_DIR: path.join(rwDir, 'observe'), AI_BRIDGE_WORKSPACE_ROOT: path.join(rwDir, 'ws'), AI_BRIDGE_TOKEN: '' },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    rwProc.stderr.on('data', () => {}); rwProc.stdout.on('data', () => {});
+    const rwReq = (method, urlPath, body) => new Promise((resolve, reject) => {
+      const data = body ? JSON.stringify(body) : null;
+      const headers = {};
+      if (data) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = Buffer.byteLength(data); }
+      const r = http.request({ hostname: HOST, port: RW_PORT, path: urlPath, method, timeout: 8000, headers }, res => {
+        let s = ''; res.on('data', c => s += c); res.on('end', () => resolve({ status: res.statusCode, text: s }));
+      });
+      r.on('timeout', () => { r.destroy(); reject(new Error('rw 请求超时')); });
+      r.on('error', reject); if (data) r.write(data); r.end();
+    });
+    let rwUp = false;
+    for (let i = 0; i < 30 && !rwUp; i++) { await sleep(400); try { const h = await rwReq('GET', '/api/health', null); rwUp = h.status === 200; } catch (_) {} }
+    check('#43a0 哨兵:坏 switches.json 不得阻止中枢起来(现状即绿,防把保守策略做成崩溃)', rwUp, 'rwUp=' + rwUp);
+    if (rwUp) {
+      await rwReq('GET', '/api/tools', null); // 首次读取即触发 quarantine
+      const tg = await rwReq('POST', '/api/toggle', { tool: 'openclaw', enabled: false });
+      let tgb = null; try { tgb = JSON.parse(tg.text); } catch (_) {}
+      check('#43a1 写被拒期间 /api/toggle 不得回 2xx,响应体也不得宣称 success:true(现状 200+success:true 而磁盘无 switches.json)',
+        tg.status >= 400 && !(tgb && tgb.success === true),
+        'status=' + tg.status + ' body=' + tg.text.substring(0, 110));
+      check('#43a2 哨兵:拒写期间不得凭空写出 switches.json(现状即绿;防"为让 a1 变绿而随便造文件")',
+        !fs.existsSync(path.join(rwDir, 'switches.json')), fs.readdirSync(rwDir).join(','));
+      const wsOk = await rwReq('POST', '/api/workspaces', { name: 'rw-healthy', description: '#43a3 未隔离 key 必须照写' });
+      const wsPersisted = (() => { try { const j = JSON.parse(fs.readFileSync(path.join(rwDir, 'workspaces.json'), 'utf-8')); return Array.isArray(j.workspaces) && j.workspaces.length > 0; } catch (_) { return false; } })();
+      check('#43a3 哨兵:同实例上未被隔离的写入必须照常 2xx 且真的落盘(防"一律拒写"这种偷懒实现)',
+        wsOk.status >= 200 && wsOk.status < 300 && wsPersisted,
+        'status=' + wsOk.status + ' 落盘=' + wsPersisted + ' body=' + wsOk.text.substring(0, 90));
+    }
+    try { rwProc.stdin.end(); rwProc.kill(); } catch { /* ignore */ }
+    await sleep(300);
+  }
+
   // 9.12) 点名派发中被跳过的目标必须诚实呈现(#36 指定红集)
   //   实况:targets 只收"可解析且已启用"的工具(server.js:765-770),而"可解析但被禁用"的落进
   //   skipped(:804-807)。响应的 total = targets.length(:973)→ 被跳过者**不进分母**。

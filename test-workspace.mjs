@@ -118,6 +118,30 @@ async function main () {
   check('受管目录可连同文件回收', removedManaged.filesDeleted === true && !fs.existsSync(managed.path));
   check('受管记录已移除', ws.get(managed.id) === null);
 
+  section('#43 写失败不得先删文件(删除路径的写序守卫)');
+  {
+    // 确定性写失败注入:store.saveSync 先写 <file>.tmp 再 rename —— 把 tmp 做成目录,
+    // writeFileSync 必抛 EISDIR。不碰生产、不需网络、不需要权限。
+    const inj = ws.create({ name: 'inj-order', description: '#43b 写失败注入' });
+    const tmpPath = path.join(DATA_DIR, 'workspaces.json.tmp');
+    fs.mkdirSync(tmpPath, { recursive: true });
+    let injCode = null, injMsg = '';
+    try { ws.remove(inj.id, { deleteFiles: true }); } catch (e) { injCode = (typeof e.statusCode === 'number' ? e.statusCode : (typeof e.status === 'number' ? e.status : null)); injMsg = e.message; }
+    check('#43b1 注册表落盘失败时不得删除受管目录(现状:rmSync 已先删掉目录,落盘随后才失败)',
+      fs.existsSync(inj.path), '目录仍在=' + fs.existsSync(inj.path) + ' err=' + injMsg.substring(0, 70));
+    check('#43b2 不得留下"注册表仍指向、目录已消失"的悬空记录(现状:记录在 + 目录没 = 后续 dispatch 必失败且难归因)',
+      !(ws.get(inj.id) !== null && !fs.existsSync(inj.path)),
+      '记录存在=' + (ws.get(inj.id) !== null) + ' 目录存在=' + fs.existsSync(inj.path));
+    check('#43b3 失败必须以带状态码的领域错误上报(现状:裸 EISDIR,statusCode 缺失)',
+      injCode === 500 || injCode === 503, 'statusCode=' + injCode + ' msg=' + injMsg.substring(0, 70));
+    fs.rmSync(tmpPath, { recursive: true, force: true });
+    let retry = null, retryErr = '';
+    try { retry = ws.remove(inj.id, { deleteFiles: true }); } catch (e) { retryErr = e.message; }
+    check('#43b4 哨兵:注入物移除后正常删除必须仍成功(目录与记录一并消失)——防"永不删文件"式假修复',
+      !!retry && retry.filesDeleted === true && !fs.existsSync(inj.path) && ws.get(inj.id) === null,
+      'filesDeleted=' + (retry && retry.filesDeleted) + ' 目录在=' + fs.existsSync(inj.path) + ' 记录在=' + (ws.get(inj.id) !== null) + ' err=' + retryErr.substring(0, 60));
+  }
+
   section('持久化');
   const state = JSON.parse(fs.readFileSync(store.FILES.workspaces, 'utf-8'));
   check('workspaces.json 已落盘且与内存视图一致', Array.isArray(state.workspaces) && state.workspaces.length === ws.list().length, String(state.workspaces?.length));
