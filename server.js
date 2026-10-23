@@ -1179,14 +1179,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 健康检查(免鉴权/免工具检测,供守护进程/服务管理器探活)
+    // 健康检查:免鉴权面只给"存活 + 负载计数",详细面(codely 到期情报 / usage 用量)须凭据在先。
+    //   仍留在鉴权门(本文件下方 /api/ + /v1/ 那道门)之前 —— 外部监控要能不被 401 挡住才能判活(整体搬到门后会把
+    //   "需要凭据"误报成"宕机",风险大于收益)。但门前提前不等于无密可守:#68 按鉴权态给两种视图。
     if (p === '/api/health' && req.method === 'GET') {
+      // checkAuth 未设 AI_BRIDGE_TOKEN 时恒 true → 自用实例拿到的仍是完整视图(零负担)
+      const authorized = checkAuth(req);
       const tokenDays = codelyTokenExpiryDays();
       if (tokenDays !== null && tokenDays <= 7) {
         log('warn', `Codely access_token 将在 ${tokenDays} 天后过期,请尽快打开 Codely CLI 重新登录(微信登录无 refresh_token,无法自动刷新)`);
       }
-      const dailyBudget = parseInt(process.env.AI_BRIDGE_DAILY_TOKEN_BUDGET) || 0;
-      const today = db.todayTokens();
       const payload = {
         status: isShuttingDown ? 'shutting_down' : 'ok',
         uptime: Math.floor((Date.now() - START_TIME) / 1000),
@@ -1194,16 +1196,27 @@ const server = http.createServer(async (req, res) => {
         clients: onlineClientCount(),
         activeDispatches: activeDispatchCount,
         dispatchTotal: METRICS.dispatchTotal,
-        version: '1.1',
-        codely: {
+        version: '1.1'
+      };
+      if (authorized) {
+        const dailyBudget = parseInt(process.env.AI_BRIDGE_DAILY_TOKEN_BUDGET) || 0;
+        const today = db.todayTokens();
+        payload.codely = {
           cliVersion: codelyCliVersion(),
           tokenDaysLeft: tokenDays,
           tokenWarning: tokenDays !== null && tokenDays <= 7 ? `access_token 剩 ${tokenDays} 天,请打开 Codely CLI 重新登录` : null
-        },
-        usage: dailyBudget > 0 ? { todayTokens: today, dailyBudget, warning: today >= dailyBudget } : { todayTokens: today }
-      };
-      // ?probe=1:带签名探测 LiteLLM 上游真实连通性(只在本机回环监听,无密钥泄露面)
+        };
+        payload.usage = dailyBudget > 0 ? { todayTokens: today, dailyBudget, warning: today >= dailyBudget } : { todayTokens: today };
+      }
+      // ?probe=1:带签名探测 LiteLLM 上游真实连通性。
+      //   这一分支会 await getCodelyCliApiKey() 并 requestCodelyLiteLLM() —— 每一次调用都驱使
+      //   中枢带着**真实签名**去打上游,免鉴权时就是免费的探测/放大器(还有成本)。
+      //   故:先判权再探测,未鉴权一律 401 且**绝不发起任何上游请求**(顺序不可颠倒)。
       if (url.searchParams.get('probe') === '1') {
+        if (!authorized) {
+          sendJSON(res, 401, { error: '未授权' });
+          return;
+        }
         const t0 = Date.now();
         try {
           const cliKey = await getCodelyCliApiKey();

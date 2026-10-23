@@ -1104,16 +1104,17 @@ async function main () {
       const m4 = await reqAuth('GET', '/', null, false);
       check('#42a4 Web UI 首页本身不得被锁死(锁的是数据面,不是让页面消失)', m4.status === 200 && /<html|<!DOCTYPE/i.test(m4.text), 'status=' + m4.status + ' len=' + m4.text.length);
 
-      // #68:/api/health 在门之前处理(server.js:1183,比 :1235 的门早 52 行),原注释称"供守护进程探活"
-      //   却无人使用 —— watchdog.js 靠子进程 exit 事件判活,全仓仅 edge-agent.js:186 的 bridge:health
-      //   会回传它。实测无凭据可读 version/clients/activeDispatches/dispatchTotal + db 绝对路径 +
-      //   codely.tokenDaysLeft + usage 汇总。裁定:同一端点按鉴权态给两种视图 —— 无凭据只留
-      //   存活与负载计数(clients 保留,既有锁 test-e2e.mjs:901 断言它必须是 number,不得为收窄而改锁);
-      //   db/codely/usage 仅带凭据可见。**实测更正**:health 处理器(server.js:1183-1206)的 payload 键集为
-      //   status/uptime/port/clients/activeDispatches/dispatchTotal/version/codely/usage —— 从来没有 db 字段;
-      //   我首版把 db.stats()(db.js:320)与门后的 /api/db/stats(:1502)的形状当成 health 的,已纠正。
-      //   故本锁按真实键集写:无凭据禁止 codely/usage(db 一并列入属纵深防御,当前恒不存在);
-      //   带凭据必须仍能看到 codely/usage(UI 与 edge-agent.js:186 的 bridge:health 依赖完整视图)。
+      // #68:/api/health 在门之前处理(server.js:1185,比 :1248 的门早 63 行),原注释称"供守护进程探活"
+      //   却无人使用 —— watchdog.js 靠子进程 exit 事件判活(全仓对 /api/health 引用数 = 0),
+      //   唯一使用方是 edge-agent.js:186 的 bridge:health(它自带 AI_BRIDGE_TOKEN)。实测修复前无凭据可读
+      //   version/clients/activeDispatches/dispatchTotal + codely.tokenDaysLeft + usage 汇总。
+      //   裁定:同一端点按鉴权态给两种视图 —— 无凭据只留存活与负载计数(clients 保留,既有锁
+      //   test-e2e.mjs:901 断言它必须是 number,不得为收窄而改锁);codely/usage 仅带凭据可见。
+      //   **实测更正(我首版的两处口径错)**:① 我把 db.stats()(db.js:318 起,形状含 dbPath)与门后的
+      //   /api/db/stats 路由的形状当成 health 的,health 从来没有 db 字段,本锁把 db 列入禁止项属纵深防御、当前恒不存在;
+      //   (端点按路由名定位不写行号——本轮实现净增 13 行就让它从 :1502 下移到 :1515,写死行号必然漂)
+      //   ② 我原写成"UI 依赖完整视图",经核 ui.html 全文对 /api/health 引用数 = 0(:546/:598/:664 的
+      //   usage 是 dispatch 任务记录,不是 health),依赖方只有 edge-agent —— 断言名已照此改正。
       const hAnon = await reqAuth('GET', '/api/health', null, false);
       // 前置守卫:reqAuth 返回的是 text 而非 body,JSON 解析失败必须判红 —— 否则"没读到字段"
       //   会被当成"没外带字段"蒙成绿(我首版就犯了这个错,这里显式封死)。
@@ -1134,9 +1135,34 @@ async function main () {
       let fb = null, fbParsed = true;
       try { fb = JSON.parse(hFull.text); } catch (_) { fb = null; fbParsed = false; }
       fb = (fb && typeof fb === 'object') ? fb : {};
-      check('#68a3 带凭据必须仍能看到完整视图(codely 到期信息与 usage 一处不少:UI 与 edge-agent 的 bridge:health 依赖它)',
+      check('#68a3 带凭据必须仍能看到完整视图(codely 到期信息与 usage 一处不少:全仓唯一使用方 edge-agent.js:186 的 bridge:health 依赖它)',
         hFull.status === 200 && fbParsed && fb.codely !== undefined && fb.usage !== undefined,
         'status=' + hFull.status + ' parsed=' + fbParsed + ' keys=' + Object.keys(fb).join(','));
+
+      // #68b 锁定 ?probe=1 的鉴权前置。这条是我的红基线漏项(补锁):probe 分支会 await
+      //   getCodelyCliApiKey() + requestCodelyLiteLLM('/v1/models') —— 零凭据也能驱使中枢带着
+      //   **真实签名**去打签名上游,既是探测放大器也有成本,故"未鉴权不得触发上游"必须常驻可回归。
+      //   成本纪律:只断言未鉴权侧(401 + 无 upstream);带凭据侧会真打上游,不锁进套件。
+      const pAnon = await reqAuth('GET', '/api/health?probe=1', null, false);
+      check('#68b1 无凭据 ?probe=1 必须 401 且响应不得含 upstream(未鉴权绝不允许驱使中枢带真实签名打上游)',
+        pAnon.status === 401 && !/"upstream"\s*:/.test(pAnon.text),
+        'status=' + pAnon.status + ' body=' + pAnon.text.substring(0, 80));
+      // 结构守卫:光断言 401 挡不住"顺序被调换"的回归(先探测、后判权 → 401 仍会返回,但上游已被打过)。
+      //   故直接锁源码顺序:health 处理器段内,判权 401 必须先于 getCodelyCliApiKey / requestCodelyLiteLLM。
+      const hSrc = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+      const segStart = hSrc.indexOf("p === '/api/health'");
+      // 必须先剥掉注释再取索引:注释里会正儿八经写出 getCodelyCliApiKey() 的名字,不剥就会
+      //   在"注释排在判权之前"的正常代码上假红(我第一版就踩了这个坑)。
+      //   切行按 /\r?\n/、剥注释用 [^\r\n] 而非 .*$:CRLF 文件里 `.` 不匹配 \r,写 /\/\/.*$/
+      //   会整条失配(实测 replace 原样返回字符串),注释剥不净 → 守卫假红。此坑我踩过两次,记此防复发。
+      const segRaw = hSrc.substring(segStart, segStart + 4000);
+      const seg = segRaw.split(/\r?\n/).map(l => l.replace(/\/\/[^\r\n]*/, '')).join('\n');
+      const iAuth = seg.indexOf('if (!authorized)');
+      const iKey = seg.indexOf('getCodelyCliApiKey()');
+      const iReq = seg.indexOf('requestCodelyLiteLLM(');
+      check('#68b2 源码顺序守卫:health 段内判权 401 必须先于 getCodelyCliApiKey/requestCodelyLiteLLM(先探测后判权=放大器复活)',
+        segStart !== -1 && iAuth !== -1 && iKey !== -1 && iReq !== -1 && iAuth < iKey && iAuth < iReq,
+        'segStart=' + segStart + ' iAuth=' + iAuth + ' iKey=' + iKey + ' iReq=' + iReq);
     }
     try { authProc.stdin.end(); authProc.kill(); } catch { /* ignore */ }
     await sleep(400);
