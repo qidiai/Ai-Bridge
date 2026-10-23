@@ -148,6 +148,70 @@ async function main () {
   );
   check('失败后有更新成功则立即解除冷却', recovered.coolingDown === false && recovered.cooldownUntil === null);
 
+  section('#47 幂等缓存流式回放的帧合成（sse-replay 纯函数 + server.js 命中分支结构锁）');
+  {
+    // 背景（现状实测）：缓存**只由非流式 200 响应写入**（server.js:2139-2145 `if (!isStream) ... cacheSet`），
+    // 而 cacheKey(:227) 不含 stream → 流式请求命中同一 key 时，:2123-2127 把 **JSON 原文**直接
+    // `res.write(cached.value)` 写进 `Content-Type: text/event-stream` 响应，再补一行 `data: [DONE]`。
+    // 客户端拿到的是"没有 data: 前缀的一坨 JSON + 一个 DONE 帧"= 畸形 SSE（SSE 解析器会直接丢弃非 data: 行 → 空流）。
+    // 文档却写"合成单块 SSE"（ARCHITECTURE.md:49）、代码注释也写"流式命中缓存时直接合成单块 SSE 回放"——
+    // 这就是 #47 标题里的"文档与实现背离"。修法必须真的合成，且缓存体不可回放时**逐出并转发上游**：
+    // 绝不因缓存坏而向用户报错，也绝不静默吐畸形流。
+    // 可测性接缝：缓存只能用真签名上游预热（免费额度、网络），故合成逻辑必须是可独立 require 的纯函数模块。
+    let replay = null, reqErr = null;
+    try { replay = require('./sse-replay.js'); } catch (e) { reqErr = e.code === 'MODULE_NOT_FOUND' ? 'MODULE_NOT_FOUND' : e.message; }
+    check('#47a0 纯函数模块 sse-replay.js 必须存在并导出 isReplayableJson / sseFromChatJson',
+      !!replay && typeof replay.isReplayableJson === 'function' && typeof replay.sseFromChatJson === 'function',
+      reqErr || Object.keys(replay || {}).join(','));
+
+    const OK_JSON = JSON.stringify({
+      id: 'chatcmpl-47', object: 'chat.completion', created: 1700000000, model: 'glm-5.3',
+      choices: [{ index: 0, message: { role: 'assistant', content: '你好，世界' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 }
+    });
+    let frames = null, firstChunk = null, lastChunk = null, rawOut = null;
+    if (replay && typeof replay.sseFromChatJson === 'function') {
+      rawOut = String(replay.sseFromChatJson(OK_JSON, { model: 'glm-5.3' }));
+      frames = rawOut.split('\n\n').filter(x => x.length > 0);
+      const dataFrames = frames.filter(x => x.startsWith('data: '));
+      try { firstChunk = JSON.parse(dataFrames[0].slice(6)); } catch (_) { firstChunk = null; }
+      try { lastChunk = JSON.parse(dataFrames[dataFrames.length - 1].slice(6)); } catch (_) { lastChunk = null; }
+    }
+    check('#47a1 回放每一帧都必须以 `data: ` 开头、以空行分帧、最后一帧严格 `data: [DONE]`（无 data: 前缀的行会被 SSE 解析器丢弃 = 客户端看到空流）',
+      Array.isArray(frames) && frames.length >= 2 && frames.every(f => f.startsWith('data: ')) && frames[frames.length - 1] === 'data: [DONE]',
+      frames && JSON.stringify(frames.map(f => f.slice(0, 24))));
+    check('#47a2 内容不得丢失或改写:首帧 object=chat.completion.chunk、delta.content 与原 message.content 逐字相等、model 原样',
+      !!firstChunk && firstChunk.object === 'chat.completion.chunk' && firstChunk.model === 'glm-5.3'
+      && firstChunk.choices?.[0]?.delta?.content === '你好，世界',
+      firstChunk && JSON.stringify(firstChunk).substring(0, 160));
+    check('#47a3 usage 必须随回放透传，且末帧 finish_reason=stop（丢了 usage 就是"看着成功、账上没有"，与 #45 同族）',
+      !!rawOut && /"total_tokens"\s*:\s*18/.test(rawOut) && !!lastChunk && lastChunk.choices?.[0]?.finish_reason === 'stop',
+      rawOut && rawOut.substring(rawOut.lastIndexOf('data: '), rawOut.lastIndexOf('data: ') + 200));
+
+    const BAD = [null, undefined, '', 'not json at all', '{"choices":[]}', '{"id":"x"}', '{"choices":[{"index":0}]}'];
+    const misjudge = [];
+    if (replay && typeof replay.isReplayableJson === 'function') {
+      for (const b of BAD) { if (replay.isReplayableJson(b) !== false) misjudge.push(String(b).substring(0, 16)); }
+      if (replay.isReplayableJson(OK_JSON) !== true) misjudge.push('合法件被判不可回放');
+    } else { misjudge.push('无 isReplayableJson'); }
+    check('#47a4 不可回放判定必须准确:null/空串/非法 JSON/无 choices/choices 空/条目无 message → false;合法件 → true（判错=要么吐畸形流要么误逐出好缓存）',
+      misjudge.length === 0, misjudge.join(' | '));
+
+    const srvSrc = require('node:fs').readFileSync('./server.js', 'utf-8');
+    const hitAt = srvSrc.indexOf('if (cached) {');
+    const hitBlock = hitAt >= 0 ? srvSrc.slice(hitAt, hitAt + 1400) : '';
+    const streamBranch = hitBlock.split('} else {')[0] || '';
+    const streamsViaReplay = /sseFromChatJson/.test(streamBranch) && !/res\.write\(\s*cached\.value\s*\)/.test(streamBranch);
+    const evictsWhenUnplayable = /isReplayableJson/.test(hitBlock) && /_respCache\.delete\(/.test(hitBlock);
+    check('#47a5 命中分支必须真的走合成器（不得再直接 res.write(cached.value) 进 SSE），且不可回放时逐出缓存并继续转发上游（不得 502 糊弄、不得静默吐坏流）',
+      hitAt >= 0 && streamsViaReplay && evictsWhenUnplayable,
+      '找到命中块=' + (hitAt >= 0) + ' 走合成器=' + streamsViaReplay + ' 逐出并转发=' + evictsWhenUnplayable);
+    const nonStreamHit = /'application\/json; charset=utf-8',\s*'X-Cache':\s*'HIT'/.test(srvSrc)
+      && /res\.end\(\s*cached\.value\s*\)/.test(srvSrc);
+    check('#47a6 反向锁:非流式命中路径不得被牵连改动（仍原字节回放 + application/json + X-Cache: HIT）',
+      nonStreamHit, '非流式命中形状=' + nonStreamHit);
+  }
+
   // ── codely-client 签名(可选模块:开源版剔除 codely-client.js 时整段跳过) ──
   if (codelySigningKey && codelySignature && codelyCliVersion && codelyUserAgent) {
     section('codely-client(X-Codely-Signature 签名/UA 跟版)');
