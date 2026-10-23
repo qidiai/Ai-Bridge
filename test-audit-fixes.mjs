@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 const require = createRequire(import.meta.url);
 
 let passed = 0;
@@ -370,9 +371,9 @@ section('K) 死码账本归零 + 活账本不被误删(#31)');
   check('K3b 反向锁:db.js 的活账本三件套 recordTraffic/queryTraffic/clearTraffic 必须仍在导出里',
     ['recordTraffic', 'queryTraffic', 'clearTraffic'].every(t => new RegExp('\\b' + t + '\\b').test(dbSrc)),
     '缺失: ' + ['recordTraffic', 'queryTraffic', 'clearTraffic'].filter(t => !new RegExp('\\b' + t + '\\b').test(dbSrc)).join(','));
-  check('K4 反向锁:db.js 的活账本三件套 recordTraffic/queryTraffic/clearTraffic 必须仍在导出里',
-    ['recordTraffic', 'queryTraffic', 'clearTraffic'].every(t => new RegExp('\\b' + t + '\\b').test(dbSrc)),
-    '缺失: ' + ['recordTraffic', 'queryTraffic', 'clearTraffic'].filter(t => !new RegExp('\\b' + t + '\\b').test(dbSrc)).join(','));
+  check('K4 反向锁:/api/traffic 仍必须走 db.queryTraffic,/api/traffic/clear 仍必须调 db.clearTraffic()(读路径与清库都不许断链)',
+    /db\.queryTraffic\(/.test(srvSrc) && /db\.clearTraffic\(\)/.test(srvSrc),
+    'queryTraffic=' + /db\.queryTraffic\(/.test(srvSrc) + ' clearTraffic=' + /db\.clearTraffic\(\)/.test(srvSrc));
   // K5) 清理不得**新造**孤儿:`async save` 是 _locks 的唯一使用者,删了 save 却没删 _locks,
   //   等于在一张"死代码清理"单里留下一个新死符号(eslint 也报 no-unused-vars)。
   //   同时 assertShape 的注释示例仍写 `未知 key(logs/traffic 等)`,而 traffic 已不再是 FILES 键
@@ -382,6 +383,77 @@ section('K) 死码账本归零 + 活账本不被误删(#31)');
   check('K5 清理不得新造孤儿:_locks 不得作为零引用声明残留(它原本只被已删除的 async save 使用),且注释示例不得指向已删除的 traffic 键',
     !lockDecl && !/logs\/traffic/.test(storeSrc),
     '_locks 声明残留=' + lockDecl + ' 全文提及=' + lockUses + ' 注释仍举例 logs/traffic=' + /logs\/traffic/.test(storeSrc));
+}
+
+// ── L) 用量报表恒 0:#45 红集(指挥官亲笔,编码手禁改) ──
+// 背景:traffic.usage 至少有四种形状各写一遍,而聚合只认其中一种键名:
+//   ① 反代入站 server.js:296 存**上游原样** {prompt_tokens, completion_tokens}
+//   ② 派发回写 server.js:630 存**归一化后** {input, output, total, reported|estimated}
+//   ③ events 表用**列** input_tokens/output_tokens(db.js:1132 一带)
+//   ④ token-stats.json 又是第五种(按工具累计 + estimate 路径)
+//   而 db.js 的 usageReport()(byDay/byTool)与 todayTokens() 只 SUM
+//   `json_extract(usage,'$.prompt_tokens') + json_extract(usage,'$.completion_tokens')`。
+// 生产实测(2026-10-23,只读 API):最近 500 条 traffic 里 usage 非空 52 条,**52 条全是形状②**,
+//   `/api/usage/report?days=30` 每一行 tokens=0;带凭据 `/api/health` 的 usage={todayTokens:0}
+//   → `AI_BRIDGE_DAILY_TOKEN_BUDGET` 告警永不触发(输入恒 0)。同库 `/api/db/stats` 的 dispatches.tokens=638931。
+// 载体用**子进程 + 独立 AI_BRIDGE_DB**(与 test-store-corrupt 同法):
+//   绝不在本进程 require db.js——模块顶层会按 env 解析库路径,env 设晚了就会连到生产 ~/.ai-bridge/bridge.db。
+//   L0 就是这把枪的保险栓:runner 必须回显它实际打开的库路径,且必须落在本套件的临时根里。
+section('L) 用量报表恒 0(#45 · 三形状一聚合)');
+{
+  const usageRunner = path.join(tmpRoot, 'usage45-runner.cjs');
+  const SUITE_DIR = import.meta.dirname;
+  fs.writeFileSync(usageRunner, `'use strict';
+const db = require(${JSON.stringify(path.join(SUITE_DIR, 'db.js'))});
+const TOOL = 'usage45-shape-tool';
+const now = new Date().toISOString();
+const rows = [
+  { tool: TOOL, direction: 'in', ts: now, success: true, type: 'openai-proxy', usage: { prompt_tokens: 100, completion_tokens: 50 } },
+  { tool: TOOL, direction: 'in', ts: now, success: true, type: 'dispatch', usage: { input: 200, output: 60, total: 260, reported: true } },
+  { tool: TOOL, direction: 'in', ts: now, success: true, type: 'client-report', usage: { input_tokens: 30, output_tokens: 20 } },
+  { tool: TOOL, direction: 'in', ts: now, success: true, type: 'no-usage', usage: null },
+];
+for (const r of rows) db.recordTraffic(r);
+db.recordEvent({ ts: now, source: 'openai-proxy', channel: TOOL, model: 'm', inputTokens: 111, outputTokens: 22 });
+const rep = db.usageReport(7);
+const one = (rep.byTool || []).find(x => x.tool === TOOL) || null;
+const day = (rep.byDay || []).find(x => x.tool === TOOL) || null;
+process.stdout.write(JSON.stringify({
+  dbPath: (db.stats && db.stats().dbPath) || null,
+  byTool: one, byDay: day,
+  todayTokens: db.todayTokens(),
+  events: db.stats().events
+}) + '\\n');
+`, 'utf-8');
+  const usageDb = path.join(tmpRoot, 'usage45.db');
+  const ur = spawnSync(process.execPath, [usageRunner], {
+    cwd: SUITE_DIR,
+    env: { ...process.env, AI_BRIDGE_DB: usageDb, AI_BRIDGE_DATA_DIR: tmpRoot },
+    encoding: 'utf-8', timeout: 20000
+  });
+  let uo = null;
+  try { uo = JSON.parse((ur.stdout || '').trim().split('\n').pop()); } catch (_) { /* 交给断言判失败 */ }
+  const inTmp = !!(uo && uo.dbPath) && path.resolve(uo.dbPath).toLowerCase() === path.resolve(usageDb).toLowerCase();
+  check('L0 保险栓:runner 实际打开的必须是本套件的隔离库(设错 env 就会写生产 ~/.ai-bridge/bridge.db)',
+    inTmp, uo && uo.dbPath);
+  check('L1 报表必须把三种 usage 形状都算进 tokens(现状只认 prompt/completion:期望 460,实测会=150)',
+    !!uo && !!uo.byTool && uo.byTool.tokens === 460,
+    uo && uo.byTool ? 'byTool=' + JSON.stringify(uo.byTool) : 'runner 无输出: ' + (ur.stderr || '').substring(0, 120));
+  check('L2 byDay 同口径(#45 的报表页就是靠它;形状②/③ 不得被静默丢弃)',
+    !!uo && !!uo.byDay && uo.byDay.tokens === 460, uo && uo.byDay ? JSON.stringify(uo.byDay) : 'n/a');
+  check('L3 todayTokens 同口径(它是 AI_BRIDGE_DAILY_TOKEN_BUDGET 告警的唯一输入,恒 0 = 预算闸门形同虚设)',
+    !!uo && uo.todayTokens === 460, 'todayTokens=' + (uo && uo.todayTokens));
+  check('L3b 无 usage 的行必须仍计入 calls 而不得被猜出 tokens(null 不是 0 的替身)',
+    !!uo && !!uo.byTool && uo.byTool.calls === 4, 'byTool=' + JSON.stringify(uo && uo.byTool));
+  // 反向锁(现状即绿):events 走列名聚合,不得被本次改动牵连
+  check('L4 反向锁:events 表按列(input_tokens+output_tokens)聚合的 133 必须不受影响',
+    !!uo && !!uo.events && uo.events.n >= 1 && uo.events.tokens === 133,
+    'events=' + JSON.stringify(uo && uo.events));
+  // 写侧形状统一:入站反代记录不得再直接存上游原样(否则新数据继续生产形状①,读侧兼容只是止血)
+  const srv = fs.readFileSync('./server.js', 'utf-8');
+  const rawWrite = /usage:\s*parsed\.usage\s*\|\|/.test(srv);
+  check('L5 写侧必须收敛成单一形状:入站反代不得再把上游原样 usage 直接写进 traffic(形状①是病源)',
+    !rawWrite, '仍在写上游原样的处数=' + (srv.match(/usage:\s*parsed\.usage\s*\|\|/g) || []).length);
 }
 
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
