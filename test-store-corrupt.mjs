@@ -17,6 +17,9 @@
  *   C4 可用性不塌：load 仍返回空结构(调用方不得因此抛错/500)；
  *   C5 不得永久瘫：坏文件已被移走后，新进程(脏标志随之消失)必须能正常写新文件；
  *   C6 正常路径(文件不存在)绝不产生 .corrupt- 产物，且写入照常成功。
+ *   C7 (#44) 「能解析但形状非法」与「解析失败」同口径:容器/字段/顶层三种类型错都算损坏
+ *      —— 不得"补成合法空结构"后覆写原文件,必须保全 + 置脏 + 拒写 + 不抛错。
+ *      (#52 只给了 meetings 一个点的守卫,本契约要的是同一把尺子量所有形状非法。)
  *
  * 运行:node test-store-corrupt.mjs   退出码:0 全通过 / 1 有失败
  */
@@ -78,6 +81,36 @@ if (scenario === 'normal') {
   const sw = store.load('switches');
   const wrote = store.saveSync('switches', {});
   out({ swEmpty: Object.keys(sw).length === 0, wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
+} else if (scenario === 'shape44aclfield') {
+  // #44:合法 JSON 但字段形状非法(acl.blocklist 是对象)——今天会被"补成合法空结构"后覆写
+  let threw = null, aclShape = null;
+  try { const a = store.loadACL(); aclShape = { blocklistIsArray: Array.isArray(a.blocklist), allowlistNow: a.allowlist }; } catch (e) { threw = e.message; }
+  const wrote = store.saveACL({ allowlist: ['x'], blocklist: [], pending: [] });
+  out({ threw, aclShape, wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
+} else if (scenario === 'shape44tasks') {
+  // #44:memory.tasks 是对象而非数组——recordTask 里 mem.tasks.unshift 是方法调用
+  let threw = null;
+  try { store.loadMemory(); } catch (e) { threw = 'load:' + e.message; }
+  let wrote = null;
+  try { wrote = store.recordTask({ id: 't', task: 'x', tools: ['a'], results: [], successCount: 0, totalTokens: 0 }); } catch (e) { threw = (threw || '') + ' recordTask:' + e.message; }
+  out({ threw, wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
+} else if (scenario === 'shape44acltop') {
+  // #44:acl 顶层是 null(能解析)——loadACL 直接读 acl.allowlist
+  let threw = null;
+  try { store.loadACL(); } catch (e) { threw = e.message; }
+  let wrote = null;
+  try { wrote = store.saveACL({ allowlist: [], blocklist: [], pending: [] }); } catch (e) { threw = (threw || '') + ' save:' + e.message; }
+  out({ threw, wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
+} else if (scenario === 'shape44memstr') {
+  // #44:memory 顶层是字符串(能解析)——补字段是往 primitive 上赋值(sloppy 模式静默丢弃)
+  let mem = null;
+  try { mem = store.loadMemory(); } catch (e) { return out({ threw: e.message, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) }); }
+  const wrote = store.saveSync('memory', mem);
+  out({ threw: null, memType: typeof mem, wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
+} else if (scenario === 'shape44legal') {
+  // 哨兵:形状完全合法的文件必须照旧可写(守卫不得把正常路径一起拒掉)
+  const wrote = store.saveACL({ allowlist: ['a'], blocklist: ['b'], pending: [] });
+  out({ wrote, dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR) });
 } else {
   process.exitCode = 3;
   out({ error: 'unknown scenario ' + scenario });
@@ -143,6 +176,60 @@ check('#52a2 返回空清扫列表(跳过而非崩溃)', shape.parsed && shape.p
 check('#52a3 形状异常同样按损坏保全(生成 .corrupt- 且拒绝覆写)',
   shape.parsed && shape.parsed.wrote === false && corrupt(shape.parsed.dir).some(f => f.startsWith('memory.json.corrupt-')),
   shape.parsed && shape.parsed.dir);
+
+section('#44 合法 JSON 但形状非法:必须与"解析失败"同口径(C7),不得补成空结构后覆写');
+// 三种真实形态(每种都先用探针取过现状,红集按实测写):
+//   ① 字段类型错(acl.blocklist 是对象)——现状:补成 [] 后 saveACL **成功覆写**,原 blocklist 蒸发
+//   ② 容器类型错(memory.tasks 是对象)——现状:recordTask 内 mem.tasks.unshift **抛 TypeError**
+//   ③ 顶层类型错(acl 是 null / 数组;memory 是字符串)——现状:null 抛 TypeError,其余静默放行
+const SHAPE_ACL_FIELD = JSON.stringify({ allowlist: ['real-client'], blocklist: { evil: 1 }, pending: [] });
+const SHAPE_MEM_TASKS = JSON.stringify({ tasks: { '0': { id: 'hist-1' } }, experiences: [], preferences: {}, meetings: [] });
+const SHAPE_ACL_NULL = 'null';
+const SHAPE_ACL_ARRAY = JSON.stringify(['good-client', 'another']);
+const SHAPE_MEM_STRING = JSON.stringify('just a string');
+
+const s44acl = runScenario('s44aclfield', 'shape44aclfield', { 'clients-acl.json': SHAPE_ACL_FIELD });
+check('#44a1 loadACL 遇 blocklist 非数组不得抛错(可用性必须保住)',
+  s44acl.parsed && s44acl.parsed.threw === null, s44acl.parsed && s44acl.parsed.threw);
+check('#44a2 saveACL 必须被拒绝(现状 wrote=true:把坏形状"修好"就顺手覆写了真数据)',
+  s44acl.parsed && s44acl.parsed.wrote === false, s44acl.parsed && { wrote: s44acl.parsed.wrote });
+check('#44a3 必须保全 clients-acl.json.corrupt-*(现状 0 个保全产物,坏文件被就地洗白)',
+  s44acl.parsed && corrupt(s44acl.parsed.dir).some(f => f.startsWith('clients-acl.json.corrupt-')), s44acl.parsed && s44acl.parsed.dir);
+check('#44a4 原 allowlist 必须还能从保全件里取回(real-client 不得蒸发)',
+  (readBackup(s44acl, 'clients-acl.json.corrupt-') || '').includes('real-client'), readBackup(s44acl, 'clients-acl.json.corrupt-'));
+
+const s44tasks = runScenario('s44tasks', 'shape44tasks', { 'memory.json': SHAPE_MEM_TASKS });
+check('#44b1 recordTask 遇 tasks 非数组不得抛 TypeError(现状直接炸调用方)',
+  s44tasks.parsed && s44tasks.parsed.threw === null, s44tasks.parsed && s44tasks.parsed.threw);
+check('#44b2 recordTask 必须返回 false 而非落盘',
+  s44tasks.parsed && s44tasks.parsed.wrote === false, s44tasks.parsed && { wrote: s44tasks.parsed.wrote });
+check('#44b3 必须保全 memory.json.corrupt-*',
+  s44tasks.parsed && corrupt(s44tasks.parsed.dir).some(f => f.startsWith('memory.json.corrupt-')), s44tasks.parsed && s44tasks.parsed.dir);
+
+const s44null = runScenario('s44aclnull', 'shape44acltop', { 'clients-acl.json': SHAPE_ACL_NULL });
+check('#44c1 acl 顶层为 null 时 loadACL 不得抛(现状 "Cannot read properties of null")',
+  s44null.parsed && s44null.parsed.threw === null, s44null.parsed && s44null.parsed.threw);
+check('#44c2 顶层 null 同样须拒绝覆写并保全',
+  s44null.parsed && s44null.parsed.wrote === false && corrupt(s44null.parsed.dir).some(f => f.startsWith('clients-acl.json.corrupt-')),
+  s44null.parsed && { wrote: s44null.parsed.wrote, dir: s44null.parsed.dir });
+
+const s44arr = runScenario('s44aclarray', 'shape44acltop', { 'clients-acl.json': SHAPE_ACL_ARRAY });
+check('#44d1 acl 顶层为数组(形状非法但可解析)须被拒写并保全,不得静默改写为对象',
+  s44arr.parsed && s44arr.parsed.wrote === false && corrupt(s44arr.parsed.dir).some(f => f.startsWith('clients-acl.json.corrupt-')),
+  s44arr.parsed && { wrote: s44arr.parsed.wrote, dir: s44arr.parsed.dir });
+
+const s44mem = runScenario('s44memstr', 'shape44memstr', { 'memory.json': SHAPE_MEM_STRING });
+check('#44e1 memory 顶层为字符串时 loadMemory 不得抛错',
+  s44mem.parsed && (s44mem.parsed.threw === null || s44mem.parsed.threw === undefined), s44mem.parsed && s44mem.parsed.threw);
+check('#44e2 顶层字符串同样须拒写 + 保全(现状:往 primitive 补字段被静默丢弃,守卫完全没生效)',
+  s44mem.parsed && s44mem.parsed.wrote === false && corrupt(s44mem.parsed.dir).some(f => f.startsWith('memory.json.corrupt-')),
+  s44mem.parsed && { wrote: s44mem.parsed.wrote, dir: s44mem.parsed.dir });
+
+// 哨兵(现状即绿,不是红集):守卫不得把合法路径一起拒掉,也不得凭空产生保全产物
+const s44ok = runScenario('s44legal', 'shape44legal', { 'clients-acl.json': JSON.stringify({ allowlist: ['a'], blocklist: ['b'], pending: [] }) });
+check('#44s1 形状合法的 acl 必须照旧可写(不为过锁而放宽守卫/不为守卫而误拒)',
+  s44ok.parsed && s44ok.parsed.wrote !== false, s44ok.parsed && { wrote: s44ok.parsed.wrote });
+check('#44s2 合法路径不得出现 .corrupt- 产物', s44ok.parsed && corrupt(s44ok.parsed.dir).length === 0, s44ok.parsed && s44ok.parsed.dir);
 
 section('C1/C2/C4 损坏 switches.json:开关状态不得被空对象持久化');
 const sw = runScenario('switches', 'switches', { 'switches.json': TRUNC_SWITCHES });
