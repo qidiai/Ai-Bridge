@@ -1,0 +1,18 @@
+{
+  "selector": "CatchClause:not(:has(CallExpression)):not(:has(ThrowStatement)):not(:has(ReturnStatement))",
+  "total": 45,
+  "files": {
+    "server.js": 19,
+    "bridge-stdio.js": 5,
+    "adapters/cli-adapter.js": 4,
+    "store.js": 4,
+    "codely-client.js": 3,
+    "qidi-sync.js": 3,
+    "output-cleaner.js": 2,
+    "watchdog.js": 2,
+    "edge-agent.js": 1,
+    "test-http.js": 1,
+    "workspace-manager.js": 1
+  },
+  "note": "口径(逐字锁死,勿改): CatchClause:not(:has(CallExpression)):not(:has(ThrowStatement)):not(:has(ReturnStatement)) —— catch 块里既无任何函数调用(不记录)、也无 return/throw(不做决定) = 纯吞异常;注释不是 AST 节点,写注释绕不过。计数内核: ESLint 8.57.1 显式规则 no-restricted-syntax + esquery 1.7.0 的 :has(),内联配置不级联 ai-bridge/.eslintrc.json(等价 --no-eslintrc)。范围: 根目录 **/*.js,排除 node_modules/、点目录/点文件、*.bak* 与全部 *.mjs(测试套 56 处不入门禁)。路径一律正斜杠相对根目录。交叉核对命令(在 ai-bridge 目录): npx eslint . --ext .js --rule '{\"no-restricted-syntax\":[\"error\",\"CatchClause:not(:has(CallExpression)):not(:has(ThrowStatement)):not(:has(ReturnStatement))\"]}' -f json"
+}
