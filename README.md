@@ -46,7 +46,7 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 |------|--------|------|
 | `AI_BRIDGE_PORT` | 9800 | 服务端口 |
 | `AI_BRIDGE_HOST` | 127.0.0.1 | 监听地址（**仅本机**；改 0.0.0.0 前务必设 TOKEN） |
-| `AI_BRIDGE_TOKEN` | 无 | 鉴权 token（不设则无鉴权）。**自 #42 起门覆盖 `/api/*` 与 `/v1/*`**（`server.js:1235`）：设了 token 后，用 OpenAI 兼容层的任何客户端都必须把 API key 配成同一个值（`Authorization: Bearer <AI_BRIDGE_TOKEN>`），否则一律 401；Web UI 会在首次 401 时提示输入一次并存入 localStorage（不设 token 时不会弹框）。**两处已知仍免凭据**：`GET /`（UI 首页本身，无数据）与 `GET /api/health`——后者在门之前处理（`server.js:1183`，注释"供守护进程探活"），会带出 version/clients/activeDispatches/db 路径/token 剩余天数等，收紧方案见「已知问题」#68；另有 `/proxy/*` 免凭据透传（#64） |
+| `AI_BRIDGE_TOKEN` | 无 | 鉴权 token（不设则无鉴权）。**自 #42 起门覆盖 `/api/*` 与 `/v1/*`**（`server.js:1248`）：设了 token 后，用 OpenAI 兼容层的任何客户端都必须把 API key 配成同一个值（`Authorization: Bearer <AI_BRIDGE_TOKEN>`），否则一律 401；Web UI 会在首次 401 时提示输入一次并存入 localStorage（不设 token 时不会弹框）。**`GET /api/health` 自 #68 起按鉴权态给两种视图**：它在门之前处理（`server.js:1185`），无凭据只返回 `status/uptime/port/clients/activeDispatches/dispatchTotal/version` 七个存活与负载计数；`codely`（CLI 版本 / access_token 剩余天数）与 `usage`（今日 token / 预算）仅在带凭据时出现；`?probe=1` 无凭据一律 401 **且绝不发起任何上游请求**（`#68b2` 源码顺序锁死"判权必须先于探测"，防止"先探测后判权"这种照样返回 401 但上游已被打过的回潮）。不设 token 时 `checkAuth` 恒真 → 自用实例仍拿完整视图（零负担）。仍免凭据的只剩 `GET /`（UI 首页本身，无数据）与 health 的上述存活视图；另有 `/proxy/*` 免凭据透传（#64） |
 | `AI_BRIDGE_CLIENT` | unknown | 作为 MCP 客户端时的身份名（**注意**：默认值是常量 `unknown`，同一宿主开多个会话会全部塌进同一个在册条目且复用是静默无日志的，见「已知问题」） |
 | `AI_BRIDGE_EXECUTE_TIMEOUT` | 900000 | 中枢单次执行窗口(ms)：CLI 执行链与客户端反向执行都吃它。**桥侧 `AI_BRIDGE_HTTP_TIMEOUT` 必须 ≥ 本值 + 30000**，否则长任务会被桥早判死而中枢仍在执行（`test-audit-fixes` 段 F 锁死该数值关系） |
 | `AI_BRIDGE_HTTP_TIMEOUT` | 960000 | 桥侧同步工具调用总预算(毫秒)，同时驱动 `httpPost` 默认值与 `callTool` 总超时；**未设时 GET/轮询仍为 30000ms 快速失败**（自愈节奏，有意不与 POST 同源抬高） |
@@ -86,7 +86,7 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 
 - **模型清单自动同步**：`POST /api/models/sync` 带签名拉上游 /v1/models，新模型自动注册进 models.json
 - **幂等缓存**：非流式 200 响应按 sha256(model+messages+参数) 缓存，命中直接回放（`X-Cache: HIT`）
-- **上游健康探测**：`GET /api/health?probe=1` 带签名实测 LiteLLM 连通性
+- **上游健康探测**：`GET /api/health?probe=1` 带签名实测 LiteLLM 连通性（**自 #68 起须带凭据**：无凭据一律 401，且未鉴权时绝不发起上游请求——该分支每次调用都会驱使中枢带真实签名打上游，属"能花钱"面）
 - **用量报表**：`GET /api/usage/report?days=7` 按天/按模型聚合，Web UI「用量」Tab 可视化
 
 ### Claude Code / Anthropic 兼容客户端接入
@@ -124,13 +124,13 @@ API Key:  随便填（如 sk-1234）
 node test-unit.mjs          # 41 项  纯单元测试
 node test-workspace.mjs     # 36 项  工作区管理（独立临时数据目录）
 node test-store-corrupt.mjs # 23 项  坏 JSON 隔离/拒绝覆写（子进程 + 隔离 DATA_DIR）
-node test-audit-fixes.mjs   # 45 项  审计修复验收（含结构锁 E/F/G/H/I 段）
+node test-audit-fixes.mjs   # 49 项  审计修复验收（含结构锁 E/F/G/H/I/J 段）
 node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
-node test-e2e.mjs           # 184 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827，均不影响生产）
+node test-e2e.mjs           # 195 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827/9830，均不影响生产）
 npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
 ```
 
-合计 **374 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+合计 **389 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
 
 
 ### 派发长任务前必读（超时口径）
@@ -285,13 +285,17 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
   - **任务态写入**：在册客户端条目只允许就地 mutate（禁止 `set(key, {...快照})` 整体替换），避免"已清空的 `pendingTask`/已释放的 `_busy` 被复活"。
   - **状态位归位**：超时清理补 `taskPending` 复位，"取走任务却没回结果"不再把客户端永久钉在 `online_busy`。
   - **启动期健壮性**：坏形状（能解析但字段类型非法）的 `memory.json` 不再阻止进程起来；讨论孤儿会议启动清扫，避免并发闸门被崩溃残留堵成永久 429。
+  - **点名跳过的诚实呈现**：被禁用而没跑的点名目标现在进分母（响应新增 `requested`，`total` 语义不变），`skipped` 升级为 `{ref, reason}`（"被开关禁用"与"没资格"可区分），桥侧汇总行随之显示 `1/1 成功(点名 2)`；同一件事曾有的三种分母实现收敛为 `total` 优先。
+  - **鉴权覆盖面**：门同时覆盖 `/api/*` 与 `/v1/*`（`server.js:1248`），零凭据不再能枚举 `/v1/models`、也不再能走进 `model=<工具名>` 的真实执行支；Web UI 有自己的凭据注入点（`ui.html` 的 `withAuth()`，401 提示一次并至多重试一次），**设了 token 不再把自己的管理界面锁死**。
+  - **免鉴权 health 视图（#68）**：`/api/health` 按鉴权态分视图——无凭据只剩存活与负载计数 7 个字段，`codely` token 期限与 `usage` 汇总须带凭据；`?probe=1` 无凭据一律 401 且绝不发起上游（此前零凭据即可驱使中枢带真实签名打 LiteLLM）。
 - **未修（如实列示，按当前队列序）**：
-  - #36 点名派发时被禁用的目标**不进分母**：响应 `total = 实际被调度数`，桥侧汇总因此显示 `1/1 成功`，"点名 2 个只跑了 1 个"只能靠后一行小字 `⚠️ 跳过(关闭)` 察觉；且 `skipped` 只有名字、没有原因。另发现同一件事有**三种分母实现**（`bridge-stdio.js` 的 `:317` 用 `total`、`:382`/`:397` 用 `results.length`）。
-  - #42 鉴权只覆盖 `/api/*`（`server.js:1217`），`/v1/*` 与 Web UI 静态面不设防；且一旦设 token，Web UI 自身会被 401 锁死。
   - #57 桥默认身份是常量 `unknown`：`connectedClients` 以名字为键，同一宿主的多个派生会话必然塌进**一个**在册条目，共享 `pendingTask` 槽与能力字段；后启动会话的 `registerSeq` 基数天然更大，于是"后来者覆写全体能力"成为合法行为。且注册复用分支**静默无日志**，中枢也无 `hostCount`/poll 计数面——该缺陷目前**无法从可观测面证明有几个会话在共享身份**。
   - #58 MCP 面无异步派发：中枢支持 `body.async === true`，但 `dispatch` 工具没有 `async` 入参、也没有取回异步结果的工具，宿主只能吃同步窗口。
   - #60 失败判定器仍会被**短文本里的数字子串**误伤：`looksLikeError` 只要正文 ≤400 字符即返回 true，而关键词表含裸 `'401'/'402'/'429'`，于是"耗时 4021ms""见 `:398-401`"这类成功产出可能被记成失败（#37 只修了长文那一半）。
   - 其余：#44 合法但形状非法的 JSON 仍可能被静默覆写（#52 是点补而非根治）、#46 `tools.json` 损坏即崩（与 P0 双重标准；现已确认为"只发生在启动时"，运行期不重读）、#43 写被拒却报 200 / 删工作区先删文件后落盘、#31 死代码与双账本、#45 usage 三处形状各写一遍、#47 幂等缓存命中流式写出畸形 SSE、#40 恒假分支致 CLI 拿不到工作区简报、#51 工作区 path 无效时静默改建空目录、#26 吞异常门禁、#49 两个 HTTP 封装单点化（含负数 env 钳制：`parseInt(env) || 默认` 对负数不成立，而 Node 的 `setTimeout(<0)` 语义是"超时失效"）、#27/#28/#29 结构性重构、#55 北极星端到端验收。
+  - 鉴权面残项（#42/#68 之后仍然成立的口子）：**#64** `/proxy/*` 在鉴权门**之前**免凭据透传（与 `/v1` 同属"能执行能花钱"面，另含 `checkAuth` 非恒定时间比较）、**#65** `check-active.js`/`cleanup-stuck.js` 硬连生产 9800 却不带凭据（设 token 后必然 401，运维脚本自己失效）、**#66** 把 #42/#68 的一次性凭据取证 harness 固化成第 7 套常驻套件（防"第二个调用点漏网"复发；禁止"复制一份 JS 进测试"那种永远绿假锁）、**#67** UI 流式解析三缺陷（无跨块缓冲、`TextDecoder` 未开 `stream` 会碎中文、`catch(_){}` 静默吞）。
+  - 本轮（#68）核准新增：**#69** `edge-agent` 漏配 `AI_BRIDGE_TOKEN` 时，`bridge:health` 会**静默**降级成 7 字段存活视图（运维无从归因），应启动自检并告警——属 `edge-agent.js` 面，另行派工；**#70** `?probe=1` 在仓内**零代码调用方**（只有两处文档提及），若确认无运维使用方，整段删除才是根除"签名放大器"面的正解，删除须与文档同批修订。
+  - 落盘与卫生：**#62** `store.js` 的 `recordTask` 是字段白名单，`requested/skipped/total` 进不了历史（#36 的诚实只在响应里，历史里仍丢失）、**#63** 测试残留清理不实（Windows 下 SQLite 句柄未关，`cleanup()` 删不净却打印"目录已清理"；且 `.bak-cleanup-*` 一类文件未被 `.gitignore` 覆盖，靠"用历史切分而非复制目录"来避免误发布）、**#61** 文档保真锁（env 表 / 套件计数 / 端点行号与源码同源，否则红灯——本轮 README 的 `45/184/374` 三处漂移就是它要治的病）。
 
 
 ## mitmproxy 流量监控（可选）
