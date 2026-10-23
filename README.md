@@ -127,13 +127,14 @@ API Key:  随便填（如 sk-1234）
 node test-unit.mjs          # 48 项  纯单元测试（含 #47 SSE 回放合成器）
 node test-workspace.mjs     # 59 项  工作区管理（独立临时数据目录 + 写失败注入）
 node test-store-corrupt.mjs # 43 项  坏 JSON 与坏形状隔离/拒绝覆写 + 配置损坏只降级（子进程 + 隔离 DATA_DIR）
-node test-audit-fixes.mjs   # 63 项  审计修复验收（含结构锁 E/F/G/H/I/J/K/L 段）
+node test-audit-fixes.mjs   # 70 项  审计修复验收（含结构锁 E/F/G/H/I/J/K/L/M 段；M 段会实际调起棘轮门禁）
 node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
 node test-e2e.mjs           # 211 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827/9830 + 第四实例 9841 + 注册表接缝与假 CLI 实例 9833/9834/9835，均不影响生产）
-npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
+npx eslint . --ext .js,.mjs # 0 error / 18 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
+node check-swallow-ratchet.mjs # 0=棘轮通过并打印 STATUS=ok / TOTAL=<实测>；非 0 时点名 GROWTH / SCOPE-DRIFT / TOTAL-SUM-CONFLICT
 ```
 
-合计 **469 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+合计 **476 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
 
 
 ### 派发长任务前必读（超时口径）
@@ -299,6 +300,7 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
   - **注册表配置路径可注入（#80）**：`tools.json` 的载入路径原先硬编码在 `tool-registry.js:98`，测试无法在不碰生产配置的前提下把一个本地假 CLI 送进**真派发链路**——于是「CLI 侧到底收到什么任务文本」（#40）、「流式缓存命中的端到端形状」（#79）只能靠源码结构锁兜住，而结构锁已被 #74 证明会漏抓第二/第三写手。现 `AI_BRIDGE_TOOLS_PATH` 存在时按该文件装载（未设时逐字节不变，且刻意不用 `path.resolve('tools.json')` 防随 cwd 漂移），`/api/tools` 响应带 `registry: getLoadDiagnostics()` 让"到底读了哪个文件"可归因。附带立项 #81：`CliAdapter.detect()` 对绝对路径 `command` 恒判不可用（`where <绝对路径>` 退出码 2），而 `execute()` 走的 `resolveWindowsCommand` 却认它——跑得动却永不被派发。
   - **CLI 终于拿到工作区简报，出站文本收成单一写手（#40）**：`server.js` 里 `outboundTask` 的 else（CLI）分支曾在自己内部再判一次 `toolDef.type === 'client'` —— 在该分支恒为 false，于是 **CLI 工具永远只拿到 `[USAGE]` 自报后缀、拿不到"只在该目录内动文件"这段唯一的文字护栏**（`cwd` 只约束进程起始目录，拦不住越界绝对路径）。现在简报与后缀分型一次组装（`brief = workspace ? 拼简报 : 原文`，client 不加后缀、CLI 加后缀）；同时删掉 `executeClient` 内的**第二次**组装（旧 `:572` 记台账、`:685` 才实发，恰好等值但一改就漂）——台账所记与进程实收/客户端实收自此按构造同源，由 `#40e4`/`#40e8` 两条**逐字节相等**哨兵锁住（探针 CLI 把实收 stdin 以 base64 回吐）。两处 exec 准入守卫刻意双存、拒绝文案逐字不变、且仍在写台账之前，#43 的"被拒派发不产生假发出流量"不回退。
   - **空白 `path` 不再被当成"没给"（#51）**：`workspace-manager.js` 原判定 `input.path != null && String(input.path).trim() !== ''` 把"提供了但纯空白"（`""` / `"   "` / `"\t"` / `"\n"`）折叠成"未提供"，于是**静默在受管根 mkdir 一个空目录、写注册表落盘、返回成功**——调用方本意是登记自己已有的目录，结果拿到一个从没人要的工作区，此后所有派发产生的文件都写进那里。现在 `create()` 最顶端（先于 `loadState`/`mkdirSync`/`trySaveState`）以 **400** 拒绝，文案点名 `path` 并说清真因（"已提供但为空白"），不伪装成"路径不存在"；三分类互斥且全覆盖：未提供（`null`/`undefined`）→ 照旧 managed，提供且非空白 → 校验链一字未动，提供但空白 → 拒绝且不留任何记录或目录。
+  - **吞异常有了只降不升的门禁（#26）**：源码里 `try { … } catch (e) { }` 式"既不记录也不做任何决定"的纯吞曾有 **45 处 / 11 文件**（最多 `server.js 19`），过去没有任何机制阻止它继续生长——`no-empty` 视注释为非空，写一行 `/* 有意忽略 */` 就能过关（实测）。现在 `check-swallow-ratchet.mjs` 用 ESLint 显式规则 + esquery `:has()` 选择器计数（**注释不是 AST 节点，绕不过**），与 `swallow-baseline.json` 比对：某文件增长、基线幽灵文件、`total` 与逐文件之和不符——三者都非 0 退出并点名正斜杠相对路径；基线比实测更严则放行（这就是"只降不升"）。口径刻意放过 `catch { return false }` 这类**有决定的降级**（严格口径会把 `db.js`/`sse-replay.js` 也算红，只会逼出噪声 log 换绿灯）。门禁是**旁挂脚本**：`ai-bridge/.eslintrc.json` 一字未改（写 error 会把 45 处当场打成 45 error、毁掉"必须 0 error"那道门；写 warn 无人看），由 `test-audit-fixes` 的 M 段调起 ⇒ 跑套件即跑门禁。
 - **未修（如实列示，按当前队列序）**：
   - #81 CLI 绝对路径可用位不对称：`detect()` 只查 `commandPaths` + `findInPath`（Windows `where <绝对路径>` 恒失败），而 `execute()` 的 `resolveWindowsCommand` 认绝对路径——同一份配置跑得动却永远不被派发，拒绝文案还是"未知工具/no_targets"（归因误导，#54 同族）
   - #57 桥默认身份是常量 `unknown`：`connectedClients` 以名字为键，同一宿主的多个派生会话必然塌进**一个**在册条目，共享 `pendingTask` 槽与能力字段；后启动会话的 `registerSeq` 基数天然更大，于是"后来者覆写全体能力"成为合法行为。且注册复用分支**静默无日志**，中枢也无 `hostCount`/poll 计数面——该缺陷目前**无法从可观测面证明有几个会话在共享身份**。
