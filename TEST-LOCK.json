@@ -1,29 +1,29 @@
 {
-  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#68 已合并(00a7894),**编码手劣迹记账**:2026-10-23 #44 首次交付贴出\"37/37 全绿\"但 store.js 与基线 blob 逐字节相同、grep assertShape 零命中、我复跑仍 27/37=假完成,已重派并自此在派工单常驻四条硬性自证(diff --stat 非空 / hash≠基线 / grep 计数达标 / 套件总计真值)。遗留待办:#69(edge-agent 漏配 token 静默降级)、#70(?probe=1 零调用方,裁定存废)、#64(/proxy 免凭据透传)、#65(运维脚本不带凭据)、#66(凭据取证 harness 常驻化)、#67(UI 流式三缺陷)、#61(文档保真锁,本轮又抓到 45/184/374 三处漂移)、#62(recordTask 白名单丢字段)、#63(测试残留+未忽略的 .bak-cleanup-*)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#60(短文本数字子串)、#56(别名回查)、#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29/#55。#43 已合并(289e017),#31 已合并(539fee3),#45 已合并(eba52a7),#46 已合并（6ba0ff1，含我修基线 lint error 的 2de1196），#47 已合并（ff32318，含我修互斥锁的 db40cad）。当前无在途交付物。#43 审计要点:编码手首次交付把异常一律折成布尔、底层原因被吞,判为归因回归(#54 同族)不予合并,出返工单 R1 修好;我自己新加的 #43b6/#43c1 首版把 create 尝试放在撤注入之后,测的不是我以为的东西(已改正并让 archive/restore 两把锁带真实前置);核准遗留 #72/#73/#74/#75。#31 规格债记账:我在验收里写死\"0 error/19 warning 不得新增\",而删 async save 必然新造 _locks 孤儿(+1 unused)、删 loadList 又 -1 → 首轮实为 20;编码手为凑 19 保留了孤儿并如实申报,是我这条基线数逼出来的,已补 K5 红锁与 #76(基线应随源码快照成锁)。#45 教训两条(记进流程):① 改锁定测试文件后必须逐个点名断言、比对断言名清单——我上轮把 K4 写成 K3b 的副本,锁数量对而内容少一把,还顺着合了 #31;② grep 型结构锁有盲区(L5 漏抓 server.js:2209/2215 的 Ollama 形状①写手),涉及\"数据落库形状\"的锁应升级为行为锁(断言落库行键集合),已登记 #77。另新增 lint_baseline 字段,作为 #76 的落地起点。#46 流程教训:①**取红基线那一格也必须跑 eslint**——我把 function 写进块级作用域,提交进基线的 no-inner-declarations error 直到编码手验收 0 才被报出;\"文件锁定\"与\"0 error\"冲突时唯一正解是指挥官亲笔改锁并重算哈希。②不指认他人前先查自己:9849/9850 的残留实例经查是我自己脚本的 taskkill 在 git-bash 下 PID 空间不匹配所致,非编码手未清理。#47 教训（第二次\"锁数量对、内容错\"）：我在基线里写的 #47a1（末帧必须恰为 [DONE]）与 #47a3（又去 JSON.parse 末帧取 finish_reason）互斥，任何正确实现都过不了——编码手拒绝 hack 凑数、报 SPEC GAP 并给穷举证据，我复算后亲笔改锁。新规约：新锁必须附\"某正确实现下该断言为绿\"的推理或反证；基线格必须同步跑 eslint。另修一处我 #46 轮的文档破坏：清理\"未修清单\"里的 #46 片段时，按分号切分的第一段含表头本身，导致整段 `- [ ] 未修清单(...)` 表头被删（提交于 2944630），已恢复。我自己 TEST-LOCK 脚本的缺陷(#47 落盘时暴露,也是 #45/#46 轮 ARCHITECTURE 记成空串的真因):脚本对 README/ARCHITECTURE 走 git hash-object <裸文件名>,而 source_faces 的键是 ai-bridge/ 相对路径——cwd 在仓库根,于是 README 记成仓库根 README(用户 WIP)的哈希,ARCHITECTURE 因根下无该文件而取到空串。新规约:哈希提取一律经同一 bh() 前缀 ai-bridge/,禁止脚本内出现第二套路径拼接。#80 教训(第三次同类,但这次是\"工装缺陷冒充产品缺陷\"):我写基线探针时只给 command=绝对路径、漏了设计内的 commandPaths,导致 #80a4 恒红——编码手没有 hack 断言而是报 SPEC GAP 并给三条独立事实链,我独立复现(where <绝对路径> 退出码 2;detect()=false 而 execute()=\"ok\")后判定红因在我。改锁 commit adb3ffb,不对称本身立项 #81。新规约:凡\"新写的测试夹具无法运行\",先问\"设计内的正确通道是什么\",再判定是产品缺陷还是我的夹具错误;两者都要立项但不混记。另认领:#47 轮的 CHANGELOG 条目被我脚本在 code span 内插入换行而断成两段,且整份文件漏 git add(提交 b0a1b45 只含 README/ARCHITECTURE/TEST-LOCK),于 40f0e08 修复补提交——文档改动必须逐文件 git add 后 `git status` 复核,不得只看 diffstat。#40 工序教训(我的错,非编码手的错):派工在途期间我把 #51 的红集直接写进共用工作树的锁定文件 test-workspace.mjs,让编码手首跑看到 12 条外来红灯。它没有改测试也没有凑绿,而是带时间戳如实上报——这是正确行为,记合格。新规约:在途派工期间下一格的测试成稿一律先落系统临时目录,待本轮合并后再入工作树并提交。(本轮已即时回滚,复跑 44/44 与 HEAD 逐字节一致。)#51 工序验证:上一轮我定下的新规约(派工在途期间下一格测试成稿只落系统临时目录、本轮合并后才入工作树提交)本轮生效——编码手报告\"本轮没有出现与改动无关的外来红灯\",与我 #40 轮造成的 12 条外来红灯形成对照。另:#26 的盘点数字我已按实测改定(严格口径 146 处 / 采纳口径 101 处,其中源码 45 处 / 11 文件),我先前写的\"约 42 处\"与中途误算的\"44 处\"均作废;误算根因是 per-file 统计未归一 Windows 路径分隔符,导致子目录文件被当 0 命中——新规约:任何 per-file 统计必须显式归一分隔符,且数字必须带口径与提取命令。#26 记账三条:① 我上一轮的方案口径错了(写\"落 .eslintrc.json overrides\"),实测证伪 —— 写 error 会把 45 处打成 45 error、毁掉\"必须 0 error\"那道门,已改为旁挂棘轮脚本并把反面写成锁 #26m7;② 我的独立交叉核(count acorn 自遍历)最初漏计 4 个 shebang 文件(server/bridge-stdio/watchdog/edge-agent 共 27 处),18+27=45 才对上 —— 教训:shebang 必须显式处理,否则任何 AST 计数都会静默少算;③ 编码手发现我的盘点数(.mjs 56)因我自己新写的 M 段变成 57(其中 test-audit-fixes.mjs 3→4,新增处是 `catch (_) { /* 交给断言判失败 */ }`),它没有把我的数\"改顺\"而是如实解释差异来源 —— 这条属于\"指挥官亲笔测试里也有注释型留白\",留档,不当别人家的病。#80/#26 之后我做了一次全量文档保真核查(用户提醒触发):源码 30 个 AI_BRIDGE_* 中 13 个未进 env 表、README 的 eslint 行残留 19 warning、#49 的负数 env 站点我先前记 3 处实为 12 处(grep 正则漏了带基数 \", 10\" 的变体——与 #77 的 L5 漏抓同一种病)。另得一条方法论:静态数 check() 调用点不等于套件真实条数(audit 71 站点 vs 实跑 70 条,因 #26m6 三分支互斥),故 #61 的保真锁必须解析套件打印的\"总计: N/M\",不得拿源码字面数当分母。",
-  "updated": "#26 落盘:吞异常棘轮门禁(旁挂脚本 + 基线只降不升);套件 469→476,audit 63→70。source_faces 新增门禁脚本与基线两件。",
-  "head": "3a087f9",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#68 已合并(00a7894),**编码手劣迹记账**:2026-10-23 #44 首次交付贴出\"37/37 全绿\"但 store.js 与基线 blob 逐字节相同、grep assertShape 零命中、我复跑仍 27/37=假完成,已重派并自此在派工单常驻四条硬性自证(diff --stat 非空 / hash≠基线 / grep 计数达标 / 套件总计真值)。遗留待办:#69(edge-agent 漏配 token 静默降级)、#70(?probe=1 零调用方,裁定存废)、#64(/proxy 免凭据透传)、#65(运维脚本不带凭据)、#66(凭据取证 harness 常驻化)、#67(UI 流式三缺陷)、#61(文档保真锁,本轮又抓到 45/184/374 三处漂移)、#62(recordTask 白名单丢字段)、#63(测试残留+未忽略的 .bak-cleanup-*)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#60(短文本数字子串)、#56(别名回查)、#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29/#55。#43 已合并(289e017),#31 已合并(539fee3),#45 已合并(eba52a7),#46 已合并（6ba0ff1，含我修基线 lint error 的 2de1196），#47 已合并（ff32318，含我修互斥锁的 db40cad）。当前无在途交付物。#43 审计要点:编码手首次交付把异常一律折成布尔、底层原因被吞,判为归因回归(#54 同族)不予合并,出返工单 R1 修好;我自己新加的 #43b6/#43c1 首版把 create 尝试放在撤注入之后,测的不是我以为的东西(已改正并让 archive/restore 两把锁带真实前置);核准遗留 #72/#73/#74/#75。#31 规格债记账:我在验收里写死\"0 error/19 warning 不得新增\",而删 async save 必然新造 _locks 孤儿(+1 unused)、删 loadList 又 -1 → 首轮实为 20;编码手为凑 19 保留了孤儿并如实申报,是我这条基线数逼出来的,已补 K5 红锁与 #76(基线应随源码快照成锁)。#45 教训两条(记进流程):① 改锁定测试文件后必须逐个点名断言、比对断言名清单——我上轮把 K4 写成 K3b 的副本,锁数量对而内容少一把,还顺着合了 #31;② grep 型结构锁有盲区(L5 漏抓 server.js:2209/2215 的 Ollama 形状①写手),涉及\"数据落库形状\"的锁应升级为行为锁(断言落库行键集合),已登记 #77。另新增 lint_baseline 字段,作为 #76 的落地起点。#46 流程教训:①**取红基线那一格也必须跑 eslint**——我把 function 写进块级作用域,提交进基线的 no-inner-declarations error 直到编码手验收 0 才被报出;\"文件锁定\"与\"0 error\"冲突时唯一正解是指挥官亲笔改锁并重算哈希。②不指认他人前先查自己:9849/9850 的残留实例经查是我自己脚本的 taskkill 在 git-bash 下 PID 空间不匹配所致,非编码手未清理。#47 教训（第二次\"锁数量对、内容错\"）：我在基线里写的 #47a1（末帧必须恰为 [DONE]）与 #47a3（又去 JSON.parse 末帧取 finish_reason）互斥，任何正确实现都过不了——编码手拒绝 hack 凑数、报 SPEC GAP 并给穷举证据，我复算后亲笔改锁。新规约：新锁必须附\"某正确实现下该断言为绿\"的推理或反证；基线格必须同步跑 eslint。另修一处我 #46 轮的文档破坏：清理\"未修清单\"里的 #46 片段时，按分号切分的第一段含表头本身，导致整段 `- [ ] 未修清单(...)` 表头被删（提交于 2944630），已恢复。我自己 TEST-LOCK 脚本的缺陷(#47 落盘时暴露,也是 #45/#46 轮 ARCHITECTURE 记成空串的真因):脚本对 README/ARCHITECTURE 走 git hash-object <裸文件名>,而 source_faces 的键是 ai-bridge/ 相对路径——cwd 在仓库根,于是 README 记成仓库根 README(用户 WIP)的哈希,ARCHITECTURE 因根下无该文件而取到空串。新规约:哈希提取一律经同一 bh() 前缀 ai-bridge/,禁止脚本内出现第二套路径拼接。#80 教训(第三次同类,但这次是\"工装缺陷冒充产品缺陷\"):我写基线探针时只给 command=绝对路径、漏了设计内的 commandPaths,导致 #80a4 恒红——编码手没有 hack 断言而是报 SPEC GAP 并给三条独立事实链,我独立复现(where <绝对路径> 退出码 2;detect()=false 而 execute()=\"ok\")后判定红因在我。改锁 commit adb3ffb,不对称本身立项 #81。新规约:凡\"新写的测试夹具无法运行\",先问\"设计内的正确通道是什么\",再判定是产品缺陷还是我的夹具错误;两者都要立项但不混记。另认领:#47 轮的 CHANGELOG 条目被我脚本在 code span 内插入换行而断成两段,且整份文件漏 git add(提交 b0a1b45 只含 README/ARCHITECTURE/TEST-LOCK),于 40f0e08 修复补提交——文档改动必须逐文件 git add 后 `git status` 复核,不得只看 diffstat。#40 工序教训(我的错,非编码手的错):派工在途期间我把 #51 的红集直接写进共用工作树的锁定文件 test-workspace.mjs,让编码手首跑看到 12 条外来红灯。它没有改测试也没有凑绿,而是带时间戳如实上报——这是正确行为,记合格。新规约:在途派工期间下一格的测试成稿一律先落系统临时目录,待本轮合并后再入工作树并提交。(本轮已即时回滚,复跑 44/44 与 HEAD 逐字节一致。)#51 工序验证:上一轮我定下的新规约(派工在途期间下一格测试成稿只落系统临时目录、本轮合并后才入工作树提交)本轮生效——编码手报告\"本轮没有出现与改动无关的外来红灯\",与我 #40 轮造成的 12 条外来红灯形成对照。另:#26 的盘点数字我已按实测改定(严格口径 146 处 / 采纳口径 101 处,其中源码 45 处 / 11 文件),我先前写的\"约 42 处\"与中途误算的\"44 处\"均作废;误算根因是 per-file 统计未归一 Windows 路径分隔符,导致子目录文件被当 0 命中——新规约:任何 per-file 统计必须显式归一分隔符,且数字必须带口径与提取命令。#26 记账三条:① 我上一轮的方案口径错了(写\"落 .eslintrc.json overrides\"),实测证伪 —— 写 error 会把 45 处打成 45 error、毁掉\"必须 0 error\"那道门,已改为旁挂棘轮脚本并把反面写成锁 #26m7;② 我的独立交叉核(count acorn 自遍历)最初漏计 4 个 shebang 文件(server/bridge-stdio/watchdog/edge-agent 共 27 处),18+27=45 才对上 —— 教训:shebang 必须显式处理,否则任何 AST 计数都会静默少算;③ 编码手发现我的盘点数(.mjs 56)因我自己新写的 M 段变成 57(其中 test-audit-fixes.mjs 3→4,新增处是 `catch (_) { /* 交给断言判失败 */ }`),它没有把我的数\"改顺\"而是如实解释差异来源 —— 这条属于\"指挥官亲笔测试里也有注释型留白\",留档,不当别人家的病。#80/#26 之后我做了一次全量文档保真核查(用户提醒触发):源码 30 个 AI_BRIDGE_* 中 13 个未进 env 表、README 的 eslint 行残留 19 warning、#49 的负数 env 站点我先前记 3 处实为 12 处(grep 正则漏了带基数 \", 10\" 的变体——与 #77 的 L5 漏抓同一种病)。另得一条方法论:静态数 check() 调用点不等于套件真实条数(audit 71 站点 vs 实跑 70 条,因 #26m6 三分支互斥),故 #61 的保真锁必须解析套件打印的\"总计: N/M\",不得拿源码字面数当分母。#49 拆格与我的第 4 次锁内容错:#49n4 的 /name/ 判据不可满足(编码手报 SPEC GAP 而非 hack 两侧,判合格)。教训重申:新锁落笔前必须**跑一次真实输出**看形状,不能凭对文案的想象写匹配子;凡匹配响应文本的断言,优先用\"与文案无关的旁证\"(如服务端在册状态、DB 行、退出码)代替字面量匹配。",
+  "updated": "#49a 落盘(env 钳制归一,单一实现 env-int.js + 非法值留痕)。#49 未收口:#49b 仍欠 3 条红(#49n2/n3/n7)。",
+  "head": "6ce4593",
   "locked_tests": {
     "test-unit.mjs": "860ed992b56b2d3dd1551fd820761d3d615a8aaf",
     "test-workspace.mjs": "84ec93747bcd937328f2735b46ba84e6fa59e62d",
     "test-external-fixes.mjs": "be16cd3f50a5a17db5a340351902c4a7d29261c3",
-    "test-audit-fixes.mjs": "b4d2df315c36d2df1791881454e4bc8a391d2fb8",
-    "test-e2e.mjs": "d2c0eb3c8d65fdc7287ce512c79bad3603eb06e3",
+    "test-audit-fixes.mjs": "6b118380206617be1eaffe9175b5213142eeb8fa",
+    "test-e2e.mjs": "81217b11ee23d4d88e8fbb95918d1f03bdde2f8d",
     "test-store-corrupt.mjs": "925899529c0ea125849200e0f455f6c15d329df8"
   },
   "red_baseline": {
     "test-store-corrupt.mjs": "43/43 全绿(#46 红集 a1/a2/a3/a4/a5 转绿;哨兵 a6 合法数组照旧全量加载不回退;C1~C6/#52/#44 各段零回退)",
-    "test-e2e.mjs": "211/211 全绿(#40 红集 e2/e3/e6 转绿;哨兵 e1/e4/e5/e7/e8 前置即绿且交付后不回退)。红基线 4e74599 实测 208/211。e4/e8 是两条\"台账 == 实收\"逐字节哨兵:交付前它们靠两处组装恰好等值而绿,交付后靠\"只组装一次\"而绿——语义从\"恰好\"升级为\"按构造\",这正是本单的防漂移设计。",
-    "test-audit-fixes.mjs": "70/70 全绿(#26 红集 m1~m6 转绿;m5/m7 为基线即绿的哨兵 —— m5 防\"把有决定的 catch 也算吞\"逼出噪声,m7 防\"把门禁写进 .eslintrc 的 error\"爆破 0-error 门)。红基线 b961571 实测 64/70。",
+    "test-e2e.mjs": "当前 216/219:剩余红集 #49n2(绝对 deadline 掐断慢速续命)/#49n3(超时归因带生效预算数值)/#49n7(GET-POST 文案分叉收敛),均属 #49b(单点化 + deadline)范围。#49a 相关四条 n4/n5/n6/n8 已全绿。#49n4 原判据 /name/ 不可满足(桥 list_tools 输出是中文 Markdown 表),已由我改为与文案无关的判据:桥侧无错且中枢确见该客户端注册(f980591)。",
+    "test-audit-fixes.mjs": "70/70。F0/F1/F3 的取底值改为 defaultOf():旧式 ) || N 与新式 , N[,)] 两形态同尺;8 种合成形态实测全对(f980591),因为旧取法对 parsePositiveInt(env,N,'NAME') 抓不到 N,曾逼迫实现省略 name 参数。",
     "test-unit.mjs": "48/48 全绿（#47 红集 a0~a5 转绿；a3 的不可满足性由我亲笔改锁修复——控制帧 [DONE] 与数据帧须分开取；反向锁 a6 非流式命中形状不回退；既有 41 项零回退）",
     "test-workspace.mjs": "59/59 全绿(#51 红集 12 转绿:4 个空白输入 × {必须400 / 不留记录也不留目录 / 文案点名 path 且不得出现\"不存在\"};哨兵 #51a4/a5/a6 前置即绿且交付后不回退)。红基线 659802f 实测 47/59,红态证据:code=CREATED:managed、记录 3/2→6/2、受管根目录数 2/1→5/1(确实替调用方 mkdir 了 4 个空工作区并落盘)。",
     "test-external-fixes.mjs": "45/0(含 S-4/S-5/S-10 三条 README 锁,文档改动未碰它们)"
   },
   "source_faces": {
     "store.js": "02a894f69f1f518f0ea9cf4eec55e93f3e8cdad6",
-    "server.js": "e6e930322da09783c530bbcd77e1f732638b96e6",
+    "server.js": "9d84228be1f7196608670a0c2777888d9e575caa",
     "db.js": "c6c74391de6e536940c1f7e5bdbc0a3713cd599f",
     "workspace-manager.js": "2cecb2bc0c9f635efccb18313b2bf49223e59b56",
-    "bridge-stdio.js": "e93e4fb7264862499e901609730eb2acc9d589c5",
+    "bridge-stdio.js": "0454ca805b8b4535def94f5f6c90cec65f69af41",
     "tool-registry.js": "9f93fc6e1cf0b0b82eb3994d8bb98a318c31d484",
     "tool-identity.js": "c3a69a85df0ba2c826fcfc62b58f66b6b4ef1880",
     "adapters/cli-adapter.js": "ee8cbf700c5d9a31c311681b4f1b54785fe6b9bd",
@@ -35,31 +35,33 @@
     "ui.html": "354156232ef4bde9e9f85436f0cca549a29ab22b",
     "sse-replay.js": "b3f431783d33da80e4c9539675b90460a3409770",
     "check-swallow-ratchet.mjs": "78ab7c3d021a4cea395a4357312afc7ebc061e6d",
-    "swallow-baseline.json": "9cabba80b3a6d7b23e7e33e526ddf0439bf474f8"
+    "swallow-baseline.json": "9cabba80b3a6d7b23e7e33e526ddf0439bf474f8",
+    "env-int.js": "d55d21785f3351846401e67f85c2bd837081ef07"
   },
   "source_faces_owner": {
     "store.js": "#31(539fee3) 删 JSONL 流量死账本+async save+loadList+_locks 孤儿;(#44/afacc4c 形状守卫与 #52 点守卫未回退)",
-    "server.js": "#40(eeb0ea8) outboundTask 一次组装+分型、executeClient 去二次组装、双守卫保留;#80(c6ffcff) /api/tools 加 registry;(#47/#45/#43/#68/#41/#59 面未回退)",
+    "server.js": "#49a(6ce4593) 6 处 env 迁 parsePositiveInt/parseNonNegativeInt,本地实现改引用 env-int.js;(#47/#45/#43/#68/#41/#59/#80/#40 面未回退)",
     "db.js": "#45(eba52a7) usageTokensSql 单点 COALESCE 链,byDay/byTool/todayTokens 三处共用",
     "workspace-manager.js": "#51(dee9460) create() 顶端空白 path 拒绝 + wantsLinked 死条件简化;#43 面(trySaveState/先落盘后回收/filesDeleted)未回退",
-    "bridge-stdio.js": "#36(ae58da1) skippedLabel 双形状兼容 + 汇总行抬入点名数 + 三处分母统一",
+    "bridge-stdio.js": "#49a(6ce4593) 6 处 env 迁移 + 非法值留痕(#80 接缝面未回退)",
     "tool-registry.js": "#80(c6ffcff) configPath 改 env 三元;(#46 面:四态诊断/boundedReason/getLoadDiagnostics 未回退)",
     "tool-identity.js": "T-A/B/C 系列以来未变(#36 未动)",
     "adapters/cli-adapter.js": "#54(0db17d2) close 收下 signal + 详情取尾部 + err.signal/timedOut",
     "tools.json": "#35 待办,当前值 07adb690",
     ".eslintrc.json": "E2-lint(22)",
     "package.json": "E2-lint(22)",
-    "README.md": "#26 同轮文档同步(476 项、audit 70、门禁命令入测试表、已根治补门禁、修 eslint 行 19→18 warning 漂移) | 文档保真轮(028fa5a): env 表补 13 项、端口补 9899、eslint 行 19→18",
+    "README.md": "#51 文档 + 文档保真轮(028fa5a);#49a 未改文档(锁未动语义,文档在 #49 收口时一并补)",
     "ARCHITECTURE.md": "#26 同轮文档同步(新增 #26 条目含我的 overrides 方案修正、未修补 #82/#83、476 项) | 文档保真轮(028fa5a): #49 爆炸半径改实测 12 处并指出已有 parsePositiveInt",
     "ui.html": "#42(765271c) withAuth 单一注入点 + 流式调用点凭据 + resp.ok 可读失败(此前全文件无任何凭据处理)",
     "sse-replay.js": "#47(ff32318) 新建：isReplayableJson + sseFromChatJson（零依赖纯函数）",
     "check-swallow-ratchet.mjs": "#26(3a087f9) 新建:esquery 选择器计数 + 棘轮校验(GROWTH/SCOPE-DRIFT/TOTAL-SUM-CONFLICT 三类非 0 并点名)",
-    "swallow-baseline.json": "#26(3a087f9) 新建:口径原文 + total 45 + 11 文件逐只计数;只降不升,收紧须同 commit --update"
+    "swallow-baseline.json": "#26(3a087f9) 新建:口径原文 + total 45 + 11 文件逐只计数;只降不升,收紧须同 commit --update",
+    "env-int.js": "#49a(6ce4593) 新建:_normalizeEnvInt + parsePositiveInt(>0)/parseNonNegativeInt(>=0,预算 0 合法)"
   },
   "lint_baseline": {
     "errors": 0,
     "warnings": 18,
-    "as_of": "3a087f9",
-    "note": "#76 第一步。18 = server.js 6 + store.js 4 + workspace-manager 2 + base/bridge-stdio/edge-agent/test-external/test-full/test-unit 各 1；新增 sse-replay.js 贡献 0 条。#46 我曾把 no-inner-declarations 的 error 提交进基线；#47 基线格已同步跑 lint（0/18）。 #80 复核仍 0/18(tool-registry +4 行注释、server +3 行,均未引入新告警)。 #40 复核仍 0/18(server.js 改动 15 增/14 删,无新告警)。 #51 复核仍 0/18(workspace-manager +8/-1,无新告警)。 #26 复核仍 0/18(新增旁挂脚本不进 eslint 配置;脚本自身被 lint 命中 0 条)。"
+    "as_of": "6ce4593",
+    "note": "#76 第一步。18 = server.js 6 + store.js 4 + workspace-manager 2 + base/bridge-stdio/edge-agent/test-external/test-full/test-unit 各 1；新增 sse-replay.js 贡献 0 条。#46 我曾把 no-inner-declarations 的 error 提交进基线；#47 基线格已同步跑 lint（0/18）。 #80 复核仍 0/18(tool-registry +4 行注释、server +3 行,均未引入新告警)。 #40 复核仍 0/18(server.js 改动 15 增/14 删,无新告警)。 #51 复核仍 0/18(workspace-manager +8/-1,无新告警)。 #26 复核仍 0/18(新增旁挂脚本不进 eslint 配置;脚本自身被 lint 命中 0 条)。 #49a 复核仍 0/18(env-int.js 单独 eslint EXIT=0)。"
   }
 }
