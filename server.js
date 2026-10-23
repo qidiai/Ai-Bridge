@@ -13,7 +13,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { TOOLS, findInPath, estimateTokens, extractCodeBlocks } = require('./tool-registry');
+const { TOOLS, findInPath, estimateTokens, extractCodeBlocks, getLoadDiagnostics } = require('./tool-registry');
 const { getKimiProxyModels } = require('./kimi-models');
 const qidiSync = require('./qidi-sync');
 const {
@@ -34,6 +34,21 @@ const db = require('./db');
 const observe = require('./observe');
 const { cleanupStaleTaskDirs } = require('./output-cleaner.js');
 const { USAGE_REPORT_SUFFIX, parseUsageReport } = require('./usage-reporter');
+
+// ── #46 tools.json 降级留痕:加载期损坏只降级功能、不拦进程起来;但"静态工具缺席"这一事实必须进可查账本 ──
+//   落账必须在 server.js 做:tool-registry 不得为此依赖 store(#46a4 —— bridge-stdio 也 require 它,
+//   加了依赖每个 MCP 桥进程都会在加载期 mkdir 数据目录)。'missing' 是合法部署态,不写 error 级。
+//   本处不做 /api/health 上报(那属 #33 损坏状态上报);对原件不做任何写/改名/删除(#46a5)。
+{
+  const regDiag = getLoadDiagnostics();
+  if (regDiag.status === 'corrupt-parse' || regDiag.status === 'corrupt-shape') {
+    const statusCn = regDiag.status === 'corrupt-parse' ? '解析失败' : '顶层形状非法（期望 JSON 数组）';
+    const diagMsg = `工具配置 ${regDiag.file} 已降级（${statusCn}；原因: ${regDiag.error}）：` +
+      '静态工具已全部缺席，本进程仅剩自动同步工具；原件未被改动，需人工修复后方可恢复。';
+    store.appendLog('error', diagMsg);
+    console.error('[server] ' + diagMsg); // watchdog stdio 为 inherit：不能只进 logs.jsonl，stdout 也要看得到
+  }
+}
 
 // ── 配置(集中管理,不再分散硬编码) ──
 // 解析正整数 env:非数字/0/负数一律回退默认值

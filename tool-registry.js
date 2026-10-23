@@ -11,6 +11,7 @@
  *   - findInPath:  PATH 可执行探测
  *   - estimateTokens:  中文友好 token 估算
  *   - extractCodeBlocks: 代码块提取
+ *   - getLoadDiagnostics: #46 tools.json 加载诊断（server.js 据此把降级事实落进 logs.jsonl）
  */
 
 const path = require('path');
@@ -67,15 +68,67 @@ function addConfigs (tools, seen, configs) {
   }
 }
 
+// ── #46 加载期诊断:tools.json 损坏只能降级功能,绝不能阻止进程起来(与 store P0/#52/#44 同尺)──
+//   留痕在本模块内的诊断状态,由 server.js 消费后落进 logs.jsonl(#46a4)。
+//   本模块不得为此新增对 store.js 的引用(#46a4):bridge-stdio.js:12 也 require tool-registry,
+//   一旦加上 store 依赖,每个 MCP 桥进程都会在加载期 mkdir 数据目录。
+//   损坏原件必须原样留在原处:不改名、不覆写、不隔离(#46a5;P0 的 .corrupt-* 隔离只用于运行数据)。
+const DIAG_ERROR_MAX = 200; // 原因摘要上限,与 #54/#74 的 causeOf 同尺:压换行、超长取尾部并保留开头错误码
+
+/** 有界原因摘要:SyntaxError/EBUSY 这类第一顺位归因(开头的错误码/异常名)不得被截掉 */
+function boundedReason (e) {
+  const msg = String((e && e.message) || e || '').replace(/\s+/g, ' ').trim();
+  if (!msg) return '未知故障（无异常信息）';
+  if (msg.length <= DIAG_ERROR_MAX) return msg;
+  const codeMatch = /^[A-Z]+(?=:| )/.exec(msg);
+  const prefix = codeMatch ? codeMatch[0] + ': ' : '';
+  return prefix + '…' + msg.slice(-(DIAG_ERROR_MAX - prefix.length - 1));
+}
+
+// 诊断状态:仅在每次 loadTools() 后整体更新;kimi 热更新(resyncKimiTools)走自身 try/catch,不得写这里。
+// { status: 'ok'|'missing'|'corrupt-parse'|'corrupt-shape', error: string|null, file: basename, entryCount: number }
+let lastLoadDiag = { status: 'missing', error: null, file: 'tools.json', entryCount: 0 };
+
+/** tools.json 加载诊断(导出给 server.js 落账;返回副本防调用方改内部状态) */
+function getLoadDiagnostics () {
+  return { ...lastLoadDiag };
+}
+
 function loadTools () {
   const configPath = path.join(__dirname, 'tools.json');
   const tools = [];
   const seen = new Set();
+  let status = 'ok';
+  let error = null;
+  let entryCount = 0;
   if (!fs.existsSync(configPath)) {
+    // 文件不存在是合法部署态:保持现状语义(仅 warn、不算损坏、不写 error 级留痕)
+    status = 'missing';
     console.warn('[tool-registry] tools.json 不存在，仅加载自动同步工具');
   } else {
-    addConfigs(tools, seen, JSON.parse(fs.readFileSync(configPath, 'utf-8')));
+    let configs = null;
+    try {
+      // 读文件 + JSON.parse 整体纳入保护:EBUSY/EPERM 一类读错误与 store P0
+      // "读不确定即不覆写"同尺 —— 保守当损坏,绝不让它抛穿模块加载期
+      configs = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    } catch (e) {
+      status = 'corrupt-parse';
+      error = boundedReason(e);
+    }
+    if (status === 'ok' && !Array.isArray(configs)) {
+      // 能解析但顶层不是数组:null/数字/字符串/对象都算([] 是合法空配置,不走这支)
+      status = 'corrupt-shape';
+      error = `顶层形状非法：期望 JSON 数组，实际为 ${configs === null ? 'null' : typeof configs}`;
+    }
+    if (status === 'ok') {
+      entryCount = configs.length; // 本次实际交给 addConfigs 的静态条目数(损坏时为 0)
+      addConfigs(tools, seen, configs);
+    } else {
+      // 两种 corrupt-* 后果一致:静态工具集按空处理、绝不抛、原件原样在、照常继续加载 kimi 自动同步工具
+      console.error(`[tool-registry] tools.json ${status === 'corrupt-parse' ? '解析失败' : '顶层形状非法'}，静态工具全部缺席、仅剩自动同步工具；原件未被改动，需人工修复: ${error}`);
+    }
   }
+  lastLoadDiag = { status, error, file: path.basename(configPath), entryCount };
   // 自动同步 Kimi Code 模型（kimi-code 更新模型后无需手工改 tools.json）
   addConfigs(tools, seen, getKimiToolConfigs());
   return tools;
@@ -135,4 +188,4 @@ async function findInPath (name) {
   });
 }
 
-module.exports = { TOOLS, findInPath, estimateTokens, extractCodeBlocks };
+module.exports = { TOOLS, findInPath, estimateTokens, extractCodeBlocks, getLoadDiagnostics };
