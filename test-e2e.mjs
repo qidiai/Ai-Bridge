@@ -1014,6 +1014,111 @@ async function main () {
   for (const s of hole2Socks) { try { s.destroy(); } catch { /* ignore */ } }
   await new Promise(r => hole2Srv.close(r));
 
+  // 9.45) 出站 HTTP 的三处同源缺陷(#49 指定红集)
+  //   a) 慢速续命:两个封装的超时都是 Node 的 **inactivity** 型 socket timeout——只要对端每 40ms 吐一个字节,
+  //      `timeout` 事件永不触发,桥就永久挂在"看起来还活着"的连接上(黑洞只在"完全不动"时才管用,#38/#53 覆盖的是那一种)。
+  //   b) 负数 env:`parseInt(env) || 默认` 对 0/非数字会落默认,但**负数原样直通**;
+  //      已实测 `http.request({timeout:-1})` 同步抛 ERR_OUT_OF_RANGE ⇒ 一个手滑的负数让桥彻底失联,
+  //      而且拿到的是裸错误码(归因误导,#54 同族)。仓内其实已有 `parsePositiveInt(v,def)`(server.js:57,另有 5 处在用)。
+  //   c) 双写手:httpPost(:221) 与 httpGet(:253) 各自实现同一套状态码阶梯,文案已分叉
+  //      ——`服务返回格式错误`(POST) vs `格式错误`(GET),这就是"两份实现必然漂"的现行证据。
+  section('HTTP 单点/绝对 deadline/负数 env:#49 红集');
+  {
+    const DRIP_PORT = 9816;
+    const NEG_HUB_PORT = 9817;
+    let dripHits = 0;
+    const dripSrv = http.createServer((rq, rs) => {
+      dripHits++;
+      rs.writeHead(200, { 'Content-Type': 'application/json' });
+      const iv = setInterval(() => { try { rs.write('x'); } catch (_) { clearInterval(iv); } }, 40);
+      rq.on('close', () => clearInterval(iv));
+    });
+    const dripSocks = new Set();
+    dripSrv.on('connection', (s) => { dripSocks.add(s); s.on('close', () => dripSocks.delete(s)); });
+    await new Promise(r => dripSrv.listen(DRIP_PORT, HOST, r));
+
+    const budgetCall = async (mcp, name, args, capMs) => {
+      const t0 = Date.now();
+      let out = {};
+      const capped = await Promise.race([
+        mcp.request('tools/call', { name, arguments: args }).then(r => ({ r, err: null })).catch(e => ({ r: null, err: e.message })),
+        new Promise(res => setTimeout(() => res(null), capMs))
+      ]);
+      if (capped === null) return { ms: Date.now() - t0, capped: true, isError: false, text: '' };
+      out = capped;
+      const text = (((out.r || {}).result || {}).content || []).map(c => c.text || '').join('\n');
+      return { ms: Date.now() - t0, capped: false, isError: !!((out.r || {}).result || {}).isError, text, err: out.err };
+    };
+
+    const dripProc = spawn(process.execPath, ['bridge-stdio.js'], {
+      cwd: __dirname,
+      env: { ...process.env, AI_BRIDGE_PORT: String(DRIP_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-drip', AI_BRIDGE_HTTP_TIMEOUT: '1500' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    dripProc.stderr.on('data', () => {});
+    const dripMcp = makeMcpChannel(dripProc);
+    await dripMcp.request('initialize', {}).catch(() => {});
+    const d = await budgetCall(dripMcp, 'list_tools', {}, 12000);
+    process.stdout.write(`  ⏱ #49n2 drip 实测耗时=${d.ms}ms 命中=${dripHits} ${d.capped ? '桥未自行回话(被我方 12s 上限掐住)' : '桥回话:' + d.text.substring(0, 46)}\n`);
+    check('#49n1 前置:慢速续命的服务端确实收到了请求(证明是"响应挂起"而不是连不上)', dripHits > 0, 'hits=' + dripHits);
+    check('#49n2 红:每 40ms 吐 1 字节的响应必须被**绝对 deadline** 掐断(现状 inactivity 型 socket timeout 被续命,桥永不回话)',
+      d.capped === false && d.isError === true, JSON.stringify({ capped: d.capped, ms: d.ms, isError: d.isError, text: d.text.substring(0, 60) }));
+    check('#49n3 红:超时归因必须带上**实际生效的预算数值**(现在只会说"请求超时",运维分不清是 1500 的预算还是 960000 的窗口)',
+      !d.capped && /1500/.test(d.text), 'text=' + d.text.substring(0, 120));
+    clearTimeout(valve);
+    try { dripProc.stdin.end(); dripProc.kill(); } catch { /* ignore */ }
+    for (const s of dripSocks) { try { s.destroy(); } catch { /* ignore */ } }
+    await new Promise(r => dripSrv.close(r));
+
+    // 负数 env:需要一台**功能正常**的中枢(独立实例,不碰主实例的客户端计数),桥只带坏 env
+    const negDir = path.join(TEST_RUNTIME, 'neg-env');
+    fs.mkdirSync(negDir, { recursive: true });
+    const negHub = spawn(process.execPath, ['server.js'], {
+      cwd: __dirname,
+      env: {
+        ...process.env, AI_BRIDGE_PORT: String(NEG_HUB_PORT), AI_BRIDGE_HOST: HOST,
+        AI_BRIDGE_DATA_DIR: negDir, AI_BRIDGE_DB: path.join(negDir, 'neg.db'),
+        AI_BRIDGE_OBSERVE_DIR: path.join(negDir, 'observe'), AI_BRIDGE_WORKSPACE_ROOT: path.join(negDir, 'ws'),
+        AI_BRIDGE_TOKEN: ''
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    negHub.stderr.on('data', () => {}); negHub.stdout.on('data', () => {});
+    await sleep(2000);
+    let negErr = '';
+    const negProc = spawn(process.execPath, ['bridge-stdio.js'], {
+      cwd: __dirname,
+      env: { ...process.env, AI_BRIDGE_PORT: String(NEG_HUB_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-neg-env', AI_BRIDGE_HTTP_TIMEOUT: '-1' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    negProc.stderr.on('data', (chunk) => { negErr += chunk.toString(); });
+    negProc.stdout.on('data', () => {});
+    const negMcp = makeMcpChannel(negProc);
+    await negMcp.request('initialize', {}).catch(() => {});
+    const n = await budgetCall(negMcp, 'list_tools', {}, 12000);
+    check('#49n4 红:负数 AI_BRIDGE_HTTP_TIMEOUT 不得让桥彻底失联(现状 parseInt(env)||默认 让 -1 直通 → http.request 同步抛 ERR_OUT_OF_RANGE)',
+      n.capped === false && n.isError === false && /name/.test(n.text),
+      JSON.stringify({ capped: n.capped, err: n.err, isError: n.isError, text: n.text.substring(0, 80) }) + ' stderr=' + negErr.substring(0, 80));
+    check('#49n5 非法 env 必须留痕:stderr 要同时出现变量名与"非法/回落/正数"字样(静默落默认 = 设了却不生效且无人知道)',
+      /AI_BRIDGE_HTTP_TIMEOUT/.test(negErr) && /非法|无效|不是正数|必须为正|回落/.test(negErr),
+      'stderr=' + negErr.substring(0, 200));
+    try { negProc.stdin.end(); negProc.kill(); } catch { /* ignore */ }
+    try { negHub.kill(); } catch { /* ignore */ }
+    await sleep(300);
+
+    // 结构面(兜底,主证是上面四条):两份实现与 12 处 env 解析必须归一
+    const brSrc = fs.readFileSync(path.join(__dirname, 'bridge-stdio.js'), 'utf-8').replace(/\r/g, '');
+    const srvSrc = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf-8').replace(/\r/g, '');
+    const unsafe = ((srvSrc + '\n' + brSrc).match(/parseInt\(process\.env\.AI_BRIDGE_[A-Z0-9_]+(, ?10)?\)[^;\n]*\|\|/g) || []);
+    check('#49n6 红:12 处 parseInt(process.env.AI_BRIDGE_*) || 默认 必须全部迁到**已有**的 parsePositiveInt(server.js:57,已有 5 处在用)——那是"第二写手早就存在却没人调"',
+      unsafe.length === 0, '残留=' + unsafe.length + ' :: ' + unsafe.map(s => s.substring(0, 46)).join(' | ').substring(0, 240));
+    check('#49n7 红:GET/POST 的格式错误文案分叉必须收敛成一处(现状 POST="服务返回格式错误"、GET="格式错误",两份实现已在漂的直接证据)',
+      !(/服务返回格式错误/.test(brSrc) && /'格式错误'/.test(brSrc)),
+      'POST 文案=' + /服务返回格式错误/.test(brSrc) + ' GET 裸文案=' + /'格式错误'/.test(brSrc));
+    check('#49n8 哨兵(不回退):GET 的 30000 短兜底不得被抬走(#38a 的黑洞自愈路径依赖它;抬到 960000 会让 GET 永久悬空)',
+      /AI_BRIDGE_HTTP_TIMEOUT[^\n]*?30000/.test(brSrc), '未匹配到 GET 的 30000 兜底(两种写法都接受:`|| 30000` 与 `parsePositiveInt(…, 30000)`)');
+  }
+
   // 9.5) 智能路由:关闭全部本机 CLI 工具(确定性),未指定 tools 时按综合评分自动选优
   section('智能路由:未指定 tools 使用可解释综合评分');
   const allT = await req('GET', '/api/tools');
