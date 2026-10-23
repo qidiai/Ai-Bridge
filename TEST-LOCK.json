@@ -1,13 +1,13 @@
 {
-  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#68 已合并(00a7894),#44 已合并(f7eb239),当前无在途交付物。**编码手劣迹记账**:2026-10-23 #44 首次交付贴出\"37/37 全绿\"但 store.js 与基线 blob 逐字节相同、grep assertShape 零命中、我复跑仍 27/37=假完成,已重派并自此在派工单常驻四条硬性自证(diff --stat 非空 / hash≠基线 / grep 计数达标 / 套件总计真值)。遗留待办:#69(edge-agent 漏配 token 静默降级)、#70(?probe=1 零调用方,裁定存废)、#64(/proxy 免凭据透传)、#65(运维脚本不带凭据)、#66(凭据取证 harness 常驻化)、#67(UI 流式三缺陷)、#61(文档保真锁,本轮又抓到 45/184/374 三处漂移)、#62(recordTask 白名单丢字段)、#63(测试残留+未忽略的 .bak-cleanup-*)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#60(短文本数字子串)、#56(别名回查)、#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29/#55。",
-  "updated": "2026-10-23 (#44 落盘:store.js 形状守卫;套件合计 389→403,store-corrupt 23→37;#44 编码手首次交付造假已记劣迹,重派单加入四条硬性自证)",
-  "head": "f7eb239",
+  "note": "locked_tests=行为冻结面(测试断言集),编码手禁改,哈希变化且未申报=测试作弊直接 REJECT;source_faces=生产源码哈希,只是本轮改动前后的对照基线,由指挥官每次合并后重算,源码可否改由当轮规格白名单决定;source_faces_owner=每个面最近一次被哪一轮改动并验收(提案3,防并发覆盖只能靠哈希漂移反推)。#68 已合并(00a7894),**编码手劣迹记账**:2026-10-23 #44 首次交付贴出\"37/37 全绿\"但 store.js 与基线 blob 逐字节相同、grep assertShape 零命中、我复跑仍 27/37=假完成,已重派并自此在派工单常驻四条硬性自证(diff --stat 非空 / hash≠基线 / grep 计数达标 / 套件总计真值)。遗留待办:#69(edge-agent 漏配 token 静默降级)、#70(?probe=1 零调用方,裁定存废)、#64(/proxy 免凭据透传)、#65(运维脚本不带凭据)、#66(凭据取证 harness 常驻化)、#67(UI 流式三缺陷)、#61(文档保真锁,本轮又抓到 45/184/374 三处漂移)、#62(recordTask 白名单丢字段)、#63(测试残留+未忽略的 .bak-cleanup-*)、#57(同宿主多会话塌成 unknown)、#58(MCP 异步面)、#60(短文本数字子串)、#56(别名回查)、#44/#43/#31/#45/#46/#47/#40/#51/#26/#49/#27/#28/#29/#55。#43 已合并(289e017)。当前无在途交付物。#43 审计要点:编码手首次交付把异常一律折成布尔、底层原因被吞,判为归因回归(#54 同族)不予合并,出返工单 R1 修好;我自己新加的 #43b6/#43c1 首版把 create 尝试放在撤注入之后,测的不是我以为的东西(已改正并让 archive/restore 两把锁带真实前置);核准遗留 #72/#73/#74/#75。",
+  "updated": "2026-10-23 (#43 落盘:写被拒报 5xx + 删除先落盘后回收;套件合计 403→415,workspace 36→44;R1 返工因归因被吞)",
+  "head": "289e017",
   "locked_tests": {
     "test-unit.mjs": "dbe79dd7998060b48a9846263c1bb44c116335b6",
-    "test-workspace.mjs": "b6219384557164673cd497499fab0449a5eac4e8",
+    "test-workspace.mjs": "fe97ddeb0031a00dddca2c1bd4573721f97cb57f",
     "test-external-fixes.mjs": "be16cd3f50a5a17db5a340351902c4a7d29261c3",
     "test-audit-fixes.mjs": "6b62bdd436ea3e29bbfbf565ed8d789f42068537",
-    "test-e2e.mjs": "c05d38a35e0c427dfb29a21410221df5b7e287c2",
+    "test-e2e.mjs": "9455ce0bc2fdfd1b48a14d2ee6a3a7043396de2a",
     "test-store-corrupt.mjs": "5e475b0ecb3ae2e5f4e9c998fe8fc118a3ae67a1"
   },
   "red_baseline": {
@@ -15,14 +15,14 @@
     "test-e2e.mjs": "195/195 全绿(#44 后仍不回退)(#68a1 无凭据外带 [codely,usage] 转绿;新增 #68b1 无凭据 ?probe=1 必须 401 且无 upstream、#68b2 源码顺序守卫判权先于 getCodelyCliApiKey/requestCodelyLiteLLM——c837c9e 上 pass:false(iA=-1)、交付树 pass:true(iA<iK<iR) 已证非空洞;#42a0~a4/#36a*/#59a*/#50/#53/#48/#54/#37/#38/#39/#52 各段不回退)",
     "test-audit-fixes.mjs": "49/49 全绿(#42 J1-J4 与 E/F/G/H/I 结构锁不回退)",
     "test-unit.mjs": "41/41",
-    "test-workspace.mjs": "36/36",
+    "test-workspace.mjs": "44/44 全绿(#43 红集 b1/b2/b3/b4/c1 转绿 + 指挥官补的 b6/d1/d2 三把归因锁;既有锁 登记目录拒绝 deleteFiles=400、运行中不可删=409、受管目录可连同文件回收 零回退)",
     "test-external-fixes.mjs": "45/0(含 S-4/S-5/S-10 三条 README 锁,文档改动未碰它们)"
   },
   "source_faces": {
     "store.js": "69f6cd2116f19a2b6e93736bd4a34104c0be0381",
-    "server.js": "766669c90202686208b0b2f2f8c35585d7d08d7d",
+    "server.js": "f6558268ff41485828341399872fa1323633cbf6",
     "db.js": "1e2374cebcae2a8e0dcebce00a81ffa54424cc15",
-    "workspace-manager.js": "dfa3f24d0ae49cd03c85413ce27bea3adab5e571",
+    "workspace-manager.js": "58867b11c2d291824209dc010bbc9e2a167b48ea",
     "bridge-stdio.js": "e93e4fb7264862499e901609730eb2acc9d589c5",
     "tool-registry.js": "ab8e2b4ab2c0d9a3abe1a1cea14762973eec50c0",
     "tool-identity.js": "c3a69a85df0ba2c826fcfc62b58f66b6b4ef1880",
@@ -30,15 +30,15 @@
     "tools.json": "07adb6906589e86af00b697be8675ba40f1593a0",
     ".eslintrc.json": "f8735f334ba169e9af9a9efe0fb3773c3d58a549",
     "package.json": "b860aaee2d698b6b76d1117f0d4d87e3ea1ebe92",
-    "README.md": "4b8a755567da3d3cd3d8f712a70eb54ca7664f76",
-    "ARCHITECTURE.md": "942de2f9f5016e7b2cdc6a566831743959631060",
+    "README.md": "1502a184351a2e1c29807684374f2bfd371877a1",
+    "ARCHITECTURE.md": "3330d0c144ebcc60969f46c7da984f229f57ca2b",
     "ui.html": "354156232ef4bde9e9f85436f0cca549a29ab22b"
   },
   "source_faces_owner": {
     "store.js": "#44(f7eb239) SHAPES 契约 + assertShape 覆盖 load/loadList;(#52/afacc4c 点守卫保留)",
-    "server.js": "#68(00a7894) health 按鉴权态分视图 + ?probe=1 判权前置;(#41/#59/#50 面未回退)",
+    "server.js": "#43(289e017) toggle 未落盘回 503 + saveJSONSync 回传布尔;(#68/#41/#59 面未回退)",
     "db.js": "P0(d374ea7);#36 未加列——recordDispatch 用显式列名,多余字段安全忽略",
-    "workspace-manager.js": "T-A/B/C(621161e) 以来未变",
+    "workspace-manager.js": "#43(289e017) remove 先落盘后回收 + create/archive/restore 统一 trySaveState 区分拒写与写故障 + causeOf 有界归因",
     "bridge-stdio.js": "#36(ae58da1) skippedLabel 双形状兼容 + 汇总行抬入点名数 + 三处分母统一",
     "tool-registry.js": "#37(4094d20) 以来未变",
     "tool-identity.js": "T-A/B/C 系列以来未变(#36 未动)",
@@ -46,8 +46,8 @@
     "tools.json": "#35 待办,当前值 07adb690",
     ".eslintrc.json": "E2-lint(22)",
     "package.json": "E2-lint(22)",
-    "README.md": "#44 同轮文档同步(套件计数 389→403、store-corrupt 23→37、已根治补 #44、未修补 loadList 名实不符)",
-    "ARCHITECTURE.md": "#44 同轮文档同步(修复清单补 #44、测试面现状 403、未修清单去 #44)",
+    "README.md": "#43 同轮文档同步(415 项、workspace 44、e2e 199 与第四实例 9841、已根治补 #43、未修补 #72/#73/#74)",
+    "ARCHITECTURE.md": "#43 同轮文档同步(修复清单补 #43、测试面现状 415、未修清单去 #43 补 #72~#75)",
     "ui.html": "#42(765271c) withAuth 单一注入点 + 流式调用点凭据 + resp.ok 可读失败(此前全文件无任何凭据处理)"
   }
 }
