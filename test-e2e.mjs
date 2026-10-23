@@ -370,6 +370,80 @@ async function main () {
   try { probeProc.kill(); } catch { /* ignore */ }
   await sleep(400);
 
+  // 1.75) CLI 到底收到什么任务文本(#40 指定红集;靠 #80 接缝才可能端到端验)
+  //   实况 server.js:571-573:
+  //     const outboundTask = toolDef.type === 'client'
+  //       ? (opts.workspace ? withWorkspaceBrief(task, opts.workspace.path) : task)
+  //       : ((toolDef.type === 'client' && opts.workspace) ? withWorkspaceBrief(...) : task) + USAGE_REPORT_SUFFIX;
+  //   else 分支只在 type!=='client' 时走到,其内部却又判 toolDef.type === 'client' —— **恒假**,
+  //   于是 CLI 永远只拿到用量后缀,拿不到目录简报(而简报是"只在该目录内动文件"的唯一文字护栏;
+  //   cli-adapter 虽给了 cwd,但简报缺失对越界读写没有任何显式劝阻,且文档/注释都当它存在)。
+  //   验收面:探针 CLI 把自己**逐字节收到的 stdin** 以 base64 回吐 → 可断言"进程实收 == 台账所记 == 应有形状"。
+  section('CLI 拿不到工作区简报:#40 红集(第二实例)');
+  const P40_PORT = 9835;
+  const p40Dir = path.join(toolsDir, 'brief');
+  fs.mkdirSync(p40Dir, { recursive: true });
+  const p40ToolsPath = path.join(p40Dir, 'brief-tools.json');
+  const echoScript = "let s='';process.stdin.on('data',d=>{s+=d});process.stdin.on('end',()=>{"
+    + "console.log('ECHO|b64='+Buffer.from(s,'utf8').toString('base64')+'|cwd='+process.cwd())})";
+  fs.writeFileSync(p40ToolsPath, JSON.stringify([{
+    name: 'echo-cli',
+    displayName: 'Echo CLI',
+    description: '#40 探针:把实收 stdin 逐字节 base64 回吐',
+    transport: 'cli',
+    command: process.execPath,
+    // 绝对路径的可用位判定走设计内通道(见 #80a4 注释与 #81)
+    commandPaths: [process.execPath],
+    args: ['-e', echoScript],
+    inputMode: 'stdin',
+    outputMode: 'stdout-text',
+    timeout: 20000
+  }], null, 2), 'utf-8');
+
+  const p40Proc = spawnProbeHub(P40_PORT, { AI_BRIDGE_TOOLS_PATH: p40ToolsPath }, 'brief-hub');
+  await sleep(2200);
+  const p40Ws = await jreq(P40_PORT, 'POST', '/api/workspaces', { name: 'brief-ws', description: '#40 工作区' });
+  const p40WsPath = (p40Ws.body && p40Ws.body.path) || '';
+  const p40Dispatch = await jreq(P40_PORT, 'POST', '/api/dispatch', { task: '只写一个 hello.txt', tools: ['echo-cli'], workspace: 'brief-ws', auto_fallback: false });
+  await sleep(500);
+  const p40Out = String((p40Dispatch.body.results || [])[0]?.content || '');
+  const b64 = (p40Out.match(/b64=([A-Za-z0-9+/=]*)/) || [])[1] || '';
+  const received = b64 ? Buffer.from(b64, 'base64').toString('utf8') : '';
+  // 台账里的 tool 字段是工具 id(实测 `cli:echo-cli`),不是名字——用名字查会得到空结果(工装错而非缺陷)
+  const p40Trf = await jreq(P40_PORT, 'GET', '/api/traffic?tool=' + encodeURIComponent('cli:echo-cli') + '&direction=out&limit=10');
+  const logged = (p40Trf.body.traffic || []).map(t => t.content).filter(c => typeof c === 'string').pop() || '';
+
+  check('#40e1 前置:探针必须真跑到并回吐实收文本(此绿是下面各条的证据基础)',
+    p40Ws.status === 201 && (p40Dispatch.body.successCount || 0) === 1 && received.length > 0,
+    'ws=' + p40Ws.status + ' successCount=' + p40Dispatch.body.successCount + ' recvLen=' + received.length + ' out=' + p40Out.substring(0, 60));
+  check('#40e2 红:CLI 绑定工作区时,子进程实收任务文本必须含目录简报段,且简报路径就是该工作区绝对路径(现状:恒假分支让 CLI 永远收不到)',
+    received.includes('## 工作区目录') && received.includes(p40WsPath),
+    'wsPath=' + p40WsPath + ' recv=' + JSON.stringify(received.substring(0, 120)));
+  check('#40e3 红:同一次派发必须同时带 [USAGE] 自报后缀——简报与后缀不得互吞(现状:只有后缀)',
+    /\[USAGE\]/.test(received) && received.includes('## 工作区目录'),
+    'hasUsage=' + /\[USAGE\]/.test(received) + ' hasBrief=' + received.includes('## 工作区目录'));
+  const firstDiff = (a, b) => {
+    for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return i;
+    return Math.min(a.length, b.length);
+  };
+  check('#40e4 哨兵(单一写手):台账 out 记录必须与子进程实收文本逐字节相等——修任何一侧都必须同步另一侧',
+    logged.length > 0 && logged === received,
+    'loggedLen=' + logged.length + ' recvLen=' + received.length + ' 首处差异@' + firstDiff(logged, received));
+  const p40NoWs = await jreq(P40_PORT, 'POST', '/api/dispatch', { task: '不用工作区打个招呼', tools: ['echo-cli'], auto_fallback: false });
+  await sleep(400);
+  const out2 = String((p40NoWs.body.results || [])[0]?.content || '');
+  const recv2 = Buffer.from((out2.match(/b64=([A-Za-z0-9+/=]*)/) || ['', ''])[1], 'base64').toString('utf8');
+  check('#40e5 哨兵(防半修):CLI 不带 workspace 时不得出现简报段,但 [USAGE] 后缀必须照旧',
+    recv2.length > 0 && !recv2.includes('## 工作区目录') && /\[USAGE\]/.test(recv2),
+    'recv2=' + JSON.stringify(recv2.substring(0, 120)));
+  const srvSrc = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf-8').replace(/\r/g, '');
+  const ternaryBlock = (srvSrc.match(/const outboundTask[\s\S]{0,600}?;/) || [''])[0];
+  check('#40e6 结构兜底锁:outboundTask 的 else(CLI)分支内不得再出现 type===\'client\' 判据(恒假条件的机械指纹;主证是 e2/e3)',
+    ternaryBlock.length > 0 && !/:\s*\(\(\s*toolDef\.type === 'client'/.test(ternaryBlock),
+    '片段=' + JSON.stringify(ternaryBlock.substring(0, 180)));
+  try { p40Proc.kill(); } catch { /* ignore */ }
+  await sleep(400);
+
   // 1.8) 取走任务后不回结果,超时必须让任务态归位(#59 指定红集)
   //   实况:poll 取任务时置 taskPending=true(server.js:1709 立即支 / :1735 长轮询 interval 支),
   //   而 executeClient 的超时清理(:672-679)只清 pendingTask/pendingResolve/pendingReject/_busy,
@@ -626,12 +700,22 @@ async function main () {
   const wsDispatch = await req('POST', '/api/dispatch', { task: '写一个 Python cube(x) 函数', tools: [CLIENT], workspace: 'e2e-ws' });
   check('dispatch 绑定工作区成功', wsDispatch.body.successCount === 1 && wsDispatch.body.workspace?.name === 'e2e-ws', JSON.stringify(wsDispatch.body.workspace));
   check('exec 型客户端任务文本已注入工作区路径', lastSamplingTask.includes('## 工作区目录') && lastSamplingTask.includes(wsCreate.body.path), lastSamplingTask.slice(0, 120));
+  // #40 反向锁:出站文本收成单一写手时,最容易把 CLI 的用量后缀顺手抹到客户端上——
+  //   MCP sampling 已上报真实用量,追加自报后缀会污染对话(T5 既定豁免)。锁死该形状防"归一即抹平"。
+  check('#40e7 反向锁(不回退):exec 型客户端必须拿到简报但**不得**被追加 [USAGE] 自报后缀(T5 豁免)',
+    lastSamplingTask.includes('## 工作区目录') && !/\[USAGE\]/.test(lastSamplingTask), JSON.stringify(lastSamplingTask.slice(-120)));
   const wsDispatchNoExec = await req('POST', '/api/dispatch', { task: 'x', tools: [REVIEWER], workspace: 'e2e-ws', auto_fallback: false });
   check('sampling-only 客户端承接 workspace 任务被显式拒绝', wsDispatchNoExec.body.successCount === 0 && /推理型/.test(JSON.stringify(wsDispatchNoExec.body.results ?? wsDispatchNoExec.body)), JSON.stringify(wsDispatchNoExec.body.results?.[0] ?? wsDispatchNoExec.body).slice(0, 200));
   // 流量保真:准入拒绝必须发生在 'out' 记录之前(未发出的注入文本不得进流量);成功派发则必须如实记录注入后载荷
   await sleep(400);
   const trfCli = await req('GET', '/api/traffic?tool=' + encodeURIComponent('client:' + CLIENT) + '&direction=out&limit=100');
   check('成功派发的工作区注入简报已如实入流量', (trfCli.body.traffic || []).some(t => (t.content || '').includes('## 工作区目录')), JSON.stringify((trfCli.body.traffic || []).map(t => (t.content || '').slice(0, 40))).slice(0, 300));
+  // #40 单一写手(客户端路):出站任务文本目前在 server.js:572 与 :685 各组装一次(今天恰好等值)。
+  //   把组装收成一处时,最容易只改一侧 → 台账与实发漂移(比恒假分支更阴:一切"看起来成功"却记的不是发出去的字)。
+  const cliLogged = ((trfCli.body.traffic || []).slice().pop() || {}).content || '';
+  check('#40e8 哨兵(单一写手·客户端路):台账 out 内容必须与 exec 型客户端实收 sampling 文本逐字节相等',
+    cliLogged.length > 0 && cliLogged === lastSamplingTask,
+    'loggedLen=' + cliLogged.length + ' recvLen=' + lastSamplingTask.length + ' 首处差异@' + firstDiff(cliLogged, lastSamplingTask) + ' logged=' + JSON.stringify(cliLogged.slice(-60)));
   const trfRev = await req('GET', '/api/traffic?tool=' + encodeURIComponent('client:' + REVIEWER) + '&direction=out&limit=100');
   check('被拒的 workspace 派发不产生假发出流量', !(trfRev.body.traffic || []).some(t => (t.content || '').includes('## 工作区目录')), JSON.stringify((trfRev.body.traffic || []).map(t => (t.content || '').slice(0, 40))).slice(0, 300));
   const wsAfterUse = await req('GET', '/api/workspaces');
