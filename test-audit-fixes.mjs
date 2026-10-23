@@ -171,13 +171,15 @@ section('F) 超时预算关系锁(#53/#48)');
 {
   const srv = fs.readFileSync('./server.js', 'utf-8');
   const br = fs.readFileSync('./bridge-stdio.js', 'utf-8');
-  const sm = srv.match(/EXECUTE_TIMEOUT:\s*parseInt\([^)]*\)\s*\|\|\s*(\d+)/);
+  // 兜底值的两种写法都必须认:旧式 parseInt(env)||N 与新式 parsePositiveInt(env,N)(#49 的目标形态)。
+  // 只认一种就会"照规格修完反而判红"(锁与规格互斥,#47 那次同款病)——取语句末尾那个数字。
+  const sm = srv.match(/EXECUTE_TIMEOUT:[^\n]*?(\d+)\s*\)?[,;]/);
   const S = sm ? Number(sm[1]) : NaN;
   check('F0 能解析中枢单次执行窗口(server.js CONFIG.EXECUTE_TIMEOUT 兜底值)', Number.isFinite(S) && S > 0, `S=${S}`);
   // 数值解析器:默认值可以写字面量,也可以写共享常量标识符(鼓励后者:GET/POST/总超时同源)
   const resolveDefault = (expr) => {
     if (/^\d+$/.test(expr)) return Number(expr);
-    const m2 = br.match(new RegExp('(?:const|let|var)\\s+' + expr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*=\\s*[^;]*?\\|\\|\\s*(\\d+)'));
+    const m2 = br.match(new RegExp('(?:const|let|var)\\s+' + expr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*=\\s*[^;]*?(\\d+)\\s*\\)?;'));
     return m2 ? Number(m2[1]) : NaN;
   };
   const pm = br.match(/function\s+httpPost\s*\([^)]*?timeoutMs\s*=\s*(\d+|[A-Za-z_$][\w$]*)/);
@@ -190,7 +192,10 @@ section('F) 超时预算关系锁(#53/#48)');
   // F3:env 必须被读取且**同步类预算**的兜底值要包住中枢窗口。
   //   注意取 matchAll 的最大值而不是首个:GET 允许有独立的短兜底(poll 快速失败是自愈路径的关键,
   //   若把 GET 默认也抬到 960s,#38a 的黑洞测试会从 30010ms 变成永久悬空 → 制造回归)。
-  const ems = [...br.matchAll(/AI_BRIDGE_HTTP_TIMEOUT[^)\n]*\)?\s*\|\|\s*(\d+)/g)].map(m => Number(m[1]));
+  const brCode = br.split('\n').filter(l => !/^\s*(\/\/|\*)/.test(l)).join('\n');
+  const ems = [...brCode.matchAll(/^.*AI_BRIDGE_HTTP_TIMEOUT.*$/gm)]
+    .map(mm => { const n = mm[0].match(/(\d+)\s*\)?[;,]/); return n ? Number(n[1]) : NaN; })
+    .filter(Number.isFinite);
   const BMAX = ems.length ? Math.max(...ems) : NaN;
   check('F3 预算必须可用 AI_BRIDGE_HTTP_TIMEOUT 配置,且同步类兜底值同样包住中枢窗口(GET 可另设更短兜底)',
     ems.length > 0 && BMAX >= S + 30000, ems.length ? `候选兜底=[${ems.join(',')}] 取最大=${BMAX} 窗口=${S}` : '桥侧未读取 AI_BRIDGE_HTTP_TIMEOUT');
