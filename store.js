@@ -50,28 +50,93 @@ function quarantine (key, reason) {
   appendLog('error', `存储文件 ${path.basename(FILES[key])} 损坏(${bakInfo};原因: ${reason}),本进程内拒绝覆写`);
 }
 
+// 每 key 的字段形状契约(#44)。只对"文件里实际存在的字段"检查类型,缺失属合法稀疏,
+// 由 loadMemory/loadACL 的补字段逻辑处理;switches/stats 只锁顶层,值类型语义留给 #45/#46。
+// 为什么不在这里对数组元素设卡:历史数据里的 results/fallbackLog 内部字段演化过多次,
+// 硬加"每元素必须含 X/Y"会误拒在用文件,把可用状态打成隔离状态。
+const SHAPES = {
+  memory: { tasks: 'array', experiences: 'array', meetings: 'array', preferences: 'object' },
+  acl: { allowlist: 'array', blocklist: 'array', pending: 'array' },
+  workspaces: { workspaces: 'array' },
+  switches: {},
+  stats: {}
+};
+
+// 判定 data 是否符合 key 的形状契约:顶层必须是 plain object,声明字段存在时必须类型正确。
+// 返回 true=合法;false=非法(调用方须按"解析失败同口径"处理:quarantine + 返回空结构)。
+// 为什么单独抽出来:#44 的三种真实恶果(字段类型错/容器类型错/顶层类型错)都是"能解析但形状错"
+// ——loadMemory/loadACL 的补字段逻辑对 primitive/null 要么抛 TypeError 要么静默丢弃,
+// 两者都会让守卫绕过,把在用的真实数据洗掉。守卫必须同时覆盖 load 与 loadList 两个入口,
+// 不在调用方散落补丁(避免 #52 那种"只给 meetings 一个点"的补丁式回归)。
+function assertShape (key, data) {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
+  const fields = SHAPES[key];
+  if (!fields) return true; // 未知 key(logs/traffic 等)只把顶层,不引入本单未规定的约束
+  for (const name of Object.keys(fields)) {
+    if (!(name in data)) continue; // 缺失:合法稀疏,由补字段逻辑负责
+    const v = data[name];
+    const kind = fields[name];
+    if (kind === 'array') {
+      if (!Array.isArray(v)) return false;
+    } else if (kind === 'object') {
+      if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+    }
+  }
+  return true;
+}
+
+function shapeReason (key, data) {
+  if (typeof data !== 'object' || data === null) return '顶层非对象(null/primitive/函数)';
+  if (Array.isArray(data)) return '顶层为数组(须 plain object)';
+  const fields = SHAPES[key] || {};
+  for (const name of Object.keys(fields)) {
+    if (!(name in data)) continue;
+    const v = data[name];
+    const kind = fields[name];
+    if (kind === 'array' && !Array.isArray(v)) return `${name} 字段形状非法(须为数组)`;
+    if (kind === 'object' && (typeof v !== 'object' || v === null || Array.isArray(v))) return `${name} 字段形状非法(须为 plain object)`;
+  }
+  return '形状非法';
+}
+
 function load (key) {
   const f = FILES[key];
   if (!f || !fs.existsSync(f)) return {}; // 文件不存在:合法的空,不是损坏,不隔离
+  let parsed;
   try {
-    return JSON.parse(fs.readFileSync(f, 'utf-8'));
+    parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
   } catch (e) {
     // 读不确定即不覆写:解析失败与 EBUSY/EPERM 之类的读错误同等对待,保守保全
     quarantine(key, e.message);
     return {}; // 仍返回空结构保住可用性,绝不抛错
   }
+  // #44:能解析但形状非法(字段类型/容器/顶层三种错)与解析失败同口径,
+  // 保守保全+拒写,绝不抛错(调用方在业务路径与启动序列上,抛错会把保守策略升级成故障)。
+  if (!assertShape(key, parsed)) {
+    quarantine(key, shapeReason(key, parsed));
+    return {};
+  }
+  return parsed;
 }
 
 function loadList (key) {
   const f = FILES[key];
   if (!f || !fs.existsSync(f)) return []; // 文件不存在:合法的空,不是损坏,不隔离
+  let parsed;
   try {
-    return JSON.parse(fs.readFileSync(f, 'utf-8'));
+    parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
   } catch (e) {
     // 读不确定即不覆写:解析失败与读错误同等处理,保全后返回空列表
     quarantine(key, e.message);
     return [];
   }
+  // #44:loadList 与 load 用同一把尺子(否则绕过 load 直用 loadList 的调用方还能触发洗库);
+  // 该函数目前未导出、无外部调用方,收紧校验不影响任何现有测试。
+  if (!assertShape(key, parsed)) {
+    quarantine(key, shapeReason(key, parsed));
+    return [];
+  }
+  return parsed;
 }
 
 async function save (key, data) {
