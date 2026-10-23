@@ -292,6 +292,21 @@ async function callTool (name, args) {
   } finally { if (timer) clearTimeout(timer); }
 }
 
+// #36:skipped 归一渲染。旧记录是裸名字数组(string[]),新记录是 { ref, reason }[],
+// 两种形状都要能吃;对象项渲染成「名字(原因)」,直接 join 会输出 [object Object]。
+function skippedLabel (list) {
+  if (!Array.isArray(list) || list.length === 0) return '';
+  return list.map(item => {
+    if (typeof item === 'string') return item;
+    if (item && typeof item === 'object') {
+      const ref = item.ref === undefined || item.ref === null ? '?' : String(item.ref);
+      return item.reason ? `${ref}(${item.reason})` : ref;
+    }
+    // null/数字等畸形项:如实渲染其字面值,不假造名字
+    return (item === null || item === undefined) ? '' : String(item);
+  }).filter(Boolean).join(', ');
+}
+
 async function dispatchToolCall (name, args) {
   switch (name) {
   case 'dispatch': {
@@ -314,8 +329,12 @@ async function dispatchToolCall (name, args) {
       lines.push('\n---\n⚡ 故障转移:');
       r.fallbackLog.forEach(f => lines.push(`  ${f.from}→${f.to} ${f.success ? '✅' : '❌'}${f.skipped ? '(' + f.skipped + ')' : ''}`));
     }
-    lines.push(`\n📊 ${r.totalTokens} tokens | ${r.successCount}/${r.total} 成功`);
-    if (r.skipped && r.skipped.length > 0) lines.push(`⚠️ 跳过(关闭): ${r.skipped.join(', ')}`);
+    // #36:分母口径统一——被跳过的点名目标不得被汇总行的 total 掩盖。
+    // 有跳过项时把点名请求数(requested)抬进汇总行;旧响应/旧中枢没有该字段时用 total 兜底,绝不打印 undefined。
+    const skippedTxt = skippedLabel(r.skipped);
+    const requestedN = (r.requested === undefined || r.requested === null) ? r.total : r.requested;
+    lines.push(`\n📊 ${r.totalTokens} tokens | ${r.successCount}/${r.total} 成功${skippedTxt ? `(点名 ${requestedN})` : ''}`);
+    if (skippedTxt) lines.push(`⚠️ 跳过(${r.skipped.length} 个): ${skippedTxt}`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
   case 'list_tools': {
@@ -379,7 +398,9 @@ async function dispatchToolCall (name, args) {
     const lines = ['# 🔍 记忆搜索\n'];
     if (r.tasks?.length > 0) {
       lines.push('## 任务历史');
-      r.tasks.forEach(t => lines.push(`- [${t.ts}] "${t.task}" → ${t.successCount}/${t.results?.length || 0} 成功, ${t.totalTokens} tokens`));
+      // #36:分母口径统一为 total(与 dispatch 汇总行同源);store.recordTask 目前不落 total,
+      // 旧记录(现存 136 条全部无 total)以 results 长度回退,避免渲染出 1/undefined 的新谎言。
+      r.tasks.forEach(t => lines.push(`- [${t.ts}] "${t.task}" → ${t.successCount}/${t.total || (t.results || []).length || 0} 成功, ${t.totalTokens} tokens`));
     }
     if (r.experiences?.length > 0) {
       lines.push('\n## 经验记录');
@@ -394,7 +415,7 @@ async function dispatchToolCall (name, args) {
     const lines = ['# 📋 最近任务\n'];
     (r.tasks || []).forEach(t => {
       lines.push(`[${t.ts}] "${t.task}"`);
-      lines.push(`  工具: ${(t.tools || []).join(', ')} | ${t.successCount}/${t.results?.length || 0} 成功 | ${t.totalTokens} tokens`);
+      lines.push(`  工具: ${(t.tools || []).join(', ')} | ${t.successCount}/${t.total || (t.results || []).length || 0} 成功 | ${t.totalTokens} tokens`);
       if (t.fallbackLog?.length) lines.push(`  ⚡ ${t.fallbackLog.map(f => `${f.from}→${f.to}`).join(', ')}`);
       lines.push('');
     });

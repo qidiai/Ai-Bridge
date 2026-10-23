@@ -702,6 +702,16 @@ async function executeClient (clientName, task, opts = {}) {
   });
 }
 
+// #36:skipped 的归因文案。只返回字符串,不参与 no_targets 归因块(:812-847)的判定结构
+// (那块内的 named 与「点名目标:」模板原样保留)。文案与 #50 归因块的同名字面严格一致,不另造同义词。
+function skippedTargetReason (ref, availableTools) {
+  const tool = resolveToolReference(ref, availableTools);
+  // 可解析且处于禁用态:skipped 今天的唯一定义性来源(与 #50 归因块内同名分支同字面)
+  if (tool && !isToolEnabled(tool)) return '已被开关禁用';
+  // 归因瞬间已不满足上述条件(开关/集合并发翻转):只说不宣称能力的事实,复用 #50 同名字面
+  return '状态在并发中变化(选中后可调度集合已改变)';
+}
+
 async function doDispatch (task, toolNames, autoFallback = true, context = '', withReview = false, reviewerPref = null, workspaceRef = null, fallbackScope = 'auto', modelOverride = null) {
   // 入参校验
   if (!task || typeof task !== 'string') return { error: '缺少 task 参数', code: 'invalid_request' };
@@ -802,10 +812,15 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
       };
     }
     targets = [...new Set(targets)];
+    // #36:被跳过者必须带原因(裸名字数组只告诉宿主"没跑",不告诉"为什么没跑")。
+    // 入选条件与升级前逐字一致(可解析 && 已禁用),只把形状从 ref 换成 { ref, reason }。
     const skipped = (toolNames || []).filter(ref => {
       const tool = resolveToolReference(ref, availableTools);
       return tool && !isToolEnabled(tool);
-    });
+    }).map(ref => ({ ref, reason: skippedTargetReason(ref, availableTools) }));
+    // #36:点名请求数。未点名(自动路由,含 tools 传空数组/非数组被硬化为 null)时取 targets.length,
+    // 绝不输出 requested:0 这种比现状更误导的值。total 的语义与取值一律不动(仍 = targets.length)。
+    const requested = (Array.isArray(toolNames) && toolNames.length > 0) ? toolNames.length : targets.length;
 
     if (targets.length === 0) {
       // F3/#50a4:归因分"点名派发/自动路由"两条路径,先判有没有点名再下结论,防单模板把两类真因混成一句谎话
@@ -966,12 +981,12 @@ async function doDispatch (task, toolNames, autoFallback = true, context = '', w
     // 记录任务到记忆 + 日志 + 全局库写穿
     const elapsedMs = Date.now() - dispatchStart;
     const workspaceInfo = workspace ? { id: workspace.id, name: workspace.name, path: workspace.path } : null;
-    const taskRecord = { id: `task_${Date.now()}`, dispatchId, results, successCount, total: targets.length, totalTokens, fallbackLog, skipped, task: task.substring(0, 200), tools: targets, routing, workspace: workspaceInfo };
+    const taskRecord = { id: `task_${Date.now()}`, dispatchId, results, successCount, requested, total: targets.length, totalTokens, fallbackLog, skipped, task: task.substring(0, 200), tools: targets, routing, workspace: workspaceInfo };
     store.recordTask(taskRecord);
     db.recordDispatch({ ...taskRecord, elapsedMs });
     if (successCount > 0) METRICS.dispatchSuccess++; else METRICS.dispatchFail++;
     log('info', `dispatch 完成: ${successCount}/${targets.length} 成功, ${totalTokens} tokens`, { dispatchId, tools: targets, successCount, totalTokens, elapsedMs });
-    return { dispatchId, results, successCount, total: targets.length, totalTokens, elapsedMs, fallbackLog, skipped, routing, workspace: workspaceInfo, ...(review ? { review } : {}) };
+    return { dispatchId, results, successCount, requested, total: targets.length, totalTokens, elapsedMs, fallbackLog, skipped, routing, workspace: workspaceInfo, ...(review ? { review } : {}) };
   } finally {
     if (workspaceLease) workspaceManager.endRun(workspace.id, workspaceLease.runId);
     activeDispatches.delete(dispatchId);
