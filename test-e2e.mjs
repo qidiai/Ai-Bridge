@@ -274,6 +274,96 @@ async function main () {
   try { bootProc.kill(); } catch { /* ignore */ }
   await sleep(400);
 
+  // 1.7) 注册表配置文件路径接缝(#80 指定红集;它是 #40 唯一"真链路且零网络"的验收前提)
+  //   实况:tool-registry.js:98 `configPath = path.join(__dirname, 'tools.json')` 硬编码,
+  //   测试不能在不触碰生产 tools.json 的前提下把一个本地假 CLI 塞进**真派发链路**
+  //   (CliAdapter 单测只能证明适配器,证明不了 executeTool 里的出站文本组装)。
+  //   于是 #40 这类"CLI 侧拿不拿得到工作区简报"的缺陷只剩源码结构锁可依赖(弱),
+  //   #79 的假上游接缝同样卡在这类"路径不可注入"上。
+  //   要求:AI_BRIDGE_TOOLS_PATH 存在时按该文件装载;**未设时行为逐字节不变**(生产中性)。
+  section('注册表路径接缝缺失:#80 红集(第二实例)');
+  const TOOLS_PORT_DEF = 9833;
+  const TOOLS_PORT_PROBE = 9834;
+  const toolsDir = path.join(TEST_RUNTIME, 'tools-probe');
+  const probeToolsPath = path.join(toolsDir, 'probe-tools.json');
+  fs.mkdirSync(toolsDir, { recursive: true });
+  // 探针 CLI 把收到的任务文本如实回吐成一行可判读的标记(纯本地 node -e,零网络零配额)
+  const probeScript = "let s='';process.stdin.on('data',d=>{s+=d});process.stdin.on('end',()=>{"
+    + "const m=s.match(/## 工作区目录\\r?\\n([^\\r\\n]*)/);"
+    + "console.log('PROBE|len='+s.length+'|brief='+(s.indexOf('## 工作区目录')>=0)"
+    + "+'|suffix='+(s.indexOf('[USAGE]')>=0)+'|wsline='+(m?m[1]:'none')+'|cwd='+process.cwd())})";
+  fs.writeFileSync(probeToolsPath, JSON.stringify([{
+    name: 'probe-cli',
+    displayName: 'Probe CLI',
+    description: '#80 零网络探针 CLI(把收到的任务文本回吐成标记)',
+    transport: 'cli',
+    command: process.execPath,
+    args: ['-e', probeScript],
+    inputMode: 'stdin',
+    outputMode: 'stdout-text',
+    timeout: 20000
+  }], null, 2), 'utf-8');
+
+  const jreq = (port, method, urlPath, body) => new Promise((resolve) => {
+    const data = body === undefined ? null : JSON.stringify(body);
+    const headers = data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {};
+    const r = http.request({ hostname: HOST, port, path: urlPath, method, timeout: 15000, headers }, res => {
+      let s = ''; res.on('data', c => s += c); res.on('end', () => { let j = null; try { j = JSON.parse(s); } catch (_) { j = { raw: s.substring(0, 120) }; } resolve({ status: res.statusCode, body: j }); });
+    });
+    r.on('error', e => resolve({ status: 0, body: { err: e.message } }));
+    r.on('timeout', () => { r.destroy(); resolve({ status: 0, body: { err: 'timeout' } }); });
+    if (data) r.write(data);
+    r.end();
+  });
+
+  const spawnProbeHub = (port, extraEnv, dirName) => {
+    const dir = path.join(toolsDir, dirName);
+    fs.mkdirSync(dir, { recursive: true });
+    const proc = spawn(process.execPath, ['server.js'], {
+      cwd: __dirname,
+      env: {
+        ...process.env, AI_BRIDGE_PORT: String(port), AI_BRIDGE_HOST: HOST,
+        AI_BRIDGE_DATA_DIR: dir, AI_BRIDGE_DB: path.join(dir, 'probe.db'),
+        AI_BRIDGE_OBSERVE_DIR: path.join(dir, 'observe'),
+        AI_BRIDGE_WORKSPACE_ROOT: path.join(dir, 'ws'), AI_BRIDGE_TOKEN: '',
+        ...extraEnv
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    proc.stderr.on('data', () => {}); proc.stdout.on('data', () => {});
+    return proc;
+  };
+
+  // ① 默认(未设 env):注册表必须仍读仓库内 tools.json —— 生产中性哨兵,现在就该绿,修完也必须绿
+  const defProc = spawnProbeHub(TOOLS_PORT_DEF, {}, 'default');
+  await sleep(2200);
+  const defTools = await jreq(TOOLS_PORT_DEF, 'GET', '/api/tools');
+  const defNames = (defTools.body.tools || []).map(t => t.name || t.id);
+  check('#80a1 哨兵:未设 AI_BRIDGE_TOOLS_PATH 时注册表照旧读到仓库内 tools.json(生产中性,须全程为绿)',
+    defTools.status === 200 && defNames.includes('openclaw'), 'count=' + defNames.length + ' names=' + defNames.slice(0, 6).join(','));
+  try { defProc.kill(); } catch { /* ignore */ }
+  await sleep(400);
+
+  // ② 设 env:注册表必须改读隔离文件(现状:env 被无视 → 仍是生产 12 工具)
+  const probeProc = spawnProbeHub(TOOLS_PORT_PROBE, { AI_BRIDGE_TOOLS_PATH: probeToolsPath }, 'probe');
+  await sleep(2200);
+  const probeTools = await jreq(TOOLS_PORT_PROBE, 'GET', '/api/tools');
+  const probeNames = (probeTools.body.tools || []).map(t => t.name || t.id);
+  check('#80a2 设 AI_BRIDGE_TOOLS_PATH 后注册表必须按该文件装载(现状:env 无效,静态工具仍来自仓库 tools.json)',
+    probeNames.includes('probe-cli') && !probeNames.includes('openclaw'), 'names=' + probeNames.slice(0, 8).join(','));
+  check('#80a3 载入诊断必须如实报出实际使用的文件名(现状:恒报 tools.json,派发失败时无法归因到配置源)',
+    /probe-tools\.json/.test(JSON.stringify(probeTools.body)), JSON.stringify(probeTools.body.registry || probeTools.body.diag || probeTools.body.stats || '').substring(0, 160));
+
+  // ③ 真链路:点名派发探针 CLI 并绑定工作区(现状因 #80a2 未满足而必然失败)
+  const pWs = await jreq(TOOLS_PORT_PROBE, 'POST', '/api/workspaces', { name: 'probe-ws', description: '#80 探针工作区' });
+  const pDispatch = await jreq(TOOLS_PORT_PROBE, 'POST', '/api/dispatch', { task: '说一句你好', tools: ['probe-cli'], workspace: 'probe-ws', auto_fallback: false });
+  const pOut = String((pDispatch.body.results || [])[0]?.content || '');
+  check('#80a4 哨兵:探针 CLI 必须真能被点名派发并执行(零网络;此绿是 #40 端到端验收的前提)',
+    pWs.status === 201 && (pDispatch.body.successCount || 0) === 1 && /PROBE\|len=/.test(pOut),
+    'ws=' + pWs.status + ' successCount=' + pDispatch.body.successCount + ' out=' + pOut.substring(0, 90) + ' err=' + JSON.stringify((pDispatch.body.results || [])[0]?.error || '').substring(0, 60));
+  try { probeProc.kill(); } catch { /* ignore */ }
+  await sleep(400);
+
   // 1.8) 取走任务后不回结果,超时必须让任务态归位(#59 指定红集)
   //   实况:poll 取任务时置 taskPending=true(server.js:1709 立即支 / :1735 长轮询 interval 支),
   //   而 executeClient 的超时清理(:672-679)只清 pendingTask/pendingResolve/pendingReject/_busy,
