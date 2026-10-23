@@ -34,6 +34,8 @@ const db = require('./db');
 const observe = require('./observe');
 const { cleanupStaleTaskDirs } = require('./output-cleaner.js');
 const { USAGE_REPORT_SUFFIX, parseUsageReport } = require('./usage-reporter');
+// #47 流式命中缓存的 SSE 合成器(纯函数零依赖;行为锁 test-unit #47a0~a6)
+const { isReplayableJson, sseFromChatJson } = require('./sse-replay');
 
 // ── #46 tools.json 降级留痕:加载期损坏只降级功能、不拦进程起来;但"静态工具缺席"这一事实必须进可查账本 ──
 //   落账必须在 server.js 做:tool-registry 不得为此依赖 store(#46a4 —— bridge-stdio 也 require 它,
@@ -225,6 +227,10 @@ const CACHE_TTL = parsePositiveInt(process.env.AI_BRIDGE_CACHE_TTL, 10 * 60 * 10
 const CACHE_MAX = parsePositiveInt(process.env.AI_BRIDGE_CACHE_MAX, 100);
 const _respCache = new Map(); // key → { value(Buffer), at }
 function cacheKey (modelId, body) {
+  // #47 明确决定:cacheKey **不按 stream 分键**。缓存值只存非流式 chat.completion JSON
+  // (唯一写入口 `if (!isStream) cacheSet`),流式命中由 sse-replay 合成器负责适配 →
+  // 非流式与流式互相受益(流式请求可白吃非流式预热过的缓存)。后人勿"补"stream 进键,
+  // 那会让两侧缓存互相隔离、并让当前共享设计的行为锁(#47a5)失去意义。
   const stable = { model: body.model, messages: body.messages, temperature: body.temperature, top_p: body.top_p, max_tokens: body.max_tokens };
   return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex');
 }
@@ -242,7 +248,8 @@ function cacheSet (key, value) {
 
 // ── Codely LiteLLM 转发(流式/非流式;401/403 时换新 key 重试一次,应对服务端密钥轮换) ──
 // ctx: { res, reqPath, reqData, messages, model, taskId, isStream, cliKey, retried }
-// 非流式 200 响应写入幂等缓存;流式命中缓存时直接合成单块 SSE 回放
+// 非流式 200 响应写入幂等缓存;流式命中且缓存体可回放时由 sse-replay 合成多帧 SSE(#47),
+// 不可回放则在命中分支逐出缓存后继续走本函数正常转发(见上方 if (cached) 块)
 function forwardCodelyLiteLLM (ctx) {
   const { res, reqPath, reqData, messages, model, taskId, isStream } = ctx;
   const headers = buildCodelyHeaders(reqPath, ctx.cliKey, reqData);
@@ -2116,21 +2123,28 @@ const server = http.createServer(async (req, res) => {
       if (model.transport === 'codely-http') {
         const fwdBody = { ...body, model: model.upstreamModel || model.id };
         const reqData = JSON.stringify(fwdBody);
-        // 幂等缓存命中:非流式直接回放;流式合成单块 SSE(省上游调用,免费额度有限时价值明显)
+        // 幂等缓存命中(#47 语义,只有可回放才短路返回):
+        //   非流式 → 原字节回放;流式且缓存体可回放 → sse-replay 合成合法 SSE 回放;
+        //   流式但缓存体不可回放 → 逐出该条缓存、继续走下方正常转发(绝不因缓存坏向用户报错)
         const ck = cacheKey(model.id, fwdBody);
         const cached = cacheGet(ck);
         if (cached) {
-          if (isStream) {
-            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Cache': 'HIT' });
-            res.write(cached.value);
-            res.write('data: [DONE]\n\n');
-            res.end();
-          } else {
+          if (!isStream) {
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'X-Cache': 'HIT' });
             res.end(cached.value);
+            db.recordEvent({ source: 'bridge', channel: 'cache', type: 'llm_request', model: model.id, detail: 'cache HIT' });
+            return;
           }
-          db.recordEvent({ source: 'bridge', channel: 'cache', type: 'llm_request', model: model.id, detail: 'cache HIT' });
-          return;
+          if (isReplayableJson(cached.value)) {
+            // 合成器契约见 sse-replay.js:帧帧带 data: 前缀、usage 原样透传、末帧 [DONE]
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Cache': 'HIT' });
+            res.write(sseFromChatJson(cached.value, { model: model.id }));
+            res.end();
+            db.recordEvent({ source: 'bridge', channel: 'cache', type: 'llm_request', model: model.id, detail: 'cache HIT' });
+            return;
+          }
+          // 不可回放(坏形状/旧格式/tool_calls):逐出缓存回落到正常转发,不带 X-Cache
+          _respCache.delete(ck);
         }
         try {
           const cliKey = await getCodelyCliApiKey();
