@@ -281,6 +281,29 @@ try {
   check('H 段用例执行未抛异常', false, e.message);
 }
 
+// ── I) 桥侧汇总口径不得有三种分母、不得把对象直接 join(#36 结构锁,指挥官亲笔) ──
+// 同一句"N/M 成功"在 bridge-stdio.js 里有三处实现::317 用 r.total(dispatch 响应),
+// :382 与 :397 用 t.results?.length(历史/任务列表)。今天它们数值相等所以不显形;一旦 #36
+// 让"被跳过的点名目标"进入显著信号,三处会立刻分叉——同一规则多处实现正是 #38/#49 的根因族。
+// 另外 :318 现在对 skipped 直接 .join(', '):skipped 由 string[] 升级为 {ref,reason}[] 后,
+// join 会渲染成 "[object Object]",把一个修好的归因问题换成一个更糟的展示缺陷。
+// 故锁:①禁止再用 results.length 当分母;②禁止对 skipped 直接 join;③汇总文案必须能体现点名请求数。
+section('I) 桥侧汇总口径统一(#36)');
+{
+  const br = fs.readFileSync('./bridge-stdio.js', 'utf-8');
+  const thirdDenom = br.match(/successCount\}\/\$\{[^}]*results\?\.length/g) || [];
+  check('I1 不得存在第三种分母(历史视图用 results.length 而非 total)', thirdDenom.length === 0, `命中 ${thirdDenom.length} 处: ` + thirdDenom.map(s => s.substring(0, 50)).join(' | '));
+  check('I2 skipped 不得被直接 join(升级为对象数组后会渲染成 [object Object])', !/skipped\.join\(/.test(br), (br.match(/[^\n]*skipped\.join\([^\n]*/) || ['(无)'])[0].trim().substring(0, 120));
+  // I3 收紧版:必须在 dispatch 工具的渲染区间里引用"点名请求数",且不接受 requestedAt(待审批时间)
+  // 这类无关子串——首版我写的是全文 /requested/,被 :480 的 pd.requestedAt 蒙成假绿,已认。
+  const dStart = br.indexOf("case 'dispatch'");
+  const dEnd = br.indexOf("case '", dStart + 5);
+  const dBlock = dStart >= 0 ? br.slice(dStart, dEnd > dStart ? dEnd : br.length) : '';
+  const reqRef = dBlock.replace(/requestedAt/g, '').match(/\brequested\b/);
+  check('I3 dispatch 汇总文案必须体现点名请求数(否则"1/1 成功"继续掩盖"点名 2 个只跑 1 个")',
+    dStart >= 0 && !!reqRef, dStart < 0 ? '未定位到 dispatch 分支' : `dispatch 渲染块长度=${dBlock.length},块内 requested 命中=${!!reqRef}`);
+}
+
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
 
 console.log('\n========================================');

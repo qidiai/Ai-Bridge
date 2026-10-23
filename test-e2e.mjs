@@ -1059,6 +1059,44 @@ async function main () {
     !!errRow && errRow.success === false, errRow ? JSON.stringify({ success: errRow.success, len: (errRow.content || '').length }) : '未找到对应入向流量行');
   check('#37e 失败条目必须保留正文(可短于成功态上限,但不得为空)',
     typeof errR.content === 'string' && errR.content.includes('Go usage limit exceeded'), '失败态 content=' + JSON.stringify((errR.content || '').substring(0, 60)));
+
+  // 9.12) 点名派发中被跳过的目标必须诚实呈现(#36 指定红集)
+  //   实况:targets 只收"可解析且已启用"的工具(server.js:765-770),而"可解析但被禁用"的落进
+  //   skipped(:804-807)。响应的 total = targets.length(:973)→ 被跳过者**不进分母**。
+  //   于是点名 2 个只跑 1 个时,桥侧汇总行仍是「1/1 成功」(bridge-stdio.js:317),真实情况只在
+  //   其后一行小字「⚠️ 跳过(关闭): …」(:318)——宿主模型读到的显著信号是那个撒谎的分母。
+  //   且 skipped 只有裸名字,没有原因(是被关掉?还是没资格?),与 #50 已根治的 no_targets 归因
+  //   形成双重标准。本段锁三件事:请求数可见、被跳过者带原因、分母不再掩盖。
+  //   放在套件最末:此处 CLI 工具已被智能路由段禁用,天然是"可解析但被禁用"的来源;且禁用态
+  //   由本段自己显式设定并逐字复位,不依赖前一段的副作用(上一格 #37 因插入位置污染过路由评分,
+  //   教训在前)。
+  section('被跳过的点名目标必须诚实呈现:#36 红集');
+  {
+    const allTools36 = (await req('GET', '/api/tools')).body.tools || [];
+    // 选一个"检测得到、但可被禁用"的 CLI 工具作为被跳过者(不硬编码名字,防工具清单变动后失真)
+    const cliCand = allTools36.find(t => t.type !== 'client' && t.name !== CLIENT && t.name !== REVIEWER && t.available);
+    check('#36a0 存在可解析的 CLI 工具作为被跳过样本(否则本段无从取证)', !!cliCand, JSON.stringify(cliCand && { name: cliCand.name, enabled: cliCand.enabled }));
+    if (cliCand) {
+      const wasEnabled = cliCand.enabled !== false;
+      try {
+        await req('POST', '/api/toggle', { tool: cliCand.name, enabled: false });
+        const d36 = await req('POST', '/api/dispatch', { task: '#36 点名两个:一个可跑一个已禁用 SKIP_36_MARK', tools: [CLIENT, cliCand.name], auto_fallback: false });
+        const b36 = d36.body || {};
+        check('#36a1 响应必须带点名总数 requested(=2),且 total 仍为实际被调度数(=1)',
+          b36.requested === 2 && b36.total === 1, JSON.stringify({ requested: b36.requested, total: b36.total, successCount: b36.successCount }).substring(0, 180));
+        const sk = b36.skipped || [];
+        check('#36a2 skipped 必须是带原因的结构(被禁用者要点名"禁用",不得只留裸名字)',
+          sk.length === 1 && sk[0] && typeof sk[0] === 'object' && sk[0].ref === cliCand.name && /禁用/.test(String(sk[0].reason || '')),
+          JSON.stringify(sk).substring(0, 200));
+        check('#36a3 被跳过者不得混进成功分母:实际执行数必须是 1 且跳过者无执行结果',
+          b36.successCount === 1 && (b36.results || []).length === 1 && !(b36.results || []).some(r => r.tool === cliCand.name),
+          JSON.stringify({ successCount: b36.successCount, results: (b36.results || []).map(r => r.tool) }).substring(0, 180));
+      } finally {
+        // 逐字复位,不给后续任何段落留副作用(本段虽在最末,复位纪律不变)
+        if (wasEnabled) await req('POST', '/api/toggle', { tool: cliCand.name, enabled: true }).catch(() => {});
+      }
+    }
+  }
 }
 
 async function cleanup () {
