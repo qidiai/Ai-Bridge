@@ -298,6 +298,12 @@ async function main () {
     description: '#80 零网络探针 CLI(把收到的任务文本回吐成标记)',
     transport: 'cli',
     command: process.execPath,
+    // 我(指挥官)基线里的缺陷:只给了 command=绝对路径,漏了绝对路径的**既有登记通道** commandPaths。
+    //   实测:CliAdapter.detect()(adapters/cli-adapter.js:51-60)先查 commandPaths 再 findInPath(command),
+    //   而 Windows `where <绝对路径>` 恒退出码 2(把 C: 当盘符模式),于是可用位=false →
+    //   server.js:787 的 availableTools 过滤把它挡在派发之外(execute() 本身却是好的)。
+    //   该不对称是真缺陷,单列 #81 走自己的红基线;本探针不靠它,改用设计内的 commandPaths。
+    commandPaths: [process.execPath],
     args: ['-e', probeScript],
     inputMode: 'stdin',
     outputMode: 'stdout-text',
