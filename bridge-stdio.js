@@ -10,8 +10,10 @@
 const readline = require('readline');
 const http = require('http');
 const { extractCodeBlocks } = require('./tool-registry');
+// #49a F1:env 正整数钳制的单一实现(与中枢共用;非法值留痕 F2)
+const { parsePositiveInt } = require('./env-int');
 
-const BRIDGE_PORT = parseInt(process.env.AI_BRIDGE_PORT) || 9800;
+const BRIDGE_PORT = parsePositiveInt(process.env.AI_BRIDGE_PORT, 9800, 'AI_BRIDGE_PORT');
 const BRIDGE_HOST = process.env.AI_BRIDGE_HOST || '127.0.0.1';
 const BRIDGE_TOKEN = process.env.AI_BRIDGE_TOKEN || '';
 const CLIENT_NAME = process.env.AI_BRIDGE_CLIENT || 'unknown';
@@ -22,11 +24,12 @@ const CAP_EXEC = /^(1|true|yes|on)$/i.test(process.env.AI_BRIDGE_CAP_EXEC || '')
 // 为什么 POST 预算必须大于中枢单次执行窗口(server.js CONFIG.EXECUTE_TIMEOUT,默认 900000):
 // 桥若先判死,中枢其实还在正常执行——宿主收到的是误报失败,桥侧台账还会写进一条脏失败记录。
 // 960000 = 900000(窗口) + 30000(余量)。AI_BRIDGE_HTTP_TIMEOUT 可覆盖;未设/NaN/0 落回默认。
-const HTTP_TIMEOUT_MS = parseInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 10) || 960000;
+// POST 预算的归一不带 name(锁 F1 的 resolveDefault 要求默认数紧邻 `;`);同一 env 的非法留痕由下方 GET 站点负责。
+const HTTP_TIMEOUT_MS = parsePositiveInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 960000);
 // GET 预算独立且更短:pollLoop 用 httpGet 拉任务,30s 快速失败是桥自愈路径的节奏;
 // 若把 GET 默认也抬到同步预算,#38a 的"黑洞约 30010ms 自行回 isError"会变成永久悬空(回归)。
 // 设了 AI_BRIDGE_HTTP_TIMEOUT 时与 POST 同源覆盖。
-const GET_TIMEOUT_MS = parseInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 10) || 30000;
+const GET_TIMEOUT_MS = parsePositiveInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 30000, 'AI_BRIDGE_HTTP_TIMEOUT');
 // callTool 总预算:必须严格大于内层 HTTP 预算,保证单请求工具由内层先判死、错误文案稳定为"请求超时"
 const CALL_BUDGET_MS = HTTP_TIMEOUT_MS + 30000;
 // 服务端会在客户端名与内置 CLI 重名时分配 client- 前缀 ID。
@@ -527,7 +530,7 @@ async function dispatchToolCall (name, args) {
     return { content: [{ type: 'text', text: `👢 已踢出客户端 ${r.clientId}${r.blocked ? '(并拉黑)' : ''}` }] };
   }
   case 'recognize_image': {
-    const VISION_PORT = parseInt(process.env.AI_BRIDGE_VISION_PORT) || 11434;
+    const VISION_PORT = parsePositiveInt(process.env.AI_BRIDGE_VISION_PORT, 11434, 'AI_BRIDGE_VISION_PORT');
     const VISION_HOST = process.env.AI_BRIDGE_VISION_HOST || '127.0.0.1';
     const question = args.question || '请详细描述这张图片的内容,包括所有可见的文字、UI元素和布局。';
     const imageInput = args.image;
@@ -738,7 +741,7 @@ function sendMCPRequest (method, params) {
     const timeout = setTimeout(() => {
       pendingRequests.delete(id);
       reject(new Error('客户端响应超时'));
-    }, parseInt(process.env.AI_BRIDGE_SAMPLING_TIMEOUT) || 900000); // 防泄漏兜底,节奏由服务端 EXECUTE_TIMEOUT 管控;慢宿主需要更长窗口
+    }, parsePositiveInt(process.env.AI_BRIDGE_SAMPLING_TIMEOUT, 900000, 'AI_BRIDGE_SAMPLING_TIMEOUT')); // 防泄漏兜底,节奏由服务端 EXECUTE_TIMEOUT 管控;慢宿主需要更长窗口
     pendingRequests.set(id, { resolve, reject, timeout });
   });
 }
@@ -859,7 +862,7 @@ async function pollLoop () {
         try {
           const result = await sendMCPRequest('sampling/createMessage', {
             messages: [{ role: 'user', content: res.task.task }],
-            maxTokens: parseInt(process.env.AI_BRIDGE_SAMPLING_MAX_TOKENS) || 16384,
+            maxTokens: parsePositiveInt(process.env.AI_BRIDGE_SAMPLING_MAX_TOKENS, 16384, 'AI_BRIDGE_SAMPLING_MAX_TOKENS'),
             includeContext: 'none'
           });
           // sampling 载荷的 content 是内容块(对象或块数组);逐形态提取文本,

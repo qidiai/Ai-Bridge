@@ -36,6 +36,8 @@ const { cleanupStaleTaskDirs } = require('./output-cleaner.js');
 const { USAGE_REPORT_SUFFIX, parseUsageReport } = require('./usage-reporter');
 // #47 流式命中缓存的 SSE 合成器(纯函数零依赖;行为锁 test-unit #47a0~a6)
 const { isReplayableJson, sseFromChatJson } = require('./sse-replay');
+// #49a F1:env 正整数钳制的单一实现(替代本地 parsePositiveInt;含非法值留痕 F2)
+const { parsePositiveInt, parseNonNegativeInt } = require('./env-int');
 
 // ── #46 tools.json 降级留痕:加载期损坏只降级功能、不拦进程起来;但"静态工具缺席"这一事实必须进可查账本 ──
 //   落账必须在 server.js 做:tool-registry 不得为此依赖 store(#46a4 —— bridge-stdio 也 require 它,
@@ -53,15 +55,12 @@ const { isReplayableJson, sseFromChatJson } = require('./sse-replay');
 }
 
 // ── 配置(集中管理,不再分散硬编码) ──
-// 解析正整数 env:非数字/0/负数一律回退默认值
-function parsePositiveInt (v, def) {
-  const n = parseInt(v);
-  return (Number.isFinite(n) && n > 0) ? n : def;
-}
+// env 正整数钳制的单一实现见 env-int.js(parsePositiveInt/parseNonNegativeInt,#49a F1)。
+// 非数字/0/负数一律回退默认值;传变量名时非法值会向 stderr 留痕(F2)。
 const CONFIG = {
-  PORT: parseInt(process.env.AI_BRIDGE_PORT) || 9800,
+  PORT: parsePositiveInt(process.env.AI_BRIDGE_PORT, 9800, 'AI_BRIDGE_PORT'),
   HOST: process.env.AI_BRIDGE_HOST || '127.0.0.1',
-  EXECUTE_TIMEOUT: parseInt(process.env.AI_BRIDGE_EXECUTE_TIMEOUT) || 900000, // 可配:默认 15 分钟,慢客户端(如本地大模型宿主)可再放宽单次执行窗口
+  EXECUTE_TIMEOUT: parsePositiveInt(process.env.AI_BRIDGE_EXECUTE_TIMEOUT, 900000, 'AI_BRIDGE_EXECUTE_TIMEOUT'), // 可配:默认 15 分钟,慢客户端(如本地大模型宿主)可再放宽单次执行窗口
   POLL_TIMEOUT: 30000,
   MAX_TASK_LENGTH: 50000,
   MAX_CONCURRENT_DISPATCH: parsePositiveInt(process.env.AI_BRIDGE_MAX_CONCURRENT_DISPATCH, 5),
@@ -69,8 +68,8 @@ const CONFIG = {
   MAX_CONCURRENT_MEETINGS: 3,
   TOOL_STATUS_TTL: 60000,
   CLIENT_TTL: parsePositiveInt(process.env.AI_BRIDGE_CLIENT_TTL, 5 * 60 * 1000),
-  MAX_MEETING_TOKENS: parseInt(process.env.AI_BRIDGE_MEETING_MAX_TOKENS) || 100000,
-  MEETING_MAX_MS: parseInt(process.env.AI_BRIDGE_MEETING_MAX_MS) || 10 * 60 * 1000,
+  MAX_MEETING_TOKENS: parsePositiveInt(process.env.AI_BRIDGE_MEETING_MAX_TOKENS, 100000, 'AI_BRIDGE_MEETING_MAX_TOKENS'),
+  MEETING_MAX_MS: parsePositiveInt(process.env.AI_BRIDGE_MEETING_MAX_MS, 10 * 60 * 1000, 'AI_BRIDGE_MEETING_MAX_MS'),
   AUTH_TOKEN: process.env.AI_BRIDGE_TOKEN || null,
   CORS_ORIGIN: process.env.AI_BRIDGE_CORS || null
 };
@@ -1101,7 +1100,7 @@ function readBody (req, cap = 1024 * 1024) {
 }
 
 // ── 透传代理(全局观测层):/proxy/<source>/<key>/<上游路径> ──
-const PROXY_TIMEOUT = parseInt(process.env.AI_BRIDGE_PROXY_TIMEOUT) || 600000;
+const PROXY_TIMEOUT = parsePositiveInt(process.env.AI_BRIDGE_PROXY_TIMEOUT, 600000, 'AI_BRIDGE_PROXY_TIMEOUT');
 const PROXY_MAX_BODY = 20 * 1024 * 1024; // LLM 长上下文请求体可达数 MB,独立于 readBody 的 1MB 上限
 
 function readRawBody (req, cap) {
@@ -1225,7 +1224,8 @@ const server = http.createServer(async (req, res) => {
         version: '1.1'
       };
       if (authorized) {
-        const dailyBudget = parseInt(process.env.AI_BRIDGE_DAILY_TOKEN_BUDGET) || 0;
+        // F3 特例:0 语义为"不设预算",故走允许 0 的非负整数归一(负数/非法回落 0,不让闸门恒告警)
+        const dailyBudget = parseNonNegativeInt(process.env.AI_BRIDGE_DAILY_TOKEN_BUDGET, 0, 'AI_BRIDGE_DAILY_TOKEN_BUDGET');
         const today = db.todayTokens();
         payload.codely = {
           cliVersion: codelyCliVersion(),
