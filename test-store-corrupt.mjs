@@ -253,6 +253,84 @@ const allLogs = fs.readdirSync(mem.dataDir).filter(f => /logs\.jsonl/.test(f));
 const logsText = allLogs.map(f => fs.readFileSync(path.join(mem.dataDir, f), 'utf-8')).join('\n');
 check('logs.jsonl 有损坏/拒绝的 error 级留痕', /"level":"error"/.test(logsText) && /(损坏|corrupt|拒绝|覆写)/.test(logsText), logsText.split('\n').filter(Boolean).slice(-3));
 
+section('#46 tools.json 损坏不得让进程起不来(与 P0 同尺,但配置原件不许被自动改动)');
+// 现状实测(把 tool-registry.js / kimi-models.js / adapters/{base,cli-adapter,http-adapter}.js 复制进
+// 临时目录当配置根,逐种顶层形状试):截断→ SyntaxError;`null`/`42` → TypeError: configs is not iterable;
+// `"a string"` → 不抛但**静默 0 工具、零留痕**;`[]` → 0 工具(合法)。
+// loadTools()(tool-registry.js:70-81)把 JSON.parse 放在 try 之外,而 `const TOOLS = loadTools()`(:84)
+// 在模块加载期执行 → server.js:16 一 require 就崩,watchdog 会重启到熔断。同一套哲学(store P0/#52/#44)
+// 对数据文件早就"降级不崩",配置文件却是双重标准。
+// 与数据文件的关键差别:tools.json 是 **git 跟踪的配置原件**,自动改名/隔离它(P0 对数据做的动作)
+// 在这里是过度干预 —— 本段用 #46a5 把"原件必须原样在、字节不变"锁住,防止照搬隔离动作。
+{
+  const regRunner = path.join(TMP, 'registry-runner.cjs');
+  fs.writeFileSync(regRunner, `'use strict';
+const path = require('path');
+const dir = process.argv[2];
+let reg = null, threw = null;
+try { reg = require(path.join(dir, 'tool-registry.js')); }
+catch (e) { threw = { name: e.constructor.name, msg: String(e.message || e).substring(0, 140) }; }
+let diag = null;
+if (reg && typeof reg.getLoadDiagnostics === 'function') {
+  try { diag = reg.getLoadDiagnostics(); } catch (_) { diag = null; }
+}
+const out = {
+  threw,
+  hasDiagFn: !!(reg && typeof reg.getLoadDiagnostics === 'function'),
+  diag: diag || null,
+  tools: (reg && Array.isArray(reg.TOOLS)) ? reg.TOOLS.map(t => t.name) : null
+};
+process.stdout.write(JSON.stringify(out) + '\\n');
+process.exit(0);
+`, 'utf-8');
+
+  function runRegistryCase (name, toolsContent) {
+    const dir = path.join(TMP, `reg-${name}`);
+    fs.mkdirSync(path.join(dir, 'adapters'), { recursive: true });
+    for (const f of ['tool-registry.js', 'kimi-models.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, f));
+    for (const f of ['base.js', 'cli-adapter.js', 'http-adapter.js']) fs.copyFileSync(path.join(__dirname, 'adapters', f), path.join(dir, 'adapters', f));
+    if (toolsContent !== null) fs.writeFileSync(path.join(dir, 'tools.json'), toolsContent, 'utf-8');
+    const r = spawnSync(process.execPath, [regRunner, dir], {
+      env: { ...process.env, AI_BRIDGE_DATA_DIR: dir, AI_BRIDGE_TOKEN: '' },
+      encoding: 'utf-8', timeout: 20000
+    });
+    let parsed = null;
+    try { parsed = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch { /* 交给断言判失败 */ }
+    return { dir, parsed, stderr: r.stderr || '' };
+  }
+
+  const TRUNC_TOOLS = '[{"name":"ok-tool","transport":"cli"},{"id":';
+  const cTrunc = runRegistryCase('trunc', TRUNC_TOOLS);
+  check('#46a1 截断的 tools.json 不得抛(现状 SyntaxError: Unexpected end of JSON input;模块抛=进程起不来)',
+    cTrunc.parsed && cTrunc.parsed.threw === null, cTrunc.parsed && cTrunc.parsed.threw);
+  const cNull = runRegistryCase('nulltop', 'null');
+  check('#46a2 顶层为 null 不得抛(现状 TypeError: configs is not iterable)',
+    cNull.parsed && cNull.parsed.threw === null, cNull.parsed && cNull.parsed.threw);
+  const cStr = runRegistryCase('strtop', JSON.stringify('a string'));
+  check('#46a3 顶层为字符串:不抛 **且必须留下形状诊断**(现状静默 0 工具、零留痕 = 运维无从知道配置被忽略)',
+    cStr.parsed && cStr.parsed.threw === null && cStr.parsed.hasDiagFn
+    && cStr.parsed.diag && /corrupt-shape/.test(String(cStr.parsed.diag.status)),
+    cStr.parsed && JSON.stringify({ threw: cStr.parsed.threw, hasDiagFn: cStr.parsed.hasDiagFn, diag: cStr.parsed.diag }));
+  const st = cTrunc.parsed && cTrunc.parsed.threw === null
+    ? (() => { try { return fs.readFileSync(path.join(cTrunc.dir, 'tools.json'), 'utf-8'); } catch (e) { return '读取失败:' + e.message; } })()
+    : null;
+  check('#46a5 反向锁:损坏的配置原件必须原样在、字节不变(不得改名/删除/覆写——P0 那套隔离是给运行数据的,配置原件被服务进程动过才是更大的意外)',
+    st === TRUNC_TOOLS, typeof st === 'string' && st !== TRUNC_TOOLS ? st.substring(0, 80) : cTrunc.parsed && cTrunc.parsed.threw);
+  const HEALTHY = JSON.stringify([{ name: 'probe-tool-ok', transport: 'cli', command: 'node', args: ['-e', '0'] }]);
+  const cOk = runRegistryCase('healthy', HEALTHY);
+  check('#46a6 哨兵:合法数组必须照旧全量加载(防"一律忽略配置"式假修复)',
+    cOk.parsed && cOk.parsed.threw === null && Array.isArray(cOk.parsed.tools) && cOk.parsed.tools.includes('probe-tool-ok'),
+    cOk.parsed && JSON.stringify({ threw: cOk.parsed.threw, tools: cOk.parsed.tools }));
+  // #46a4 结构锁:留痕必须进可查账本(logs.jsonl),且不得为此给 tool-registry 新增 store 依赖
+  //   (bridge-stdio.js:12 也 require tool-registry —— 一旦它依赖 store,每个 MCP 桥进程都会在加载期 mkdir 数据目录)
+  const regSrc = fs.readFileSync(path.join(__dirname, 'tool-registry.js'), 'utf-8');
+  const srvSrc = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf-8');
+  const regRequiresStore = /require\(['"]\.\/store['"]\)/.test(regSrc);
+  const srvLogsDiag = /getLoadDiagnostics/.test(srvSrc) && /appendLog\(\s*['"]error['"]/.test(srvSrc);
+  check('#46a4 诊断必须由 server.js 落进 logs.jsonl(error 级),且 tool-registry 不得为此新增 store 依赖',
+    !regRequiresStore && srvLogsDiag, 'tool-registry 依赖 store=' + regRequiresStore + ' server 落账=' + srvLogsDiag);
+}
+
 process.stdout.write('\n' + '='.repeat(40) + '\n');
 process.stdout.write(`总计: ${passed}/${passed + failed} 通过\n`);
 if (failed) process.stdout.write('失败项: ' + failures.join(', ') + '\n');
