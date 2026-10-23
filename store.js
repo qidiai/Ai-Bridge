@@ -22,12 +22,9 @@ const FILES = {
   stats: path.join(DATA_DIR, 'token-stats.json'),
   memory: path.join(DATA_DIR, 'memory.json'),
   logs: path.join(DATA_DIR, 'logs.jsonl'),
-  traffic: path.join(DATA_DIR, 'traffic.jsonl'),
   acl: path.join(DATA_DIR, 'clients-acl.json'),
   workspaces: path.join(DATA_DIR, 'workspaces.json')
 };
-
-const _locks = new Map();
 
 // 本轮进程内已确认损坏的 key 集合。为什么要它:load 读不回合法 JSON 时调用方拿到的是
 // 空结构,若随后仍然落盘就会把空结构写成"新真相"——一次手改坏/半写入即静默清库
@@ -66,12 +63,13 @@ const SHAPES = {
 // 返回 true=合法;false=非法(调用方须按"解析失败同口径"处理:quarantine + 返回空结构)。
 // 为什么单独抽出来:#44 的三种真实恶果(字段类型错/容器类型错/顶层类型错)都是"能解析但形状错"
 // ——loadMemory/loadACL 的补字段逻辑对 primitive/null 要么抛 TypeError 要么静默丢弃,
-// 两者都会让守卫绕过,把在用的真实数据洗掉。守卫必须同时覆盖 load 与 loadList 两个入口,
+// 两者都会让守卫绕过,把在用的真实数据洗掉。守卫只需覆盖 load 这一个入口
+// (另一入口已随 #31 的零调用方清理一并删除,不再有绕过 load 的第二个读入口),
 // 不在调用方散落补丁(避免 #52 那种"只给 meetings 一个点"的补丁式回归)。
 function assertShape (key, data) {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return false;
   const fields = SHAPES[key];
-  if (!fields) return true; // 未知 key(logs/traffic 等)只把顶层,不引入本单未规定的约束
+  if (!fields) return true; // FILES 里有、SHAPES 未声明形状的 key(当前仅 logs)及未知 key 只把顶层,不引入本单未规定的约束
   for (const name of Object.keys(fields)) {
     if (!(name in data)) continue; // 缺失:合法稀疏,由补字段逻辑负责
     const v = data[name];
@@ -117,45 +115,6 @@ function load (key) {
     return {};
   }
   return parsed;
-}
-
-function loadList (key) {
-  const f = FILES[key];
-  if (!f || !fs.existsSync(f)) return []; // 文件不存在:合法的空,不是损坏,不隔离
-  let parsed;
-  try {
-    parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
-  } catch (e) {
-    // 读不确定即不覆写:解析失败与读错误同等处理,保全后返回空列表
-    quarantine(key, e.message);
-    return [];
-  }
-  // #44:loadList 与 load 用同一把尺子(否则绕过 load 直用 loadList 的调用方还能触发洗库);
-  // 该函数目前未导出、无外部调用方,收紧校验不影响任何现有测试。
-  if (!assertShape(key, parsed)) {
-    quarantine(key, shapeReason(key, parsed));
-    return [];
-  }
-  return parsed;
-}
-
-async function save (key, data) {
-  if (_corrupt.has(key)) {
-    // 不抛错:调用方多数忽略返回值,抛错会把存储层的保守策略升级成业务故障
-    appendLog('error', `拒绝覆写 ${path.basename(FILES[key])}:本轮已因解析损坏被隔离`);
-    return false;
-  }
-  const f = FILES[key];
-  while (_locks.get(f)) { await new Promise(r => setTimeout(r, 10)); }
-  _locks.set(f, true);
-  try {
-    const tmp = f + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
-    fs.renameSync(tmp, f);
-  } finally {
-    _locks.set(f, false);
-  }
-  return true;
 }
 
 const _syncLocks = new Map();
@@ -248,62 +207,6 @@ function readLogs (opts = {}) {
 function clearLogs () {
   try { fs.writeFileSync(FILES.logs, '', 'utf-8'); } catch (_) {}
   try { if (fs.existsSync(FILES.logs + '.1')) fs.unlinkSync(FILES.logs + '.1'); } catch (_) {}
-}
-
-// ── 流量日志(完整内容,不截断) ──
-
-let _trafficQueue = [];
-let _trafficWriting = false;
-const TRAFFIC_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB 单文件上限
-
-function rotateTrafficIfNeeded (appendSize) {
-  try {
-    if (!fs.existsSync(FILES.traffic)) return;
-    const stat = fs.statSync(FILES.traffic);
-    if (stat.size + appendSize > TRAFFIC_MAX_FILE_SIZE) {
-      // 轮转:traffic.jsonl → traffic.jsonl.1(覆盖旧)
-      try { fs.unlinkSync(FILES.traffic + '.1'); } catch (_) {}
-      fs.renameSync(FILES.traffic, FILES.traffic + '.1');
-    }
-  } catch (_) {}
-}
-
-function flushTrafficQueue () {
-  if (_trafficWriting || _trafficQueue.length === 0) return;
-  _trafficWriting = true;
-  const batch = _trafficQueue.join('\n') + '\n';
-  _trafficQueue = [];
-  rotateTrafficIfNeeded(Buffer.byteLength(batch));
-  fs.appendFile(FILES.traffic, batch, 'utf-8', (err) => {
-    _trafficWriting = false;
-    if (err) console.error('[store] 流量日志写入失败:', err.message);
-    if (_trafficQueue.length > 0) flushTrafficQueue();
-  });
-}
-
-function appendTraffic (entry) {
-  const line = JSON.stringify(entry);
-  _trafficQueue.push(line);
-  flushTrafficQueue();
-}
-
-function readTraffic (opts = {}) {
-  const { tool, direction, limit = 50, since } = opts;
-  const maxLimit = Math.max(1, Math.min(limit || 50, 500));
-  try {
-    if (!fs.existsSync(FILES.traffic)) return [];
-    const lines = fs.readFileSync(FILES.traffic, 'utf-8').trim().split('\n').filter(Boolean);
-    let entries = lines.map(l => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean);
-    if (tool) entries = entries.filter(e => e.tool === tool);
-    if (direction) entries = entries.filter(e => e.direction === direction);
-    if (since) entries = entries.filter(e => { try { return new Date(e.ts) > new Date(since); } catch (_) { return false; } });
-    return entries.slice(-maxLimit);
-  } catch (_) { return []; }
-}
-
-function clearTraffic () {
-  try { fs.writeFileSync(FILES.traffic, '', 'utf-8'); } catch (_) {}
-  try { if (fs.existsSync(FILES.traffic + '.1')) fs.unlinkSync(FILES.traffic + '.1'); } catch (_) {}
 }
 
 // ── 记忆(任务历史 + 经验 + 工具偏好 + 会议) ──
@@ -563,9 +466,8 @@ function saveACL (acl) {
 
 module.exports = {
   FILES,
-  load, save, saveSync,
+  load, saveSync,
   appendLog, readLogs, clearLogs,
-  appendTraffic, readTraffic, clearTraffic,
   loadMemory, recordTask, writeExperience, searchMemory, getToolStats, getToolObservations, getRecentTasks,
   createMeeting, addMessage, getMeeting, getRecentMeetings, closeMeeting, markOrphanMeetings,
   loadACL, saveACL
