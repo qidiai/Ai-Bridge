@@ -62,6 +62,21 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 | `AI_BRIDGE_WORKSPACE_ROOT` | `~/.ai-bridge/workspaces` | 受管工作区根目录（托管目录创建/回收均限制在此） |
 | `AI_BRIDGE_TOOLSET` | full | 桥暴露的工具套餐：full=全部 15 个；lite=面向被派发 CLI 对端智能体的 5 工具精简面（dispatch/handoff/list_tools/memory_search/memory_recent）；非法值按 full |
 
+| `AI_BRIDGE_MAX_CONCURRENT_DISPATCH` | 5 | 并发讨论/派发闸门额度（`server.js:67`，走 `parsePositiveInt`：非正数与坏值落默认） |
+| `AI_BRIDGE_RESULT_MAX_CHARS` | 2000 | dispatch 结果 `content` 截断上限（`server.js:68`，`parsePositiveInt`） |
+| `AI_BRIDGE_CLIENT_TTL` | 300000 | 在册客户端 stale 判定窗口(ms)（`server.js:71`，`parsePositiveInt`；测试里常用 `'1200'` 加速过期） |
+| `AI_BRIDGE_MEETING_MAX_TOKENS` | 100000 | 单场会议 token 上限，超出 `/api/discuss` 返 429（`server.js:72`） |
+| `AI_BRIDGE_MEETING_MAX_MS` | 600000 | 单场会议时长上限(ms)（`server.js:73`） |
+| `AI_BRIDGE_CORS` | 不设=不发 CORS 头 | `Access-Control-Allow-Origin` 的值（`server.js:75`）。**设 `*` 等于把本机反代开放给任意网页**，慎设 |
+| `AI_BRIDGE_PROXY_TIMEOUT` | 600000 | OpenAI 反代到上游的超时(ms)（`server.js:1104`） |
+| `AI_BRIDGE_BASE_URL` | `http://127.0.0.1:9800/v1` | `qidi-sync.js` 同步器指向的中枢基址（`qidi-sync.js:28`）。多实例并存时**必须**显式指定，否则同步进别的实例 |
+| `AI_BRIDGE_OBSERVE_DIR` | `~/.ai-bridge` | 观测件（快照/审计产物）根目录（`observe.js:22`）。沙箱实例须与 `AI_BRIDGE_DATA_DIR`、`AI_BRIDGE_DB` 一起隔离 |
+| `AI_BRIDGE_VISION_PORT` | 11434 | 桥侧 `recognize_image` 的 Ollama 端口（`bridge-stdio.js:530`） |
+| `AI_BRIDGE_VISION_HOST` | 127.0.0.1 | 同上，Ollama 主机（`bridge-stdio.js:531`） |
+| `AI_BRIDGE_VISION_MODEL` | `qwen2.5vl:3b` | 同上，视觉模型名（`bridge-stdio.js:628`） |
+| `AI_BRIDGE_SAMPLING_MAX_TOKENS` | 16384 | 反向 `sampling/createMessage` 请求宿主模型时的 maxTokens（`bridge-stdio.js:862`） |
+
+> **已知坑（#49）**：以上"默认值"里，`AI_BRIDGE_PORT`/`AI_BRIDGE_EXECUTE_TIMEOUT`/`AI_BRIDGE_HTTP_TIMEOUT`/`AI_BRIDGE_SAMPLING_TIMEOUT`/`AI_BRIDGE_MEETING_*`/`AI_BRIDGE_PROXY_TIMEOUT`/`AI_BRIDGE_VISION_PORT`/`AI_BRIDGE_SAMPLING_MAX_TOKENS`/`AI_BRIDGE_DAILY_TOKEN_BUDGET` 走的是 `parseInt(env) || 默认`（实测全仓 **12 处**：`bridge-stdio.js` 6 + `server.js` 6）。这种写法 **0 与非数字会落默认，但负数原样直通**——已实测 `http.get({timeout:-1})` 直接抛 `ERR_OUT_OF_RANGE`，即一个手滑的负数能让桥失联且归因只见裸错误码。仓内其实**已有**正确写法 `parsePositiveInt(v, def)`（`server.js:57`，另有 5 处在用），#49 的工作就是把这 12 处迁到它并补"坏值留痕"。
 ## 功能
 
 - **dispatch** — 并行派发任务给多个 AI 工具，自动故障转移
@@ -129,7 +144,7 @@ node test-workspace.mjs     # 59 项  工作区管理（独立临时数据目录
 node test-store-corrupt.mjs # 43 项  坏 JSON 与坏形状隔离/拒绝覆写 + 配置损坏只降级（子进程 + 隔离 DATA_DIR）
 node test-audit-fixes.mjs   # 70 项  审计修复验收（含结构锁 E/F/G/H/I/J/K/L/M 段；M 段会实际调起棘轮门禁）
 node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
-node test-e2e.mjs           # 211 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827/9830 + 第四实例 9841 + 注册表接缝与假 CLI 实例 9833/9834/9835，均不影响生产）
+node test-e2e.mjs           # 211 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 死端口 9899（故意无人监听，验连接失败路径） + 第二实例 9821/9827/9830 + 第四实例 9841 + 注册表接缝与假 CLI 实例 9833/9834/9835，均不影响生产）
 npx eslint . --ext .js,.mjs # 0 error / 18 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
 node check-swallow-ratchet.mjs # 0=棘轮通过并打印 STATUS=ok / TOTAL=<实测>；非 0 时点名 GROWTH / SCOPE-DRIFT / TOTAL-SUM-CONFLICT
 ```
