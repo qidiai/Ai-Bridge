@@ -46,7 +46,7 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 |------|--------|------|
 | `AI_BRIDGE_PORT` | 9800 | 服务端口 |
 | `AI_BRIDGE_HOST` | 127.0.0.1 | 监听地址（**仅本机**；改 0.0.0.0 前务必设 TOKEN） |
-| `AI_BRIDGE_TOKEN` | 无 | 鉴权 token（不设则无鉴权）。**自 #42 起覆盖 `/api/*` 与 `/v1/*`**：设了 token 后，用 OpenAI 兼容层的任何客户端都必须把 API key 配成同一个值（`Authorization: Bearer <AI_BRIDGE_TOKEN>`），否则一律 401；Web UI 会在首次 401 时提示输入一次并存入 localStorage（不设 token 时不会弹框）。已知仍免凭据的入口：`/proxy/*`（见「已知问题」#64） |
+| `AI_BRIDGE_TOKEN` | 无 | 鉴权 token（不设则无鉴权）。**自 #42 起门覆盖 `/api/*` 与 `/v1/*`**（`server.js:1235`）：设了 token 后，用 OpenAI 兼容层的任何客户端都必须把 API key 配成同一个值（`Authorization: Bearer <AI_BRIDGE_TOKEN>`），否则一律 401；Web UI 会在首次 401 时提示输入一次并存入 localStorage（不设 token 时不会弹框）。**两处已知仍免凭据**：`GET /`（UI 首页本身，无数据）与 `GET /api/health`——后者在门之前处理（`server.js:1183`，注释"供守护进程探活"），会带出 version/clients/activeDispatches/db 路径/token 剩余天数等，收紧方案见「已知问题」#68；另有 `/proxy/*` 免凭据透传（#64） |
 | `AI_BRIDGE_CLIENT` | unknown | 作为 MCP 客户端时的身份名（**注意**：默认值是常量 `unknown`，同一宿主开多个会话会全部塌进同一个在册条目且复用是静默无日志的，见「已知问题」） |
 | `AI_BRIDGE_EXECUTE_TIMEOUT` | 900000 | 中枢单次执行窗口(ms)：CLI 执行链与客户端反向执行都吃它。**桥侧 `AI_BRIDGE_HTTP_TIMEOUT` 必须 ≥ 本值 + 30000**，否则长任务会被桥早判死而中枢仍在执行（`test-audit-fixes` 段 F 锁死该数值关系） |
 | `AI_BRIDGE_HTTP_TIMEOUT` | 960000 | 桥侧同步工具调用总预算(毫秒)，同时驱动 `httpPost` 默认值与 `callTool` 总超时；**未设时 GET/轮询仍为 30000ms 快速失败**（自愈节奏，有意不与 POST 同源抬高） |
