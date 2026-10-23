@@ -125,7 +125,7 @@ API Key:  随便填（如 sk-1234）
 
 ```bash
 node test-unit.mjs          # 48 项  纯单元测试（含 #47 SSE 回放合成器）
-node test-workspace.mjs     # 44 项  工作区管理（独立临时数据目录 + 写失败注入）
+node test-workspace.mjs     # 59 项  工作区管理（独立临时数据目录 + 写失败注入）
 node test-store-corrupt.mjs # 43 项  坏 JSON 与坏形状隔离/拒绝覆写 + 配置损坏只降级（子进程 + 隔离 DATA_DIR）
 node test-audit-fixes.mjs   # 63 项  审计修复验收（含结构锁 E/F/G/H/I/J/K/L 段）
 node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
@@ -133,7 +133,7 @@ node test-e2e.mjs           # 211 项 全链路 E2E（主中枢 9810 + 假中枢
 npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
 ```
 
-合计 **454 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+合计 **469 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
 
 
 ### 派发长任务前必读（超时口径）
@@ -298,12 +298,13 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
   - **幂等缓存的流式命中终于合法（#47）**：缓存只由非流式 200 响应写入，而 `cacheKey` 不含 `stream`，于是流式请求命中同一 key 时旧代码把 **JSON 原文**直接 `res.write()` 进 `text/event-stream` 响应 —— SSE 解析器丢弃所有非 `data:` 前缀的行，客户端拿到**空流**却被告知 `X-Cache: HIT`「成功」；文档与代码注释当时都写着「合成单块 SSE」，实现根本不合（现均已改为与实现一致）。新增零依赖纯函数 `sse-replay.js` 负责合成，命中分支三分支：非流式原样回放 / 流式可回放→合成 / 流式不可回放→逐出并转发上游。**能力边界如实说明**：这条链只做到单元级 + 结构锁级，**没有端到端证明**「流式命中→客户端真能解析」，因为缓存唯一写入口需要真凭据的 codely-http 上游（基址在不入库的 `codely-client.js` 里），测试不该联网也不该烧免费额度 —— 接缝缺口记 **#79**。
   - **注册表配置路径可注入（#80）**：`tools.json` 的载入路径原先硬编码在 `tool-registry.js:98`，测试无法在不碰生产配置的前提下把一个本地假 CLI 送进**真派发链路**——于是「CLI 侧到底收到什么任务文本」（#40）、「流式缓存命中的端到端形状」（#79）只能靠源码结构锁兜住，而结构锁已被 #74 证明会漏抓第二/第三写手。现 `AI_BRIDGE_TOOLS_PATH` 存在时按该文件装载（未设时逐字节不变，且刻意不用 `path.resolve('tools.json')` 防随 cwd 漂移），`/api/tools` 响应带 `registry: getLoadDiagnostics()` 让"到底读了哪个文件"可归因。附带立项 #81：`CliAdapter.detect()` 对绝对路径 `command` 恒判不可用（`where <绝对路径>` 退出码 2），而 `execute()` 走的 `resolveWindowsCommand` 却认它——跑得动却永不被派发。
   - **CLI 终于拿到工作区简报，出站文本收成单一写手（#40）**：`server.js` 里 `outboundTask` 的 else（CLI）分支曾在自己内部再判一次 `toolDef.type === 'client'` —— 在该分支恒为 false，于是 **CLI 工具永远只拿到 `[USAGE]` 自报后缀、拿不到"只在该目录内动文件"这段唯一的文字护栏**（`cwd` 只约束进程起始目录，拦不住越界绝对路径）。现在简报与后缀分型一次组装（`brief = workspace ? 拼简报 : 原文`，client 不加后缀、CLI 加后缀）；同时删掉 `executeClient` 内的**第二次**组装（旧 `:572` 记台账、`:685` 才实发，恰好等值但一改就漂）——台账所记与进程实收/客户端实收自此按构造同源，由 `#40e4`/`#40e8` 两条**逐字节相等**哨兵锁住（探针 CLI 把实收 stdin 以 base64 回吐）。两处 exec 准入守卫刻意双存、拒绝文案逐字不变、且仍在写台账之前，#43 的"被拒派发不产生假发出流量"不回退。
+  - **空白 `path` 不再被当成"没给"（#51）**：`workspace-manager.js` 原判定 `input.path != null && String(input.path).trim() !== ''` 把"提供了但纯空白"（`""` / `"   "` / `"\t"` / `"\n"`）折叠成"未提供"，于是**静默在受管根 mkdir 一个空目录、写注册表落盘、返回成功**——调用方本意是登记自己已有的目录，结果拿到一个从没人要的工作区，此后所有派发产生的文件都写进那里。现在 `create()` 最顶端（先于 `loadState`/`mkdirSync`/`trySaveState`）以 **400** 拒绝，文案点名 `path` 并说清真因（"已提供但为空白"），不伪装成"路径不存在"；三分类互斥且全覆盖：未提供（`null`/`undefined`）→ 照旧 managed，提供且非空白 → 校验链一字未动，提供但空白 → 拒绝且不留任何记录或目录。
 - **未修（如实列示，按当前队列序）**：
   - #81 CLI 绝对路径可用位不对称：`detect()` 只查 `commandPaths` + `findInPath`（Windows `where <绝对路径>` 恒失败），而 `execute()` 的 `resolveWindowsCommand` 认绝对路径——同一份配置跑得动却永远不被派发，拒绝文案还是"未知工具/no_targets"（归因误导，#54 同族）
   - #57 桥默认身份是常量 `unknown`：`connectedClients` 以名字为键，同一宿主的多个派生会话必然塌进**一个**在册条目，共享 `pendingTask` 槽与能力字段；后启动会话的 `registerSeq` 基数天然更大，于是"后来者覆写全体能力"成为合法行为。且注册复用分支**静默无日志**，中枢也无 `hostCount`/poll 计数面——该缺陷目前**无法从可观测面证明有几个会话在共享身份**。
   - #58 MCP 面无异步派发：中枢支持 `body.async === true`，但 `dispatch` 工具没有 `async` 入参、也没有取回异步结果的工具，宿主只能吃同步窗口。
   - #60 失败判定器仍会被**短文本里的数字子串**误伤：`looksLikeError` 只要正文 ≤400 字符即返回 true，而关键词表含裸 `'401'/'402'/'429'`，于是"耗时 4021ms""见 `:398-401`"这类成功产出可能被记成失败（#37 只修了长文那一半）。
-  - 其余：#51 工作区 path 无效时静默改建空目录、#26 吞异常门禁、#49 两个 HTTP 封装单点化（含负数 env 钳制：`parseInt(env) || 默认` 对负数不成立，而 Node 的 `setTimeout(<0)` 语义是"超时失效"）、#27/#28/#29 结构性重构、#55 北极星端到端验收、#32 HTTP 入口坏 JSON 伪装成参数缺失（本轮实测再现：非法 JSON 的 toggle 请求回的是 `400 缺少 tool 参数`，不是"body 解析失败"）、#33/#34 损坏与隔离状态上报到 `/api/health` 与 UI、#35 `tools.json` 模型漂移。
+  - 其余：#26 吞异常门禁、#49 两个 HTTP 封装单点化（含负数 env 钳制：`parseInt(env) || 默认` 对负数不成立，而 Node 的 `setTimeout(<0)` 语义是"超时失效"）、#27/#28/#29 结构性重构、#55 北极星端到端验收、#32 HTTP 入口坏 JSON 伪装成参数缺失（本轮实测再现：非法 JSON 的 toggle 请求回的是 `400 缺少 tool 参数`，不是"body 解析失败"）、#33/#34 损坏与隔离状态上报到 `/api/health` 与 UI、#35 `tools.json` 模型漂移。
   - 鉴权面残项（#42/#68 之后仍然成立的口子）：**#64** `/proxy/*` 在鉴权门**之前**免凭据透传（与 `/v1` 同属"能执行能花钱"面，另含 `checkAuth` 非恒定时间比较）、**#65** `check-active.js`/`cleanup-stuck.js` 硬连生产 9800 却不带凭据（设 token 后必然 401，运维脚本自己失效）、**#66** 把 #42/#68 的一次性凭据取证 harness 固化成第 7 套常驻套件（防"第二个调用点漏网"复发；禁止"复制一份 JS 进测试"那种永远绿假锁）、**#67** UI 流式解析三缺陷（无跨块缓冲、`TextDecoder` 未开 `stream` 会碎中文、`catch(_){}` 静默吞）。
   - #43 之后核准新增：**#72** `beginRun` 是第 5 个丢弃 `saveState` 返回值的站点（隔离/写故障时租约与 `useCount` 静默漂移，本单规格明令不动）、**#73** key 被隔离期间对已知 id 的写/删返回 404「不存在」而非 5xx 降级（`store.load` 返回 `{}` 使记录不可见，与 #33/#34 同源）、**#74** `causeOf` 与 #54 的"取尾部且有界"是同一规则的两处实现，且 `REFUSED_CAUSE` 文案只写"解析损坏"、窄于 #44 之后"解析失败或形状非法"的事实。
   - 本轮（#68）核准新增：**#69** `edge-agent` 漏配 `AI_BRIDGE_TOKEN` 时，`bridge:health` 会**静默**降级成 7 字段存活视图（运维无从归因），应启动自检并告警——属 `edge-agent.js` 面，另行派工；**#70** `?probe=1` 在仓内**零代码调用方**（只有两处文档提及），若确认无运维使用方，整段删除才是根除"签名放大器"面的正解，删除须与文档同批修订。
