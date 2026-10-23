@@ -72,6 +72,39 @@ async function main () {
   check('非法名称字符被拒', errorCode(() => ws.create({ name: 'bad/name' })) === 400);
   check('isInside 拒绝相等与越界路径', ws.isInside(path.join(ROOT, 'a'), ROOT) && !ws.isInside(ROOT, ROOT) && !ws.isInside(EXTERNAL, ROOT));
 
+  // #51 "提供了 path 但为空白"被当成"没提供" → 静默新建空 managed 目录
+  //   实况 workspace-manager.js:236 `wantsLinked = input.path != null && String(input.path).trim() !== ''`:
+  //   调用方给了 path(哪怕只有空格)本意是"登记这个已有目录",空白是**它的输入错误**;
+  //   现状却悄悄改建一个空受管目录并落盘,调用方拿到 201 与一个从没人要的工作区(后续派发的文件都写进那里)。
+  section('#51 空白 path 不得被当作"未提供"(须 400 且不留痕)');
+  {
+    const n0 = ws.list().length;
+    const dirs0 = fs.readdirSync(ROOT).length;
+    const blanks = [['space', '   '], ['empty', ''], ['tab', ' \t '], ['newline', '\n']];
+    for (const [label, p] of blanks) {
+      let code = null, msg = '', created = null;
+      try { created = ws.create({ name: 'blank-' + label, path: p }); code = 'CREATED:' + created.mode; }
+      catch (e) { code = e.statusCode || 'no-status'; msg = String(e.message || ''); }
+      check('#51a1-' + label + ' 提供了但空白的 path 必须以 400 拒绝(现状:被当作未提供 → 静默建 managed;实参=' + JSON.stringify(p) + ')',
+        code === 400, 'code=' + code + ' msg=' + msg.substring(0, 60));
+      check('#51a2-' + label + ' 拒绝不得留下注册记录,也不得在受管根里mkdir 出新目录',
+        ws.list().length === n0 && fs.readdirSync(ROOT).length === dirs0,
+        '记录=' + ws.list().length + '/' + n0 + ' 受管根目录数=' + fs.readdirSync(ROOT).length + '/' + dirs0);
+      check('#51a3-' + label + ' 拒绝文案必须点名 path 并说清"空白"(不得伪装成"路径不存在",#54/#74 同族归因误导)',
+        /path/.test(msg) && /(空白|为空|不能为空|必须提供)/.test(msg) && !/不存在/.test(msg), 'msg=' + msg.substring(0, 80));
+    }
+    // 哨兵三则:真正的"未提供"与合法 linked 都必须照旧 —— 防"一律拒绝"式假修复
+    const absent = ws.create({ name: 'absent-ok' });
+    check('#51a4 哨兵:完全不提 path 仍必须照旧建 managed(禁止把空白检查扩成禁用 managed)',
+      absent.mode === ws.MODE_MANAGED && fs.existsSync(absent.path), absent.mode + ' exists=' + fs.existsSync(absent.path));
+    const undef = ws.create({ name: 'undef-ok', path: undefined });
+    check('#51a5 哨兵:path 显式 undefined 等同未提供,仍照旧 managed', undef.mode === ws.MODE_MANAGED, String(undef.mode));
+    const realDir = path.join(TMP, 'real-linked');
+    fs.mkdirSync(realDir, { recursive: true });
+    const okLinked = ws.create({ name: 'linked-ok', path: realDir });
+    check('#51a6 哨兵:合法绝对路径仍照旧 linked(正向路径不回退)', okLinked.mode === ws.MODE_LINKED, okLinked.mode + ' ' + okLinked.path);
+  }
+
   section('引用解析:名称 / ID / 路径');
   check('按 ID 解析', ws.get(managed.id)?.name === 'demo project');
   check('按名称解析(大小写不敏感)', ws.get('DEMO PROJECT')?.id === managed.id);
