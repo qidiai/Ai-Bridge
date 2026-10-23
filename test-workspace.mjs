@@ -118,13 +118,23 @@ async function main () {
   check('受管目录可连同文件回收', removedManaged.filesDeleted === true && !fs.existsSync(managed.path));
   check('受管记录已移除', ws.get(managed.id) === null);
 
-  section('#43 写失败不得先删文件(删除路径的写序守卫)');
+  section('#43 写失败不得先删文件(删除/创建路径的写序与归因守卫)');
   {
     // 确定性写失败注入:store.saveSync 先写 <file>.tmp 再 rename —— 把 tmp 做成目录,
     // writeFileSync 必抛 EISDIR。不碰生产、不需网络、不需要权限。
     const inj = ws.create({ name: 'inj-order', description: '#43b 写失败注入' });
     const tmpPath = path.join(DATA_DIR, 'workspaces.json.tmp');
     fs.mkdirSync(tmpPath, { recursive: true });
+
+    // ① 创建期(注入仍在时)——先测这条,因为它和删除期共用同一个注入物
+    let cCode = null, cMsg = '', cPath = null;
+    try { cPath = ws.create({ name: 'inj-create', description: '#43c1 创建期写失败' }).path; }
+    catch (e) { cCode = (typeof e.statusCode === 'number' ? e.statusCode : null); cMsg = e.message; }
+    check('#43c1 创建期落盘失败须回传 5xx、不得留下孤儿目录、错误须含底层原因签名(EISDIR 不得被吞)',
+      (cCode === 500 || cCode === 503) && (cPath === null || !fs.existsSync(cPath)) && /EISDIR|illegal operation/.test(cMsg),
+      'code=' + cCode + ' 目录在=' + (cPath === null ? 'n/a' : fs.existsSync(cPath)) + ' msg=' + cMsg.substring(0, 80));
+
+    // ② 删除期:先落盘后回收
     let injCode = null, injMsg = '';
     try { ws.remove(inj.id, { deleteFiles: true }); } catch (e) { injCode = (typeof e.statusCode === 'number' ? e.statusCode : (typeof e.status === 'number' ? e.status : null)); injMsg = e.message; }
     check('#43b1 注册表落盘失败时不得删除受管目录(现状:rmSync 已先删掉目录,落盘随后才失败)',
@@ -134,6 +144,10 @@ async function main () {
       '记录存在=' + (ws.get(inj.id) !== null) + ' 目录存在=' + fs.existsSync(inj.path));
     check('#43b3 失败必须以带状态码的领域错误上报(现状:裸 EISDIR,statusCode 缺失)',
       injCode === 500 || injCode === 503, 'statusCode=' + injCode + ' msg=' + injMsg.substring(0, 70));
+    check('#43b6 删除期落盘失败的错误必须含底层原因签名(现状:只报"未能落盘",原因被吞 → 运维分不清权限/磁盘/隔离,#54 同族)',
+      /EISDIR|illegal operation/.test(injMsg), 'msg=' + injMsg.substring(0, 90));
+
+    // ③ 撤掉注入 → 正常路径必须照旧(防"一律拒写/永不删文件"式假修复)
     fs.rmSync(tmpPath, { recursive: true, force: true });
     let retry = null, retryErr = '';
     try { retry = ws.remove(inj.id, { deleteFiles: true }); } catch (e) { retryErr = e.message; }
