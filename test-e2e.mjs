@@ -1103,6 +1103,40 @@ async function main () {
       check('#42a3 带正确 token 访问 /v1/models 必须仍可用(反代接入不能被本轮改坏)', m3.status === 200, 'status=' + m3.status);
       const m4 = await reqAuth('GET', '/', null, false);
       check('#42a4 Web UI 首页本身不得被锁死(锁的是数据面,不是让页面消失)', m4.status === 200 && /<html|<!DOCTYPE/i.test(m4.text), 'status=' + m4.status + ' len=' + m4.text.length);
+
+      // #68:/api/health 在门之前处理(server.js:1183,比 :1235 的门早 52 行),原注释称"供守护进程探活"
+      //   却无人使用 —— watchdog.js 靠子进程 exit 事件判活,全仓仅 edge-agent.js:186 的 bridge:health
+      //   会回传它。实测无凭据可读 version/clients/activeDispatches/dispatchTotal + db 绝对路径 +
+      //   codely.tokenDaysLeft + usage 汇总。裁定:同一端点按鉴权态给两种视图 —— 无凭据只留
+      //   存活与负载计数(clients 保留,既有锁 test-e2e.mjs:901 断言它必须是 number,不得为收窄而改锁);
+      //   db/codely/usage 仅带凭据可见。**实测更正**:health 处理器(server.js:1183-1206)的 payload 键集为
+      //   status/uptime/port/clients/activeDispatches/dispatchTotal/version/codely/usage —— 从来没有 db 字段;
+      //   我首版把 db.stats()(db.js:320)与门后的 /api/db/stats(:1502)的形状当成 health 的,已纠正。
+      //   故本锁按真实键集写:无凭据禁止 codely/usage(db 一并列入属纵深防御,当前恒不存在);
+      //   带凭据必须仍能看到 codely/usage(UI 与 edge-agent.js:186 的 bridge:health 依赖完整视图)。
+      const hAnon = await reqAuth('GET', '/api/health', null, false);
+      // 前置守卫:reqAuth 返回的是 text 而非 body,JSON 解析失败必须判红 —— 否则"没读到字段"
+      //   会被当成"没外带字段"蒙成绿(我首版就犯了这个错,这里显式封死)。
+      let hb = null, hbParsed = true;
+      try { hb = JSON.parse(hAnon.text); } catch (_) { hb = null; hbParsed = false; }
+      const hbObj = (hb && typeof hb === 'object') ? hb : {};
+      const leaked = ['db', 'codely', 'usage'].filter(k => hbObj[k] !== undefined);
+      check('#68a0 无凭据 /api/health 必须是可解析的 JSON 对象(解析失败不得当成"没外带")',
+        hAnon.status === 200 && hbParsed && hb !== null && typeof hb === 'object', 'status=' + hAnon.status + ' parsed=' + hbParsed + ' text=' + String(hAnon.text).substring(0, 60));
+      check('#68a1 无凭据 /api/health 不得外带 db 路径/codely token 期限/usage 汇总',
+        hAnon.status === 200 && hbParsed && leaked.length === 0,
+        'status=' + hAnon.status + ' 外带字段=[' + leaked.join(',') + '] keys=' + Object.keys(hbObj).join(','));
+      check('#68a2 收窄只许留存活与负载计数(不得顺手把 clients 也删掉——既有锁 :901 依赖它)',
+        hbObj.status === 'ok' && typeof hbObj.uptime === 'number' && typeof hbObj.clients === 'number'
+        && typeof hbObj.activeDispatches === 'number' && hbObj.port === AUTH_PORT,
+        JSON.stringify({ status: hbObj.status, clients: hbObj.clients, ad: hbObj.activeDispatches, port: hbObj.port }).substring(0, 160));
+      const hFull = await reqAuth('GET', '/api/health', null, true);
+      let fb = null, fbParsed = true;
+      try { fb = JSON.parse(hFull.text); } catch (_) { fb = null; fbParsed = false; }
+      fb = (fb && typeof fb === 'object') ? fb : {};
+      check('#68a3 带凭据必须仍能看到完整视图(codely 到期信息与 usage 一处不少:UI 与 edge-agent 的 bridge:health 依赖它)',
+        hFull.status === 200 && fbParsed && fb.codely !== undefined && fb.usage !== undefined,
+        'status=' + hFull.status + ' parsed=' + fbParsed + ' keys=' + Object.keys(fb).join(','));
     }
     try { authProc.stdin.end(); authProc.kill(); } catch { /* ignore */ }
     await sleep(400);
