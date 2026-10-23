@@ -53,6 +53,7 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 | `AI_BRIDGE_SAMPLING_TIMEOUT` | 900000 | 桥侧反向 `sampling/createMessage` 的防泄漏兜底；实际节奏由中枢 `AI_BRIDGE_EXECUTE_TIMEOUT` 管控，慢宿主可放宽 |
 | `AI_BRIDGE_CAP_EXEC` | 否 | 严格 opt-in（`1/true/yes/on`）声明 exec 能力；不带 exec 的客户端可被派发但不能承接 workspace 任务 |
 | `AI_BRIDGE_DATA_DIR` | `ai-bridge/` 内默认位置 | store 层 JSON 数据目录。**跑任何探针/沙箱实例必须显式隔离它**，否则写穿生产台账 |
+| `AI_BRIDGE_TOOLS_PATH` | 仓库内 `tools.json` | 工具注册表配置文件路径（`tool-registry.js`）。**未设时逐字节等于默认**；仅供沙箱/测试把本地假 CLI 塞进真派发链路而不触碰生产 `tools.json`（#80）。实际载入的是哪个文件由 `/api/tools` 的 `registry.file` 如实回报 |
 | `AI_BRIDGE_DB` | `~/.ai-bridge/bridge.db` | 全局 SQLite 路径。沙箱实例须**同时**隔离它（只隔离 DATA_DIR 不够，流量/派发行会写穿生产库） |
 | `AI_BRIDGE_CACHE_TTL` | 600000 | 反代幂等缓存 TTL(ms) |
 | `AI_BRIDGE_CACHE_MAX` | 100 | 反代幂等缓存条目上限(LRU) |
@@ -128,11 +129,11 @@ node test-workspace.mjs     # 44 项  工作区管理（独立临时数据目录
 node test-store-corrupt.mjs # 43 项  坏 JSON 与坏形状隔离/拒绝覆写 + 配置损坏只降级（子进程 + 隔离 DATA_DIR）
 node test-audit-fixes.mjs   # 63 项  审计修复验收（含结构锁 E/F/G/H/I/J/K/L 段）
 node test-external-fixes.mjs# 45 项  外部模型审计修复（端口 9811）
-node test-e2e.mjs           # 199 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827/9830 + 第四实例 9841，均不影响生产）
+node test-e2e.mjs           # 203 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 第二实例 9821/9827/9830 + 第四实例 9841 + 注册表接缝实例 9833/9834，均不影响生产）
 npx eslint . --ext .js,.mjs # 0 error / 19 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
 ```
 
-合计 **442 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+合计 **446 项**；`npm test` 只串了前四项，全量口径以六套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
 
 
 ### 派发长任务前必读（超时口径）
@@ -295,7 +296,9 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
   - **用量报表不再恒 0（#45）**：`traffic.usage` 曾有三种形状各写一遍（上游原样 / 归一化 / 客户端上报），而 `db.js` 的报表与 `todayTokens()` 只 SUM `prompt_tokens`+`completion_tokens`。生产实测：最近 500 条里 usage 非空的 52 条**全是**归一化形状 → `/api/usage/report` 每行 `tokens:0`，带凭据 `/api/health` 的 `usage.todayTokens=0`，`AI_BRIDGE_DAILY_TOKEN_BUDGET` 预算告警因此**永不触发**（同库 `dispatches.tokens=638931`，账在、报表看不见）。现：`db.usageTokensSql()` 单点定义 `COALESCE(input, prompt_tokens, input_tokens, 0) + COALESCE(output, completion_tokens, output_tokens, 0)三处聚合共用；**取第一个非空键而非相加**（混合键名行实测 260 而非 520）。写侧两处入站反代不再把上游原样 usage 落库，改存 `{input,output,total}`，无 usage 写 `null`（不猜）；**对外响应体一个字节都没改**（落库发生在 `res.end(respData)` 之后）。
   - **`tools.json` 损坏不再拖垮进程（#46）**：加载器原先把 `JSON.parse` 放在 try 之外、又在模块加载期执行，配置坏掉 = `server.js` 一 require 就抛 = 进程起不来 = watchdog 重启到熔断。现分 `ok / missing / corrupt-parse / corrupt-shape` 四态：损坏时静态工具按空处理、**绝不抛**、照常加载自动同步工具，并把事实写进 `logs.jsonl`（error 级）与 stderr —— 消息含状态、原因、后果（"静态工具全部缺席"）、以及"原件未被改动需人工修复"四件事；诊断经 `getLoadDiagnostics()` 暴露（`file` 只给 basename）。**与数据文件的差别是刻意的**：`tools.json` 是 git 跟踪的配置原件，服务进程**不改名、不覆写、不隔离**它（P0 那套 `.corrupt-*` 只用于运行数据）。`missing`（文件不存在）是合法部署态，不写 error 级。
   - **幂等缓存的流式命中终于合法（#47）**：缓存只由非流式 200 响应写入，而 `cacheKey` 不含 `stream`，于是流式请求命中同一 key 时旧代码把 **JSON 原文**直接 `res.write()` 进 `text/event-stream` 响应 —— SSE 解析器丢弃所有非 `data:` 前缀的行，客户端拿到**空流**却被告知 `X-Cache: HIT`「成功」；文档与代码注释当时都写着「合成单块 SSE」，实现根本不合（现均已改为与实现一致）。新增零依赖纯函数 `sse-replay.js` 负责合成，命中分支三分支：非流式原样回放 / 流式可回放→合成 / 流式不可回放→逐出并转发上游。**能力边界如实说明**：这条链只做到单元级 + 结构锁级，**没有端到端证明**「流式命中→客户端真能解析」，因为缓存唯一写入口需要真凭据的 codely-http 上游（基址在不入库的 `codely-client.js` 里），测试不该联网也不该烧免费额度 —— 接缝缺口记 **#79**。
+  - **注册表配置路径可注入（#80）**：`tools.json` 的载入路径原先硬编码在 `tool-registry.js:98`，测试无法在不碰生产配置的前提下把一个本地假 CLI 送进**真派发链路**——于是「CLI 侧到底收到什么任务文本」（#40）、「流式缓存命中的端到端形状」（#79）只能靠源码结构锁兜住，而结构锁已被 #74 证明会漏抓第二/第三写手。现 `AI_BRIDGE_TOOLS_PATH` 存在时按该文件装载（未设时逐字节不变，且刻意不用 `path.resolve('tools.json')` 防随 cwd 漂移），`/api/tools` 响应带 `registry: getLoadDiagnostics()` 让"到底读了哪个文件"可归因。附带立项 #81：`CliAdapter.detect()` 对绝对路径 `command` 恒判不可用（`where <绝对路径>` 退出码 2），而 `execute()` 走的 `resolveWindowsCommand` 却认它——跑得动却永不被派发。
 - **未修（如实列示，按当前队列序）**：
+  - #81 CLI 绝对路径可用位不对称：`detect()` 只查 `commandPaths` + `findInPath`（Windows `where <绝对路径>` 恒失败），而 `execute()` 的 `resolveWindowsCommand` 认绝对路径——同一份配置跑得动却永远不被派发，拒绝文案还是"未知工具/no_targets"（归因误导，#54 同族）
   - #57 桥默认身份是常量 `unknown`：`connectedClients` 以名字为键，同一宿主的多个派生会话必然塌进**一个**在册条目，共享 `pendingTask` 槽与能力字段；后启动会话的 `registerSeq` 基数天然更大，于是"后来者覆写全体能力"成为合法行为。且注册复用分支**静默无日志**，中枢也无 `hostCount`/poll 计数面——该缺陷目前**无法从可观测面证明有几个会话在共享身份**。
   - #58 MCP 面无异步派发：中枢支持 `body.async === true`，但 `dispatch` 工具没有 `async` 入参、也没有取回异步结果的工具，宿主只能吃同步窗口。
   - #60 失败判定器仍会被**短文本里的数字子串**误伤：`looksLikeError` 只要正文 ≤400 字符即返回 true，而关键词表含裸 `'401'/'402'/'429'`，于是"耗时 4021ms""见 `:398-401`"这类成功产出可能被记成失败（#37 只修了长文那一半）。
