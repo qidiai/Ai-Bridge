@@ -69,8 +69,8 @@ function loadJSON (file) {
   return {};
 }
 function saveJSONSync (file, data) {
-  if (file === SWITCHES_FILE || file === 'switches') store.saveSync('switches', data);
-  else if (file === STATS_FILE || file === 'stats') store.saveSync('stats', data);
+  if (file === SWITCHES_FILE || file === 'switches') return store.saveSync('switches', data);
+  else if (file === STATS_FILE || file === 'stats') return store.saveSync('stats', data);
 }
 
 function recordTokens (tool, usage, duration) {
@@ -1316,8 +1316,13 @@ const server = http.createServer(async (req, res) => {
       if (!tool) { sendJSON(res, 404, { error: `未知或有歧义的工具: ${body.tool}` }); return; }
       const sw = loadJSON(SWITCHES_FILE);
       sw[tool.id] = !!body.enabled;
-      saveJSONSync(SWITCHES_FILE, sw);
+      let saved;
+      try { saved = saveJSONSync(SWITCHES_FILE, sw); } catch (_) { saved = false; }
       refreshToolStatus();
+      if (saved === false) {
+        sendJSON(res, 503, { error: '开关状态未能持久化（switches.json 处于隔离或写入故障状态）', persisted: false, runtimeOnly: true, tool: tool.name, toolId: tool.id, enabled: !!body.enabled });
+        return;
+      }
       sendJSON(res, 200, { success: true, tool: tool.name, toolId: tool.id, canonicalId: tool.canonicalId, enabled: !!body.enabled });
       return;
     }

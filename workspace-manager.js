@@ -96,7 +96,38 @@ function loadState () {
 }
 
 function saveState (state) {
-  store.saveSync('workspaces', state);
+  return store.saveSync('workspaces', state);
+}
+
+/* ── 落盘失败归因(返工单 R1:#54 同族,原因必须指向真因且有界) ──────────────
+ * store.saveSync 有两种失败形态,语义完全不同,必须分别上报,不得折成一个布尔:
+ *   - 返回 false : 该 key 本轮已被隔离(损坏/形状非法)→ 拒绝覆写。此时没有异常对象,
+ *                  只能如实写"被拒绝持久化",绝不伪造底层原因。
+ *   - 抛异常     : 真实写入故障(权限/磁盘满/EISDIR/...)→ 带底层原因签名。
+ */
+const CAUSE_MAX = 200;
+const REFUSED_CAUSE = '被拒绝持久化（workspaces 本轮已因解析损坏被隔离，见 logs.jsonl 与 .corrupt-* 备份）';
+
+/** 有界原因摘要:压掉换行,超长时保留尾部(真因多在末尾)并把开头错误码补回,总长不超过 CAUSE_MAX */
+function causeOf (e) {
+  const msg = String((e && e.message) || e || '').replace(/\s+/g, ' ').trim();
+  if (!msg) return '未知写入故障（无异常信息）';
+  if (msg.length <= CAUSE_MAX) return msg;
+  const codeMatch = /^[A-Z]+(?=:| )/.exec(msg);
+  const prefix = codeMatch ? codeMatch[0] + ': ' : '';
+  return prefix + '…' + msg.slice(-(CAUSE_MAX - prefix.length - 1));
+}
+
+/** 唯一落盘入口的失败采集:永不抛、永不含糊,返回 { ok, cause, err } */
+function trySaveState (state) {
+  let raw;
+  try {
+    raw = saveState(state);
+  } catch (e) {
+    return { ok: false, refused: false, cause: causeOf(e), err: e };
+  }
+  if (raw === false) return { ok: false, refused: true, cause: REFUSED_CAUSE, err: null };
+  return { ok: true, refused: false, cause: '', err: null };
 }
 
 function safeIsDir (p) {
@@ -248,11 +279,10 @@ function create (input = {}) {
     useCount: 0
   };
   state.workspaces.unshift(rec);
-  try {
-    saveState(state);
-  } catch (e) {
-    if (managedPath) { try { fs.rmSync(managedPath, { recursive: true, force: true }); } catch (_) {} }
-    throw e;
+  const savedCreate = trySaveState(state);
+  if (!savedCreate.ok) {
+    if (managedPath) { try { fs.rmSync(managedPath, { recursive: true, force: true }); } catch (__) {} }
+    throw fail(500, `工作区注册表未能落盘，已回收创建目录: ${rec.name} — ${savedCreate.cause}`);
   }
   return publicView(rec);
 }
@@ -264,7 +294,8 @@ function archive (ref) {
   if ((_activeRuns.get(rec.id)?.size || 0) > 0) throw fail(409, `工作区正在执行任务,无法归档: ${rec.name}`);
   rec.status = STATUS_ARCHIVED;
   rec.updatedAt = nowIso();
-  saveState(state);
+  const savedArchive = trySaveState(state);
+  if (!savedArchive.ok) throw fail(500, `工作区归档未能落盘: ${rec.name} — ${savedArchive.cause}`);
   return publicView(rec);
 }
 
@@ -275,13 +306,15 @@ function restore (ref) {
   assertPathUsable(rec);
   rec.status = STATUS_ACTIVE;
   rec.updatedAt = nowIso();
-  saveState(state);
+  const savedRestore = trySaveState(state);
+  if (!savedRestore.ok) throw fail(500, `工作区恢复未能落盘: ${rec.name} — ${savedRestore.cause}`);
   return publicView(rec);
 }
 
 /**
  * 解除登记。deleteFiles=true 时仅允许回收受管目录,并再次校验路径确实位于
  * 受管根目录内(防符号链接/配置篡改导致误删用户目录)。
+ * 先落盘后回收：反序会留下指向已消失目录的悬空记录。
  */
 function remove (ref, opts = {}) {
   const state = loadState();
@@ -289,22 +322,36 @@ function remove (ref, opts = {}) {
   if ((_activeRuns.get(rec.id)?.size || 0) > 0) throw fail(409, `工作区正在执行任务,无法删除: ${rec.name}`);
 
   const deleteFiles = opts.deleteFiles === true;
-  let filesDeleted = false;
+  let realTarget = null;
   if (deleteFiles) {
     if (rec.mode !== MODE_MANAGED) throw fail(400, '只能回收受管工作区的目录文件;登记目录仅解除登记');
     const root = workspaceRoot();
     const realRoot = realPathOrNull(root);
-    const realTarget = realPathOrNull(rec.path);
+    realTarget = realPathOrNull(rec.path);
     if (!realRoot || !realTarget || !isInside(realTarget, realRoot)) {
       throw fail(400, '受管工作区路径越界,拒绝删除文件');
     }
-    fs.rmSync(realTarget, { recursive: true, force: true });
-    filesDeleted = true;
   }
 
   const deleted = publicView(rec);
-  state.workspaces = state.workspaces.filter(w => w.id !== rec.id);
-  saveState(state);
+  const nextState = { ...state, workspaces: state.workspaces.filter(w => w.id !== rec.id) };
+  const savedRemove = trySaveState(nextState);
+  if (!savedRemove.ok) throw fail(500, `工作区注册表未能落盘，已取消文件回收: ${rec.name} — ${savedRemove.cause}`);
+
+  let filesDeleted = false;
+  if (deleteFiles) {
+    try {
+      fs.rmSync(realTarget, { recursive: true, force: true });
+      filesDeleted = true;
+    } catch (e) {
+      const rollback = trySaveState(state);
+      if (!rollback.ok) {
+        store.appendLog('error', `工作区删除回滚失败，注册表与磁盘不一致需人工核查: ${rec.name} — 回收原因: ${causeOf(e)} — 回滚原因: ${rollback.cause}`);
+      }
+      throw fail(500, `工作区目录回收失败，已恢复注册表登记: ${rec.name} — ${causeOf(e)}`);
+    }
+  }
+
   _activeRuns.delete(rec.id);
   return { deleted, filesDeleted };
 }

@@ -124,19 +124,40 @@ async function main () {
     // writeFileSync 必抛 EISDIR。不碰生产、不需网络、不需要权限。
     const inj = ws.create({ name: 'inj-order', description: '#43b 写失败注入' });
     const tmpPath = path.join(DATA_DIR, 'workspaces.json.tmp');
-    fs.mkdirSync(tmpPath, { recursive: true });
+    const injectOn = () => fs.mkdirSync(tmpPath, { recursive: true });
+    const injectOff = () => fs.rmSync(tmpPath, { recursive: true, force: true });
+    const codeOf = (e) => (typeof e.statusCode === 'number' ? e.statusCode : null);
 
-    // ① 创建期(注入仍在时)——先测这条,因为它和删除期共用同一个注入物
+    // ① 创建期(注入在时)——失败必须 5xx、不留孤儿目录、且原因不被吞
+    injectOn();
     let cCode = null, cMsg = '', cPath = null;
     try { cPath = ws.create({ name: 'inj-create', description: '#43c1 创建期写失败' }).path; }
-    catch (e) { cCode = (typeof e.statusCode === 'number' ? e.statusCode : null); cMsg = e.message; }
+    catch (e) { cCode = codeOf(e); cMsg = e.message; }
     check('#43c1 创建期落盘失败须回传 5xx、不得留下孤儿目录、错误须含底层原因签名(EISDIR 不得被吞)',
       (cCode === 500 || cCode === 503) && (cPath === null || !fs.existsSync(cPath)) && /EISDIR|illegal operation/.test(cMsg),
       'code=' + cCode + ' 目录在=' + (cPath === null ? 'n/a' : fs.existsSync(cPath)) + ' msg=' + cMsg.substring(0, 80));
 
-    // ② 删除期:先落盘后回收
+    // ② 归档期(同一把尺子:同函数族不得两套口径)
+    let aCode = null, aMsg = '';
+    try { ws.archive(inj.id); } catch (e) { aCode = codeOf(e); aMsg = e.message; }
+    check('#43d1 归档期落盘失败须回传 5xx 且含底层原因签名(防"只修创建/删除两条路径"的半修)',
+      (aCode === 500 || aCode === 503) && /EISDIR|illegal operation/.test(aMsg),
+      'code=' + aCode + ' msg=' + aMsg.substring(0, 80));
+
+    // ③ 恢复期:先把记录真的写成 archived(撤注入→归档成功→再注入),再触发 restore 落盘失败
+    injectOff();
+    let armedArchive = null;
+    try { armedArchive = ws.archive(inj.id); } catch (e) { armedArchive = { err: e.message }; }
+    injectOn();
+    let rCode = null, rMsg = '';
+    try { ws.restore(inj.id); } catch (e) { rCode = codeOf(e); rMsg = e.message; }
+    check('#43d2 恢复期落盘失败须回传 5xx 且含底层原因签名(前置:归档确实已落盘=' + (armedArchive && armedArchive.status) + ')',
+      (rCode === 500 || rCode === 503) && /EISDIR|illegal operation/.test(rMsg),
+      'code=' + rCode + ' msg=' + rMsg.substring(0, 80));
+
+    // ④ 删除期:先落盘后回收
     let injCode = null, injMsg = '';
-    try { ws.remove(inj.id, { deleteFiles: true }); } catch (e) { injCode = (typeof e.statusCode === 'number' ? e.statusCode : (typeof e.status === 'number' ? e.status : null)); injMsg = e.message; }
+    try { ws.remove(inj.id, { deleteFiles: true }); } catch (e) { injCode = codeOf(e); injMsg = e.message; }
     check('#43b1 注册表落盘失败时不得删除受管目录(现状:rmSync 已先删掉目录,落盘随后才失败)',
       fs.existsSync(inj.path), '目录仍在=' + fs.existsSync(inj.path) + ' err=' + injMsg.substring(0, 70));
     check('#43b2 不得留下"注册表仍指向、目录已消失"的悬空记录(现状:记录在 + 目录没 = 后续 dispatch 必失败且难归因)',
@@ -147,8 +168,8 @@ async function main () {
     check('#43b6 删除期落盘失败的错误必须含底层原因签名(现状:只报"未能落盘",原因被吞 → 运维分不清权限/磁盘/隔离,#54 同族)',
       /EISDIR|illegal operation/.test(injMsg), 'msg=' + injMsg.substring(0, 90));
 
-    // ③ 撤掉注入 → 正常路径必须照旧(防"一律拒写/永不删文件"式假修复)
-    fs.rmSync(tmpPath, { recursive: true, force: true });
+    // ⑤ 撤掉注入 → 正常路径必须照旧(防"一律拒写/永不删文件"式假修复)
+    injectOff();
     let retry = null, retryErr = '';
     try { retry = ws.remove(inj.id, { deleteFiles: true }); } catch (e) { retryErr = e.message; }
     check('#43b4 哨兵:注入物移除后正常删除必须仍成功(目录与记录一并消失)——防"永不删文件"式假修复',
