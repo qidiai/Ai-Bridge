@@ -273,6 +273,18 @@ function clearTraffic () {
 }
 
 // ── 用量报表:按天/按工具聚合(traffic 表,反代调用;events 表,透传观测) ──
+
+// S1 单点:traffic.usage(JSON 文本列)算 tokens 的唯一 SQL 表达式生成器。
+// 规则:COALESCE 链(取第一个非空键),不得把两种键名相加——同一行里
+// {input:200 与 OpenAI 原样键} 只能算 260 入,不能翻倍(重复计数陷阱,历史复发过)。
+// 覆盖已落库的三种形态:归一化 {input,output} / 上游原样 / 客户端上报 {input_tokens,output_tokens}。
+// 三处聚合(byDay、byTool、todayTokens)必须共用此表达式,不得各自再手写键名。
+function usageTokensSql (col = 'usage') {
+  const j = (key) => `CAST(json_extract(${col}, '$.${key}') AS INTEGER)`;
+  return `COALESCE(${j('input')}, ${j('prompt_tokens')}, ${j('input_tokens')}, 0)`
+    + ` + COALESCE(${j('output')}, ${j('completion_tokens')}, ${j('output_tokens')}, 0)`;
+}
+
 function usageReport (days = 7) {
   const db = getDb();
   if (!db) return { available: false, byDay: [], byTool: [] };
@@ -282,7 +294,7 @@ function usageReport (days = 7) {
       SELECT substr(ts, 1, 10) AS day, tool,
              COUNT(*) AS calls,
              SUM(CASE WHEN success THEN 1 ELSE 0 END) AS ok,
-             COALESCE(SUM(CAST(json_extract(usage, '$.prompt_tokens') AS INTEGER) + CAST(json_extract(usage, '$.completion_tokens') AS INTEGER)), 0) AS tokens
+             COALESCE(SUM(${usageTokensSql()}), 0) AS tokens
       FROM traffic
       WHERE direction = 'in' AND ts >= ?
       GROUP BY day, tool
@@ -290,7 +302,7 @@ function usageReport (days = 7) {
     `).all(since).map(r => ({ ...r, ok: !!r.ok }));
     const byTool = db.prepare(`
       SELECT tool, COUNT(*) AS calls,
-             COALESCE(SUM(CAST(json_extract(usage, '$.prompt_tokens') AS INTEGER) + CAST(json_extract(usage, '$.completion_tokens') AS INTEGER)), 0) AS tokens
+             COALESCE(SUM(${usageTokensSql()}), 0) AS tokens
       FROM traffic
       WHERE direction = 'in' AND ts >= ?
       GROUP BY tool ORDER BY tokens DESC
@@ -308,7 +320,7 @@ function todayTokens () {
     const pad = (n) => String(n).padStart(2, '0');
     const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
     const row = db.prepare(`
-      SELECT COALESCE(SUM(CAST(json_extract(usage, '$.prompt_tokens') AS INTEGER) + CAST(json_extract(usage, '$.completion_tokens') AS INTEGER)), 0) AS tokens
+      SELECT COALESCE(SUM(${usageTokensSql()}), 0) AS tokens
       FROM traffic WHERE direction = 'in' AND substr(ts, 1, 10) = ?
     `).get(today);
     return row?.tokens || 0;
@@ -339,7 +351,7 @@ module.exports = {
   createAsyncTask, finishAsyncTask, getAsyncTask, markOrphanTasks,
   recordEvent, eventsSummary,
   recordTraffic, queryTraffic, clearTraffic,
-  usageReport, todayTokens,
+  usageReport, todayTokens, usageTokensSql,
   stats,
   get available () { return _available; },
   get dbPath () { return _dbPath; }

@@ -293,8 +293,11 @@ function forwardCodelyLiteLLM (ctx) {
         res.end(respData);
         try {
           const parsed = JSON.parse(respData);
-          db.recordTraffic({ ts: new Date().toISOString(), direction: 'in', tool: model.id, taskId, type: 'openai-proxy', success: true, content: (parsed.choices?.[0]?.message?.content || parsed.content?.[0]?.text || '').substring(0, 8000), usage: parsed.usage || null, source: 'bridge' });
+          // 写侧归一(#45 S2):落库只写形状 {input,output,total},不再存上游原样 usage(形状①是病源)。
+          // 上游键名在此仅用于"读取响应",不入库;HTTP 响应体(res.end(respData))原样透传,一个字节都不改。
           const usageTokens = parsed.usage ? { input: parsed.usage.prompt_tokens || parsed.usage.input_tokens || 0, output: parsed.usage.completion_tokens || parsed.usage.output_tokens || 0 } : { input: estimateTokens(JSON.stringify(messages || [])), output: estimateTokens(parsed.choices?.[0]?.message?.content || parsed.content?.[0]?.text || ''), estimated: true };
+          usageTokens.total = usageTokens.input + usageTokens.output;
+          db.recordTraffic({ ts: new Date().toISOString(), direction: 'in', tool: model.id, taskId, type: 'openai-proxy', success: true, content: (parsed.choices?.[0]?.message?.content || parsed.content?.[0]?.text || '').substring(0, 8000), usage: usageTokens, source: 'bridge' });
           recordTokens(model.id, usageTokens, '—');
         } catch (_) {}
       });
@@ -2077,7 +2080,12 @@ const server = http.createServer(async (req, res) => {
               res.end(respData);
               try {
                 const parsed = JSON.parse(respData);
-                db.recordTraffic({ ts: new Date().toISOString(), direction: 'in', tool: model.id, taskId, type: 'openai-proxy', success: true, content: (parsed.choices?.[0]?.message?.content || '').substring(0, 8000), usage: parsed.usage || null, source: 'bridge' });
+                // 写侧归一(#45 S2):落库只写 {input,output,total},不再存上游原样 usage;上游键名仅用于读取响应。
+                // HTTP 响应体(res.end(respData))原样透传,不改一个字节。无 usage 时写 null(不猜,L3b 精神)。
+                const inTok = parsed.usage ? (parsed.usage.prompt_tokens || parsed.usage.input_tokens || 0) : 0;
+                const outTok = parsed.usage ? (parsed.usage.completion_tokens || parsed.usage.output_tokens || 0) : 0;
+                const usageRow = parsed.usage ? { input: inTok, output: outTok, total: inTok + outTok } : null;
+                db.recordTraffic({ ts: new Date().toISOString(), direction: 'in', tool: model.id, taskId, type: 'openai-proxy', success: true, content: (parsed.choices?.[0]?.message?.content || '').substring(0, 8000), usage: usageRow, source: 'bridge' });
                 if (parsed.usage) recordTokens(model.id, { input: parsed.usage.prompt_tokens || 0, output: parsed.usage.completion_tokens || 0 }, '—');
               } catch (_) {}
             });
