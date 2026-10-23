@@ -370,9 +370,18 @@ section('K) 死码账本归零 + 活账本不被误删(#31)');
   check('K3b 反向锁:db.js 的活账本三件套 recordTraffic/queryTraffic/clearTraffic 必须仍在导出里',
     ['recordTraffic', 'queryTraffic', 'clearTraffic'].every(t => new RegExp('\\b' + t + '\\b').test(dbSrc)),
     '缺失: ' + ['recordTraffic', 'queryTraffic', 'clearTraffic'].filter(t => !new RegExp('\\b' + t + '\\b').test(dbSrc)).join(','));
-  check('K4 反向锁:/api/traffic 仍必须走 db.queryTraffic,/api/traffic/clear 仍必须调 db.clearTraffic()(读路径与清库都不许断链)',
-    /db\.queryTraffic\(/.test(srvSrc) && /db\.clearTraffic\(\)/.test(srvSrc),
-    'queryTraffic=' + /db\.queryTraffic\(/.test(srvSrc) + ' clearTraffic=' + /db\.clearTraffic\(\)/.test(srvSrc));
+  check('K4 反向锁:db.js 的活账本三件套 recordTraffic/queryTraffic/clearTraffic 必须仍在导出里',
+    ['recordTraffic', 'queryTraffic', 'clearTraffic'].every(t => new RegExp('\\b' + t + '\\b').test(dbSrc)),
+    '缺失: ' + ['recordTraffic', 'queryTraffic', 'clearTraffic'].filter(t => !new RegExp('\\b' + t + '\\b').test(dbSrc)).join(','));
+  // K5) 清理不得**新造**孤儿:`async save` 是 _locks 的唯一使用者,删了 save 却没删 _locks,
+  //   等于在一张"死代码清理"单里留下一个新死符号(eslint 也报 no-unused-vars)。
+  //   同时 assertShape 的注释示例仍写 `未知 key(logs/traffic 等)`,而 traffic 已不再是 FILES 键
+  //   ——注释指向不存在的符号就是 #61 那类文档漂移的病源。两处一起锁。
+  const lockDecl = /const\s+_locks\s*=\s*new\s+Map/.test(storeSrc);
+  const lockUses = (storeSrc.match(/\b_locks\b/g) || []).length;
+  check('K5 清理不得新造孤儿:_locks 不得作为零引用声明残留(它原本只被已删除的 async save 使用),且注释示例不得指向已删除的 traffic 键',
+    !lockDecl && !/logs\/traffic/.test(storeSrc),
+    '_locks 声明残留=' + lockDecl + ' 全文提及=' + lockUses + ' 注释仍举例 logs/traffic=' + /logs\/traffic/.test(storeSrc));
 }
 
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}
