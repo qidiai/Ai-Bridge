@@ -208,7 +208,7 @@ function eventsSummary (days) {
           SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
           SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS successes, AVG(duration_ms) AS avg_ms
         FROM events WHERE ts >= ? GROUP BY source, channel ORDER BY n DESC`).all(since),
-      byDay: db.prepare(`SELECT substr(ts, 1, 10) AS day, source, COUNT(*) AS n,
+      byDay: db.prepare(`SELECT ${dayExpr()} AS day, source, COUNT(*) AS n,
           SUM(input_tokens + output_tokens) AS tokens
         FROM events WHERE ts >= ? GROUP BY day, source ORDER BY day DESC`).all(since),
       recent: db.prepare(`SELECT ts, source, channel, event_type, model,
@@ -216,6 +216,34 @@ function eventsSummary (days) {
         FROM events ORDER BY id DESC LIMIT 20`).all()
     };
   } catch (e) { _lastError = e.message; return null; }
+}
+
+// 观测事件读回:按 source / eventType 过滤,时间倒序。
+// 安全约束:source 可能来自 URL 路径分段(外部可控),因此所有条件一律走 prepare 的绑定参数,
+// 绝不把调用方字符串拼进 SQL;条件片段本身是常量,拼接只发生在常量之间。
+// 失败安全与 queryTraffic 同形:取不到库或查询出错都回空数组而不抛,并沿用本文件的留痕字段。
+function queryEvents (opts = {}) {
+  const db = getDb();
+  if (!db) return [];
+  try {
+    const conditions = [];
+    const params = [];
+    if (opts.source) { conditions.push('source = ?'); params.push(String(opts.source)); }
+    if (opts.eventType) { conditions.push('event_type = ?'); params.push(String(opts.eventType)); }
+    const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+    const limit = Math.max(1, Math.min(opts.limit || 20, 200));
+    const rows = db.prepare(`SELECT ts, source, channel, event_type, duration_ms, success, detail
+      FROM events ${where} ORDER BY ts DESC, id DESC LIMIT ?`).all(...params, limit);
+    return rows.map(r => ({
+      ts: r.ts,
+      source: r.source,
+      channel: r.channel,
+      type: r.event_type,
+      success: !!r.success,
+      detail: r.detail,
+      durationMs: r.duration_ms
+    }));
+  } catch (e) { _lastError = e.message; return []; }
 }
 
 // ── 查询/统计 ──
@@ -285,13 +313,22 @@ function usageTokensSql (col = 'usage') {
     + ` + COALESCE(${j('output')}, ${j('completion_tokens')}, ${j('output_tokens')}, 0)`;
 }
 
+// S1 单点:用量统计只能有一本日历。凡按"日"分组/比较者(usageReport.byDay、
+// todayTokens 的比较、eventsSummary.byDay)一律经此表达式,不得再各写各的 UTC 日截取。
+// 读侧统一按**本地日**(datetime(...,'localtime') 跟随进程时区),与 todayTokens 用
+// getFullYear/getMonth/getDate 拼出的本地 today 同源;写侧 ts 仍落 UTC ISO(带 Z),
+// 本改动只读不写(#78c3 锁着落库格式)。
+function dayExpr (col = 'ts') {
+  return `substr(datetime(${col}, 'localtime'), 1, 10)`;
+}
+
 function usageReport (days = 7) {
   const db = getDb();
   if (!db) return { available: false, byDay: [], byTool: [] };
   try {
     const since = new Date(Date.now() - Math.max(1, days) * 86400000).toISOString();
     const byDay = db.prepare(`
-      SELECT substr(ts, 1, 10) AS day, tool,
+      SELECT ${dayExpr()} AS day, tool,
              COUNT(*) AS calls,
              SUM(CASE WHEN success THEN 1 ELSE 0 END) AS ok,
              COALESCE(SUM(${usageTokensSql()}), 0) AS tokens
@@ -311,7 +348,8 @@ function usageReport (days = 7) {
   } catch (e) { _lastError = e.message; return { available: false, byDay: [], byTool: [] }; }
 }
 
-// 今日(本地时区)token 总量:预算告警用
+// 今日 token 总量(AI_BRIDGE_DAILY_TOKEN_BUDGET 告警唯一输入):本地 today 串与 SQL 比较两侧
+// 共用 dayExpr() 这同一本本地日历;写侧 ts 仍按 UTC ISO 落库,不受此处读法影响。
 function todayTokens () {
   const db = getDb();
   if (!db) return 0;
@@ -321,7 +359,7 @@ function todayTokens () {
     const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
     const row = db.prepare(`
       SELECT COALESCE(SUM(${usageTokensSql()}), 0) AS tokens
-      FROM traffic WHERE direction = 'in' AND substr(ts, 1, 10) = ?
+      FROM traffic WHERE direction = 'in' AND ${dayExpr()} = ?
     `).get(today);
     return row?.tokens || 0;
   } catch (e) { _lastError = e.message; return 0; }
@@ -349,7 +387,7 @@ function stats () {
 module.exports = {
   getDb, recordDispatch, recordMeeting, recordReview,
   createAsyncTask, finishAsyncTask, getAsyncTask, markOrphanTasks,
-  recordEvent, eventsSummary,
+  recordEvent, eventsSummary, queryEvents,
   recordTraffic, queryTraffic, clearTraffic,
   usageReport, todayTokens, usageTokensSql,
   stats,

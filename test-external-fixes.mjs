@@ -15,6 +15,7 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -125,6 +126,8 @@ async function waitClientConnected (name, timeoutMs = 15000) {
 }
 
 let serverProc = null, probeProc = null, otherProc = null, serverErr = '';
+// #64 本格额外起的中枢/假上游,统一登记给 finally 收尾(不留孤儿进程占端口)
+const extraProcs = [];
 
 async function main () {
   process.stdout.write('外人体验修复批次 锁定验收测试\n' + '='.repeat(40) + '\n');
@@ -294,6 +297,178 @@ async function main () {
     check('V-5 多个标记取最后一个(仅剥离该行)', d.usage?.input === 7 && d.usage?.output === 8 && String(d.content).split('\n').pop() === 'y', JSON.stringify(d).substring(0, 200));
     const f = need('big\n[USAGE] input=999999999 output=999999999');
     check('V-6 超 1e8 视为无效值:仍剥离但 usage=null', f.content === 'big' && f.usage === null, JSON.stringify(f).substring(0, 150));
+  }
+
+  // ── #64 免鉴权面的对端约束(/proxy/ 与 Web UI 声称"仅本地"却无人核实) ──
+  // 病灶:server.js 全文 0 处 remoteAddress 检查,而 AI_BRIDGE_HOST 可被设成 0.0.0.0;
+  //   /proxy/ 在鉴权门之前分发,任何非本地对端都能拿中枢当免费中继(能花钱、能观测)。
+  // 判据口径:一律取"上游到底收到几个请求"这一直接证据,不看响应文案(文案是实现细节,锁它=锁一张嘴)。
+  section('#64: 免鉴权面必须核实对端(非回环不得无凭据借道 /proxy/ 与 Web UI)');
+  const R64_LAN_PORT = 9818, R64_UP_PORT = 9817, R64_BARE_PORT = 9819;
+  const R64_TOKEN = 'r64-token';
+  const lanIp = (() => {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const a of list || []) if (a.family === 'IPv4' && !a.internal) return a.address;
+    }
+    return null;
+  })();
+  const srcNow = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf-8');
+  let upHits = 0; const upPeers = [];
+  const upSrv = http.createServer((q, s) => {
+    upHits++; upPeers.push(q.socket.remoteAddress);
+    s.writeHead(200, { 'Content-Type': 'application/json' });
+    s.end(JSON.stringify({ choices: [{ message: { content: 'UP_HIT' } }], usage: { prompt_tokens: 3, completion_tokens: 4 } }));
+  });
+
+  // 通用请求器(全局 req 把 HOST/PORT 写死了,本格的第三方中枢要按指定 host/port 打)
+  const reqTo = (hostname, port, method, p, body, headers) => new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const h = { ...(headers || {}) };
+    if (data) { h['Content-Type'] = 'application/json'; h['Content-Length'] = Buffer.byteLength(data); }
+    const r = http.request({ hostname, port, path: p, method, headers: h, timeout: 8000 }, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => { try { resolve({ status: res.statusCode, body: JSON.parse(d || '{}'), raw: d }); } catch { resolve({ status: res.statusCode, body: null, raw: d }); } });
+    });
+    r.on('error', reject);
+    r.on('timeout', () => { r.destroy(); reject(new Error('reqTo 超时 ' + p)); });
+    if (data) r.write(data);
+    r.end();
+  });
+
+  // 有界轮询起中枢(本格新写的等待必须遵守 #115 立的规矩:固定 sleep 不算就绪判据)
+  const bootHub = (port, env, dirName) => new Promise((resolve, reject) => {
+    const proc = spawn(process.execPath, ['server.js'], {
+      cwd: __dirname,
+      env: {
+        ...process.env, AI_BRIDGE_PORT: String(port), AI_BRIDGE_HOST: '0.0.0.0',
+        AI_BRIDGE_DATA_DIR: testDataPath(dirName), AI_BRIDGE_DB: testDataPath(path.join(dirName, 'lan.db')),
+        AI_BRIDGE_OBSERVE_DIR: testDataPath(path.join(dirName, 'observe')), AI_BRIDGE_WORKSPACE_ROOT: testDataPath(path.join(dirName, 'ws')),
+        AI_BRIDGE_TOKEN: '', ...env
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    extraProcs.push(proc);
+    let out = '';
+    proc.stdout.on('data', d => { out += d.toString(); });
+    proc.stderr.on('data', d => { out += d.toString(); });
+    const t0 = Date.now(); let tried = 0;
+    const tick = async () => {
+      if (Date.now() - t0 > 20000) { reject(new Error('中枢启动超时(20s) stdout=' + out.substring(0, 300))); return; }
+      tried++;
+      try {
+        const r = await reqTo('127.0.0.1', port, 'GET', '/api/health', null, null);
+        if (r.status === 200) { resolve({ proc, out: () => out, polls: tried, elapsedMs: Date.now() - t0 }); return; }
+      } catch { /* 还没起来,继续轮询 */ }
+      setTimeout(tick, 100);
+    };
+    setTimeout(tick, 50);
+  });
+
+  try {
+    if (!lanIp) throw new Error('本机没有非回环 IPv4,无法构造非本地对端(本格判据不能假装绿)');
+    await new Promise((res, rej) => { upSrv.once('error', rej); upSrv.listen(R64_UP_PORT, '0.0.0.0', res); });
+    extraProcs.push(upSrv);
+    const lan = await bootHub(R64_LAN_PORT, { AI_BRIDGE_TOKEN: R64_TOKEN }, 'lan-hub');
+
+    // 控制组先跑:路由登记要凭据(证明门还在工作),且登记成功是后面所有判据的前提
+    const regRoute = await reqTo('127.0.0.1', R64_LAN_PORT, 'POST', '/api/observe/route',
+      { source: 'r64src', key: 'r64key', upstream: `http://127.0.0.1:${R64_UP_PORT}` }, { authorization: `Bearer ${R64_TOKEN}` });
+    const regNoAuth = await reqTo('127.0.0.1', R64_LAN_PORT, 'POST', '/api/observe/route', { source: 'x', key: 'y', upstream: 'http://127.0.0.1:1' }, null);
+    check('#64a0 控制组:登记路由须凭据(有 token 200 / 无 token 401),且假上游服务已就位',
+      regRoute.status === 200 && regNoAuth.status === 401 && upHits === 0,
+      `带凭据=${regRoute.status} 无凭据=${regNoAuth.status} 上游已收到=${upHits}`);
+
+    // ── 红:非回环无凭据借道 /proxy/ ──
+    const hitBeforeRemote = upHits;
+    const proxyRemote = await reqTo(lanIp, R64_LAN_PORT, 'POST', '/proxy/r64src/r64key/v1/chat/completions', { model: 'm', messages: [] }, null);
+    check('#64a1 红:非回环对端无凭据打 /proxy/ 必须被拒且上游零收到(现状=免鉴权直接透传,上游收到 1 次)',
+      upHits - hitBeforeRemote === 0 && (proxyRemote.status === 401 || proxyRemote.status === 403),
+      `上游增量=${upHits - hitBeforeRemote} status=${proxyRemote.status} 对端=${lanIp}`);
+
+    // ── 红:X-Forwarded-For 伪造"我在本地"不得生效(判据必须读 socket,不读可伪造的头) ──
+    const hitBeforeSpoof = upHits;
+    const proxySpoof = await reqTo(lanIp, R64_LAN_PORT, 'POST', '/proxy/r64src/r64key/v1/chat/completions',
+      { model: 'm', messages: [] }, { 'x-forwarded-for': '127.0.0.1', 'x-real-ip': '127.0.0.1' });
+    check('#64a4 红:非回环对端伪造 X-Forwarded-For:127.0.0.1 仍须被拒(判据取 socket,不取请求头)',
+      upHits - hitBeforeSpoof === 0 && (proxySpoof.status === 401 || proxySpoof.status === 403),
+      `上游增量=${upHits - hitBeforeSpoof} status=${proxySpoof.status}`);
+
+    // ── 红:Web UI 的"只允许本地访问"同样无人核实 ──
+    const uiRemote = await reqTo(lanIp, R64_LAN_PORT, 'GET', '/', null, null);
+    const uiHtml = /<html|<!doctype/i.test(String(uiRemote.raw || ''));
+    check('#64a2 红:非回环对端取 Web UI 根路径不得拿到页面(现状=注释声称仅本地但 0 处 remoteAddress 检查)',
+      !uiHtml && (uiRemote.status === 401 || uiRemote.status === 403),
+      `status=${uiRemote.status} 拿到HTML=${uiHtml} 长度=${String(uiRemote.raw || '').length}`);
+
+    // ── 反向自证:约束不得过宽(本地工具接管不能被打断,LAN 显式带凭据必须仍可) ──
+    const hitBeforeLocal = upHits;
+    const proxyLocal = await reqTo('127.0.0.1', R64_LAN_PORT, 'POST', '/proxy/r64src/r64key/v1/chat/completions', { model: 'm', messages: [] }, null);
+    const deltaLocal = upHits - hitBeforeLocal;
+    const hitBeforeAuthed = upHits;
+    const proxyRemoteAuthed = await reqTo(lanIp, R64_LAN_PORT, 'POST', '/proxy/r64src/r64key/v1/chat/completions',
+      { model: 'm', messages: [] }, { authorization: `Bearer ${R64_TOKEN}` });
+    const deltaAuthed = upHits - hitBeforeAuthed;
+    check('#64a3 反向自证(过宽即打红):回环免凭据仍可透传、非回环带凭据仍可透传,各让上游 +1',
+      deltaLocal === 1 && proxyLocal.status === 200 && deltaAuthed === 1 && (proxyRemoteAuthed.status === 200 || proxyRemoteAuthed.status === 502),
+      `回环增量=${deltaLocal}(应=1) status=${proxyLocal.status} | 带凭据增量=${deltaAuthed}(应=1) status=${proxyRemoteAuthed.status}`);
+
+    // ── checkAuth:等长异字节也必须 401(恒定时间比较的前置语义),且实现须用 crypto.timingSafeEqual ──
+    const sameLenBad = R64_TOKEN.substring(0, R64_TOKEN.length - 1) + 'X';
+    const aWrong = await reqTo('127.0.0.1', R64_LAN_PORT, 'GET', '/api/tools', null, { authorization: 'Bearer ' + R64_TOKEN + 'zzz' });
+    const aSameLen = await reqTo('127.0.0.1', R64_LAN_PORT, 'GET', '/api/tools', null, { authorization: 'Bearer ' + sameLenBad });
+    const aRight = await reqTo('127.0.0.1', R64_LAN_PORT, 'GET', '/api/tools', null, { authorization: 'Bearer ' + R64_TOKEN });
+    check('#64a5 红:checkAuth 语义不变(错 token/等长异字节 401、正确 200)且比较改为 crypto.timingSafeEqual 恒定时间',
+      aWrong.status === 401 && aSameLen.status === 401 && aRight.status === 200 && /timingSafeEqual/.test(srcNow),
+      `长度不同=${aWrong.status} 等长异字节=${aSameLen.status} 正确=${aRight.status} 源码含timingSafeEqual=${/timingSafeEqual/.test(srcNow)}`);
+
+    // ── 反向自证第二面:收紧不得把"外部监控存活探针"一起打死(#68 已裁定 health 在鉴权门之前、免凭据) ──
+    //   若实现把对端判定整体上移到请求入口(最省事的写法),这条会当堂打红。
+    const healthRemote = await reqTo(lanIp, R64_LAN_PORT, 'GET', '/api/health', null, null);
+    check('#64a6 反向自证(收紧不得越界):非回环无凭据取 /api/health 仍须 200 且 status=ok(#68 的裁定面)',
+      healthRemote.status === 200 && healthRemote.body?.status === 'ok',
+      `status=${healthRemote.status} body=${JSON.stringify(healthRemote.body || {}).substring(0, 160)}`);
+
+    // ── 红(#64 第一轮规格的漏洞,编码手 PROPOSALS#3 报回):未配置凭据时"回环 或 已鉴权"退化成全放行 ──
+    //   checkAuth 在 AI_BRIDGE_TOKEN 未设时恒 true(自用零负担),于是非回环对端"不出示任何东西"也算通过该支路;
+    //   若同时把 AI_BRIDGE_HOST 设成 0.0.0.0,/proxy/ 对局域网依旧是免费中继。收紧口径=非回环必须出示**已配置的**凭据。
+    const bare = await bootHub(R64_BARE_PORT, {}, 'bare-hub');
+    const bareUpPort = R64_UP_PORT;
+    const regBare = await reqTo('127.0.0.1', R64_BARE_PORT, 'POST', '/api/observe/route',
+      { source: 'r64bare', key: 'r64key', upstream: `http://127.0.0.1:${bareUpPort}` }, null);
+    const hitBeforeBare = upHits;
+    const proxyNoTokenHub = await reqTo(lanIp, R64_BARE_PORT, 'POST', '/proxy/r64bare/r64key/v1/chat/completions', { model: 'm', messages: [] }, null);
+    check('#64a8 红:未配置 AI_BRIDGE_TOKEN 的中枢被非回环对端借道 /proxy/ 仍须拒(现状=checkAuth 恒真使"回环或已鉴权"退化为全放行)',
+      regBare.status === 200 && upHits - hitBeforeBare === 0 && (proxyNoTokenHub.status === 401 || proxyNoTokenHub.status === 403),
+      `登记路由=${regBare.status} 上游增量=${upHits - hitBeforeBare}(应=0) status=${proxyNoTokenHub.status} 对端=${lanIp}`);
+    // 反向自证:同一个未配凭据的中枢,回环对端仍必须可用(自用实例零负担,收紧不得把自己人也打掉)
+    const hitBeforeBareLocal = upHits;
+    const proxyNoTokenLocal = await reqTo('127.0.0.1', R64_BARE_PORT, 'POST', '/proxy/r64bare/r64key/v1/chat/completions', { model: 'm', messages: [] }, null);
+    check('#64a8b 反向自证:未配凭据中枢的回环 /proxy/ 仍可透传(上游 +1、200),自用零负担语义不回退',
+      upHits - hitBeforeBareLocal === 1 && proxyNoTokenLocal.status === 200,
+      `增量=${upHits - hitBeforeBareLocal}(应=1) status=${proxyNoTokenLocal.status}`);
+    try { bare.proc.kill(); } catch { /* 已退出 */ }
+
+    await (async () => { try { lan.proc.kill(); } catch { /* 已退出 */ } } )();
+
+    // ── 结构锁:对端判定必须收敛为单一写手 ──
+    //   手写第二处 remoteAddress 比较是本类缺陷复发的主路径(漏 ::1 / ::ffff:127.0.0.1 就是漏判),
+    //   且 /proxy/ 与 Web UI 两条路必须共用同一把尺,否则下一条新路由又会各写一遍。
+    const rawPeerReads = (srcNow.match(/socket\.remoteAddress/g) || []).length;
+    const guardUses = (srcNow.match(/isLoopbackPeer/g) || []).length;
+    const proxyBody = srcNow.slice(srcNow.indexOf('async function handleProxy'));
+    const proxySlice = proxyBody.slice(0, proxyBody.indexOf('\n}'));
+    const uiBranch = srcNow.slice(srcNow.indexOf("if (p === '/' && req.method === 'GET')"));
+    const uiSlice = uiBranch.slice(0, uiBranch.indexOf('\n    }'));
+    check('#64a7 结构锁:全文只许一处 socket.remoteAddress 读点,且 /proxy/ 与 UI 两条路都走 isLoopbackPeer(现状 0 处判定)',
+      rawPeerReads === 1 && guardUses >= 3 && /isLoopbackPeer/.test(proxySlice) && /isLoopbackPeer/.test(uiSlice),
+      `socket.remoteAddress 读点=${rawPeerReads}(应=1) isLoopbackPeer 出现=${guardUses}(应>=3) proxy 引用=${/isLoopbackPeer/.test(proxySlice)} UI 引用=${/isLoopbackPeer/.test(uiSlice)}`);
+  } catch (e) {
+    check('#64 本格 harness 可用(拿不到非回环对端/起不来中枢都必须显式红,不得静默绿)', false, e.message);
+  } finally {
+    // extraProcs 里既有子进程(spawn)也有本进程内的 http.Server,两者关闭方式不同,混用 .kill() 会静默抛错漏关
+    for (const p of extraProcs) { try { if (typeof p.kill === 'function') p.kill(); else p.close(); } catch { /* 已退出 */ } }
+    extraProcs.length = 0;
+    try { upSrv.close(); } catch { /* 已关闭 */ }
   }
 
   // ── 静态接线检查 ──

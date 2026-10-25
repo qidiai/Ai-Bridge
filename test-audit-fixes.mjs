@@ -259,7 +259,7 @@ section('G) 任务态 map 禁止整体替换(#41)');
 //   ① `child.on('close', (code) => …)` 把第二参数 signal 整个丢了(本机实测 spawn({timeout}) 杀死时
 //      close 回 code=null, signal='SIGTERM', killed=true,与"进程自己以 0 以外的码退出"无法区分);
 //   ② 详情取 `(stderr || stdout).substring(0, 200)` 的**头部**,而真因几乎总在末尾,头部常是横幅。
-//   该 err.message 会经 server.js:514 `reason: error.message` 与 :600 `error: execError.message`
+//   该 err.message 会经 server.js:577 `reason: error.message` 与 :665 `error: execError.message`
 //   原样进台账/流量记录 —— 中枢侧无需改动,修点只在适配器。
 // 锁的是"归因必须指向真因",不锁具体措辞:允许"被信号 SIGTERM 终止/超时"等任一表达,只要
 // ①不再出现 `code null` 这种无归因字面,②详情含尾部真因,③结构化 signal 可被上层判定器使用,
@@ -401,9 +401,9 @@ section('K) 死码账本归零 + 活账本不被误删(#31)');
 
 // ── L) 用量报表恒 0:#45 红集(指挥官亲笔,编码手禁改) ──
 // 背景:traffic.usage 至少有四种形状各写一遍,而聚合只认其中一种键名:
-//   ① 反代入站 server.js:296 存**上游原样** {prompt_tokens, completion_tokens}
-//   ② 派发回写 server.js:630 存**归一化后** {input, output, total, reported|estimated}
-//   ③ events 表用**列** input_tokens/output_tokens(db.js:1132 一带)
+//   ① 反代入站 server.js:2126 存**上游原样** {prompt_tokens, completion_tokens}
+//   ② 派发回写 server.js:702 存**归一化后** {input, output, total, reported|estimated}
+//   ③ events 表用**列** input_tokens/output_tokens(db.js:65)
 //   ④ token-stats.json 又是第五种(按工具累计 + estimate 路径)
 //   而 db.js 的 usageReport()(byDay/byTool)与 todayTokens() 只 SUM
 //   `json_extract(usage,'$.prompt_tokens') + json_extract(usage,'$.completion_tokens')`。
@@ -545,6 +545,985 @@ section('M) 吞异常棘轮门禁不存在(#26 红集)');
   } catch (_) { /* 交给断言判失败 */ }
   check('#26m7 哨兵(不回退):门禁必须是旁挂脚本 —— npx eslint . 仍 0 error / 18 warning(把它写进 .eslintrc 的 error 会当场把源码 45 处打成 45 error,爆破"必须 0 error"这道门)',
     lintErr === 0 && lintWarn === 18, 'errors=' + lintErr + ' warnings=' + lintWarn + ' (解析失败时会是 0/0 或负值,均判失败)');
+}
+
+// ── N) 仓库卫生门禁(#29,指挥官亲笔,编码手禁改) ──────────────────────────
+//   为什么写成行为锁而不是读 .gitignore 文本:判据必须是"git 眼里的世界",不是"文件里写了啥"。
+//   实测现状(2026-10-23):ai-bridge/ 下有 5 个 *.bak-cleanup-* / *.bak-pre-register-* 与
+//   test-runtime-data/ 以 `??` 出现在 git status 里(.gitignore 第 130 行只有 `ai-bridge/*.bak`,
+//   带后缀的 .bak-cleanup-2026-10-14 不匹配该模式);另 .corrupt-* 保全件(#30/#71 的产物)同样没被
+//   忽略——一旦生产真出损坏,取证文件会以"未跟踪垃圾"的形式暴露在工作树里,极易被 `git add -A` 扫进
+//   仓库(本项目还有一个公开镜像仓)。反向锁 h4 防"一把梭把 ai-bridge/ 整目录 ignore 掉"这种
+//   让配置从版本控制里消失的假修复。
+section('N) 仓库卫生:落盘垃圾必须被忽略、配置必须仍被跟踪(#29)');
+{
+  const REPO = path.resolve(import.meta.dirname, '..'); // 本文件既有约定就是 import.meta.dirname(:419/:485/:540),ESM 里没有 __dirname
+  const git = (args) => spawnSync('git', args, { cwd: REPO, encoding: 'utf-8' });
+  const ignored = (p) => git(['check-ignore', '-q', p]).status === 0; // 0=被忽略,1=未被忽略
+  const porcelain = () => String(git(['status', '--porcelain', 'ai-bridge']).stdout || '').split('\n').filter(Boolean);
+
+  // 真实的垃圾文件名(存在就用真名,不存在就用同形态样本 —— 防套件因目录被清理而假绿/假红)
+  const realBak = porcelain().map(l => l.replace(/^\?\?\s*/, '').replace(/^ai-bridge\//, '')).filter(n => /\.bak-/.test(n));
+  const bakSample = realBak.length ? 'ai-bridge/' + realBak[0] : 'ai-bridge/switches.json.bak-cleanup-2026-10-14';
+  check('#29h1 落盘备份必须被忽略:`ai-bridge/*.bak-*` 这类带后缀的备份不得以未跟踪垃圾出现在工作树'
+    + '(现状:' + (realBak.length || '样本') + ' 个;根因是 .gitignore 只有 `*.bak`,不匹配 `.bak-<日期>` 形态)',
+    ignored(bakSample), '样本=' + bakSample + ' ignored=' + ignored(bakSample));
+  check('#29h2 测试运行目录必须被忽略:`ai-bridge/test-runtime-data/` 是套件自建的落盘目录(#63),不该进工作树',
+    ignored('ai-bridge/test-runtime-data/probe.txt'), 'ignored=' + ignored('ai-bridge/test-runtime-data/probe.txt'));
+  check('#29h3 损坏保全件必须被忽略:`ai-bridge/*.corrupt-*` 是 #30 的取证产物,既不能被提交、也不该以垃圾示人(#71)',
+    ignored('ai-bridge/memory.json.corrupt-2026-01-01T00-00-00-000Z'), 'ignored=' + ignored('ai-bridge/memory.json.corrupt-2026-01-01T00-00-00-000Z'));
+  check('#29h4 反向哨兵:配置与源码**必须仍被 git 跟踪**(防"整目录 ignore"式假修复 —— 那会让 tools.json/models.json 从版本控制里消失)',
+    !ignored('ai-bridge/tools.json') && !ignored('ai-bridge/server.js')
+      && git(['ls-files', '--', 'ai-bridge/tools.json', 'ai-bridge/models.json', 'ai-bridge/server.js']).stdout.split('\n').filter(Boolean).length === 3,
+    'tools.json ignored=' + ignored('ai-bridge/tools.json') + ' server.js ignored=' + ignored('ai-bridge/server.js'));
+  // 出口判据:git status 里真的不再有 ai-bridge 的 ?? 垃圾(这才是"看起来干净"的定义)
+  const stillUntracked = porcelain().filter(l => l.startsWith('?? ')).map(l => l.replace(/^\?\?\s*/, ''))
+    .filter(n => /\.bak-|test-runtime-data[/.]|\.corrupt-/.test(n));
+  check('#29h5 出口判据(行为级):`git status --porcelain ai-bridge` 不得再出现 .bak-/test-runtime-data/.corrupt- 的未跟踪条目',
+    stillUntracked.length === 0, '残留=' + JSON.stringify(stillUntracked).substring(0, 200));
+}
+
+// ── O) 文档保真门禁(#61,指挥官亲笔,编码手禁改) ──────────────────────────
+//   为什么现在必须把它变成锁:本会话我犯了 6 次"凭记忆写数字/符号"的错(descHasNoSpace 这条
+//   根本不存在的锁名、"134 处 sendJSON/5 种键组合"实为 135/66、"13 个 env 未入表"等)。
+//   教训已证明:**写成规约文字会复发,只有变成红灯才不再复发**。
+//   本段只锁两类零误判的漂移;需要人工裁定的"历史提及/反面提及"类不写成硬锁(见 #61 说明)。
+section('O) 文档保真:env 表与源码同源、文档锚点必须可解析(#61)');
+{
+  const SUITE_DIR = import.meta.dirname; // :419 那个同名常量是 L 段的块内作用域,这里取不到 ⇒ 本段自己声明(文件既有约定就是 import.meta.dirname)
+  const SRC_EXT = ['.js', '.mjs', '.cjs'];
+  const srcFiles = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (SRC_EXT.includes(path.extname(e.name))) srcFiles.push(p);
+    }
+  };
+  walk(SUITE_DIR);
+  const envSrc = new Set();
+  for (const f of srcFiles) {
+    for (const v of (fs.readFileSync(f, 'utf-8').match(/AI_BRIDGE_[A-Z0-9_]+/g) || [])) envSrc.add(v);
+  }
+  const docOf = (rel) => fs.readFileSync(path.join(SUITE_DIR, rel), 'utf-8').replace(/\r/g, '');
+  const readme = docOf('README.md');
+  const arch = docOf('ARCHITECTURE.md');
+  const envDoc = new Set([...(readme.match(/AI_BRIDGE_[A-Z0-9_]+/g) || []), ...(arch.match(/AI_BRIDGE_[A-Z0-9_]+/g) || [])]);
+
+  // 严格判据:变量名必须坐在 env 表格的**首格**。
+  // 为什么不用"全文出现即算过":那正是我这条锁最初的空子 —— 正文随便提一句名字就能绿,
+  // 而运维真正要的是"表里查得到"。本判据先在当前 README 上验证过:33/33 全在首格、
+  // 零误杀(误杀=任何正确实现都过不了,是我犯过 6 次的那类不可满足锁)。
+  const inEnvTableRow = (varName) => {
+    for (const line of readme.split('\n')) {
+      if (!/^\s*\|/.test(line)) continue;
+      const cells = line.split('|').slice(1, -1).map(s => s.trim());
+      if (!cells.length) continue;
+      const names = [...cells[0].matchAll(/`?([A-Z][A-Z0-9_]+)`?/g)].map(x => x[1]);
+      if (names.includes(varName)) return true;
+    }
+    return false;
+  };
+  const undocumented = [...envSrc].filter(v => !inEnvTableRow(v)).sort();
+  check('#61a1 源码里每一个 AI_BRIDGE_* 都必须坐在 README env **表格首格**(不是"正文提一句就算过"——'
+    + '那正是这条锁最初的空子;运维只查表。现状实测漏 ' + undocumented.length + ' 个)',
+    undocumented.length === 0, '不在表内=' + JSON.stringify(undocumented));
+  const ghostEnv = [...envDoc].filter(v => !envSrc.has(v)).sort();
+  check('#61a2 反向哨兵(不回退):文档里写的每个 AI_BRIDGE_* 都必须真在源码被读取 —— 防"为了实现文档而新增变量"'
+    + '的反向漂移,也防我写文档时顺手编一个名字(现状幽灵=' + ghostEnv.length + ')',
+    ghostEnv.length === 0, '幽灵=' + JSON.stringify(ghostEnv));
+
+  // 锚点:`xxx.js:NNN` 必须能从 ai-bridge/ 解析到真实文件且行号不越界。
+  // 实测病例:ARCHITECTURE 曾把路径写成裸名 `cli-adapter.js` 的第 139 行,真路径是 `adapters/cli-adapter.js` ⇒ 按文档找不到。
+  const anchorOf = (text) => {
+    const bad = [];
+    for (const m of text.matchAll(/([A-Za-z0-9_.\-/]+\.(?:js|mjs|cjs|json|html)):(\d+)/g)) {
+      const rel = m[1]; const ln = Number(m[2]);
+      const abs = path.join(SUITE_DIR, rel);
+      if (!fs.existsSync(abs)) { bad.push(rel + ':' + ln + '(路径不可达)'); continue }
+      const n = fs.readFileSync(abs, 'utf-8').replace(/\r/g, '').split('\n').length;
+      if (ln > n) bad.push(rel + ':' + ln + '(越界,全文 ' + n + ' 行)');
+    }
+    return bad;
+  };
+  const badR = anchorOf(readme); const badA = anchorOf(arch);
+  check('#61a3 README 的每个 `文件:行号` 锚点必须可达且行号在界内(锚点失效=按文档去定位的人会找错地方;'
+    + '#47/#81 我两次哈希记错就是同一病的路径面)。现状失效=' + badR.length,
+    badR.length === 0, JSON.stringify(badR).substring(0, 220));
+  check('#61a4 ARCHITECTURE 同上(现状失效=' + badA.length + ',实测病例:裸写 cli-adapter.js:139 而真路径是 adapters/cli-adapter.js)',
+    badA.length === 0, JSON.stringify(badA).substring(0, 220));
+}
+
+// ── L78) 一本日历(#78 现行发作:todayTokens 用本地日、byDay 用 UTC 日) ────────
+//   实测病灶:db.js 的 todayTokens 用**本地**日期组 today,却拿它比 substr(ts,1,10)(存的是 **UTC** ISO);
+//   usageReport 的 byDay 也按 `substr(ts,1,10)` 即 **UTC 日**分组 ⇒ 两套日历并存。
+//   业务后果(不是洁癖):`AI_BRIDGE_DAILY_TOKEN_BUDGET` 的唯一输入就是 todayTokens,
+//   每天本地零点后的那几个小时里它恒 0 —— 预算闸门实际是盲的(指挥官就是在 00:05 撞上 78/79 的)。
+//   种子刻意取"本地今天的 00:30 与 23:30"两行:一本日历下它们必然同日、同被计入今日(合计 150);
+//   而 UTC/本地混用下 00:30 那行的 UTC 日属于**昨天** ⇒ 分成两天且今日只算 50 ——
+//   这样**任何钟点跑都是确定性红灯**,不依赖跑测试的时刻(我上一版锁 L3 就是靠"现在",才会随挂钟翻红)。
+section('L78) 用量只能有一本日历(#78)');
+{
+  const calRunner = path.join(tmpRoot, 'cal78-runner.cjs');
+  fs.writeFileSync(calRunner, `'use strict';
+const db = require(${JSON.stringify(path.join(import.meta.dirname, 'db.js'))});
+const TOOL = 'cal78-tool';
+// 本地今天的两个时刻 → toISOString 落成 UTC 存进 ts(写侧格式必须不变,见 c3)
+const d = new Date();
+const early = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 30, 0).toISOString();
+const late = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 30, 0).toISOString();
+db.recordTraffic({ tool: TOOL, direction: 'in', ts: early, success: true, type: 'dispatch', usage: { input: 100, output: 0, total: 100 } });
+db.recordTraffic({ tool: TOOL, direction: 'in', ts: late, success: true, type: 'dispatch', usage: { input: 50, output: 0, total: 50 } });
+const rep = db.usageReport(7);
+const days = (rep.byDay || []).filter(x => x.tool === TOOL).map(x => ({ day: x.day, tokens: x.tokens }));
+const tss = db.trafficList ? null : null;
+process.stdout.write(JSON.stringify({
+  todayTokens: db.todayTokens(), days,
+  early, late,
+  tz: new Date().getTimezoneOffset(),
+  // c3 反向锁要用的原始 ts 形状:必须是 UTC ISO(Z 结尾),不得为省事先改成本地串
+  tsIsUtc: /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$/.test(early)
+}) + '\\n');`, 'utf-8');
+  const cr = spawnSync(process.execPath, [calRunner], {
+    cwd: import.meta.dirname,
+    env: { ...process.env, AI_BRIDGE_DB: path.join(tmpRoot, 'cal78.db'), AI_BRIDGE_DATA_DIR: tmpRoot },
+    encoding: 'utf-8', timeout: 20000
+  });
+  let co = null;
+  try { co = JSON.parse((cr.stdout || '').trim().split('\n').pop()); } catch (_) { /* 交给断言判失败 */ }
+
+  check('#78c1 byDay 必须按**同一本日历**分组:本地今天的 00:30 与 23:30 两行必须落在同一个 day 键、'
+    + 'tokens 合计 150(现状 byDay 用 substr(ts,1,10)=UTC 日 ⇒ 被劈成两天,报表页与预算页说的不是同一个"今天")',
+    !!co && Array.isArray(co.days) && co.days.length === 1 && co.days[0].tokens === 150,
+    'days=' + JSON.stringify(co && co.days) + ' tz偏移=' + (co && co.tz) + ' stderr=' + String(cr.stderr || '').substring(0, 90));
+  check('#78c2 todayTokens 与 byDay 的"今天"必须相等(一本日历的直接推论;它是 AI_BRIDGE_DAILY_TOKEN_BUDGET '
+    + '唯一输入,现状本地零点后那几小时里只算到 50 甚至 0 ⇒ 闸门盲)',
+    !!co && co.todayTokens === 150, 'todayTokens=' + (co && co.todayTokens) + ' days=' + JSON.stringify(co && co.days));
+  check('#78c3 反向哨兵:修读侧不得顺手改写侧 —— ts 落库必须仍是 UTC ISO(带 Z)。'
+    + '改成本地串会让既有历史(全部 UTC)与新数据混在两套格式里,才是真毁账本',
+    !!co && co.tsIsUtc === true && /Z$/.test(String(co.early)) && /Z$/.test(String(co.late)),
+    'early=' + (co && co.early) + ' late=' + (co && co.late));
+  // 跨时区同结论:同一份种子在 TZ=UTC 与 TZ=Asia/Shanghai 下必须给出**相同**的 c1/c2 判定,
+  // 否则实现只是"碰巧对本机时区成立"。这里显式再跑一次 UTC。
+  const crUtc = spawnSync(process.execPath, [calRunner], {
+    cwd: import.meta.dirname,
+    env: { ...process.env, TZ: 'UTC', AI_BRIDGE_DB: path.join(tmpRoot, 'cal78-utc.db'), AI_BRIDGE_DATA_DIR: tmpRoot },
+    encoding: 'utf-8', timeout: 20000
+  });
+  let cu = null;
+  try { cu = JSON.parse((crUtc.stdout || '').trim().split('\n').pop()); } catch (_) { /* 交给断言判失败 */ }
+  // 只比"必须与挂钟无关"的量:天数、tokens 合计、todayTokens。
+  // **不比 day 键字面值** —— 正确的实现在 TZ=UTC 与 TZ=Asia/Shanghai 下本来就会给出不同的日期字符串
+  // (同一个瞬时对应的本地日不同),拿键面值比会写出"任何正确实现都过不了"的不可满足锁(我犯过 8 次)。
+  const sumDays = (o) => ((o && o.days) || []).reduce((a, x) => a + (x.tokens || 0), 0);
+  check('#78c4 时区无关性:同一份种子在 TZ=UTC 与本机时区下,**天数、tokens 合计、todayTokens** 三者必须一致'
+    + '(防实现只是碰巧对本机时区成立;刻意不比 day 键字面值,那本来就该随时区变)',
+    !!cu && !!co && cu.todayTokens === co.todayTokens && (cu.days || []).length === (co.days || []).length
+      && sumDays(cu) === sumDays(co),
+    'UTC=' + JSON.stringify(cu && { t: cu.todayTokens, n: (cu.days || []).length, sum: sumDays(cu) })
+      + ' 本机=' + JSON.stringify(co && { t: co.todayTokens, n: (co.days || []).length, sum: sumDays(co) }));
+}
+
+section('#96b) CLI 输出上限必须走 env 数字单点(#96)');
+{
+  // 病根(adapters/cli-adapter.js:293-294,实测唯一残留的手搓 env 数字解析):
+  //   parseInt("1e7")=1 ⇒ MAX_OUTPUT_CHARS=1 ⇒ 任何正常输出都被"输出超过 1 字符上限"误杀,
+  //   且这条路径**零留痕**。README:78 把这个 env 写进表里当作可配项,配错就静默自杀。
+  //   锁的是行为(经真 runCommand 派发真子进程),不是措辞:允许任一实现,只要非法值回落默认。
+  const cliRunner = path.join(tmpRoot, 'cli96-runner.cjs');
+  fs.writeFileSync(cliRunner, `'use strict';
+const { runCommand } = require(${JSON.stringify(path.join(import.meta.dirname, 'adapters', 'cli-adapter.js'))});
+const n = Number(process.env.CASE_N);
+runCommand(process.execPath, ['-e', 'process.stdout.write("z".repeat(' + n + '))'], { timeout: 20000 })
+  .then(out => process.stdout.write(JSON.stringify({ ok: true, len: out.length }) + '\\n'))
+  .catch(e => process.stdout.write(JSON.stringify({ ok: false, msg: String(e && e.message) }) + '\\n'));`, 'utf-8');
+  const runCli = (envVal, n) => {
+    const env = { ...process.env, CASE_N: String(n) };
+    if (envVal === null) delete env.AI_BRIDGE_CLI_MAX_OUTPUT_CHARS;
+    else env.AI_BRIDGE_CLI_MAX_OUTPUT_CHARS = envVal;
+    const r = spawnSync(process.execPath, [cliRunner], { cwd: import.meta.dirname, env, encoding: 'utf-8', timeout: 40000 });
+    let o = null;
+    try { o = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch (_) { /* 交给断言判失败 */ }
+    return o;
+  };
+  const bad = runCli('1e7', 500);
+  check('#96b1 非法值 "1e7" 不得被当成 1 字符上限:500 字符的正常输出必须成功(现被误杀=派发全灭)',
+    !!bad && bad.ok === true, bad ? 'msg=' + String(bad.msg).slice(0, 140) : 'runner 无 JSON 输出');
+  const small = runCli('100', 5000);
+  check('#96b2 反向哨兵:合法小上限 100 必须仍能终止 5000 字符输出(不许把钳制改成"一律放行")',
+    !!small && small.ok === false && /上限/.test(String(small.msg)), JSON.stringify(small));
+  const dflt = runCli(null, 20000);
+  check('#96b3 反向哨兵:未设置该 env 仍走默认 10MB(2 万字符必须成功)',
+    !!dflt && dflt.ok === true, JSON.stringify(dflt));
+  const cliSrc = fs.readFileSync(path.join(import.meta.dirname, 'adapters', 'cli-adapter.js'), 'utf-8');
+  const nParse = (cliSrc.match(/parseInt\(\s*process\.env\./g) || []).length;
+  const nNumber = (cliSrc.match(/Number\(\s*process\.env\./g) || []).length;
+  check('#96b4 单一写手:cli-adapter.js 内不得再出现对 process.env 的 parseInt/Number 直解(实测残留 :293)',
+    nParse === 0 && nNumber === 0, `parseInt(process.env.)=${nParse} Number(process.env.)=${nNumber}`);
+  check('#96b5 单一写手:cli-adapter.js 必须引用 env-int 单点',
+    /env-int/.test(cliSrc), '未找到 env-int 引用');
+}
+
+section('#101) env 钳制的每一处都必须点名(#101)');
+{
+  // acorn 与零依赖扫描器双口径对表实测(基线 965b9b1):调用点 18 个,其中 5 个**没传第三个参数 name**
+  //   server.js:66 MAX_CONCURRENT_DISPATCH(默认 5)、:67 RESULT_MAX_CHARS(2000)、:70 CLIENT_TTL(300000)
+  //   、:225 CACHE_TTL(600000)、:226 CACHE_MAX(100)
+  // 病根与 #96 同源但表现不同:env-int 单点在**没拿到 name 时无痕回落**。#96 之后整串匹配已经会拒绝
+  // "1e3" 这类前缀写法,于是这三个字变成:运维写 AI_BRIDGE_RESULT_MAX_CHARS=1e3(想要 1000)⇒
+  // 改前被 parseInt 宽容成 **1**(dispatch 结果被截到 1 字符)、改后回落 2000 —— 两者**都不告知**。
+  // 锁的是行为:真启动中枢,读它自己的 stderr。
+  const FIVE = ['AI_BRIDGE_MAX_CONCURRENT_DISPATCH', 'AI_BRIDGE_RESULT_MAX_CHARS', 'AI_BRIDGE_CLIENT_TTL', 'AI_BRIDGE_CACHE_TTL', 'AI_BRIDGE_CACHE_MAX'];
+  const HUB_PORT = '9846';
+  const d101 = path.join(tmpRoot, 'env101');
+  fs.mkdirSync(path.join(d101, 'workspaces'), { recursive: true });
+  fs.copyFileSync(path.join(import.meta.dirname, 'tools.json'), path.join(d101, 'tools.json'));
+  const bootHub = (extra) => spawnSync(process.execPath, ['server.js'], {
+    cwd: import.meta.dirname,
+    env: {
+      ...process.env,
+      AI_BRIDGE_PORT: HUB_PORT,
+      AI_BRIDGE_HOST: '127.0.0.1',
+      AI_BRIDGE_DATA_DIR: d101,
+      AI_BRIDGE_DB: path.join(d101, 'b.db'),
+      AI_BRIDGE_WORKSPACE_ROOT: path.join(d101, 'workspaces'),
+      AI_BRIDGE_TOOLS_PATH: path.join(d101, 'tools.json'),
+      AI_BRIDGE_TOKEN: 't101-sandbox',
+      ...extra
+    },
+    encoding: 'utf-8', timeout: 3000, maxBuffer: 8 * 1024 * 1024
+  });
+  const bad = bootHub(Object.fromEntries(FIVE.map(v => [v, '1e3'])));
+  const badErr = String(bad.stderr || '');
+  const named = FIVE.filter(v => badErr.includes(v));
+  check('#101a1 真启动中枢:五个静默回落点必须各自在 stderr 点名(实测缺 name 的正是这 5 处)',
+    named.length === 5, '点名 ' + named.length + '/5;' + JSON.stringify(FIVE.filter(v => !named.includes(v)))
+      + ' [env] 行数=' + (badErr.match(/\[env\]/g) || []).length);
+  const clean = bootHub({});
+  check('#101a2 反向哨兵:一个非法值都不设时启动必须零 [env] 留痕(钳制不得被改成噪音)',
+    !/\[env\]/.test(String(clean.stderr || '')), 'stderr 摘要=' + String(clean.stderr || '').replace(/\s+/g, ' ').slice(0, 200));
+  check('#101a3 非法 env 回落默认后中枢仍须活到超时(钳制改动不得把中枢弄得起不来)',
+    !!bad.error && bad.error.code === 'ETIMEDOUT' && !!clean.error && clean.error.code === 'ETIMEDOUT',
+    'bad.error=' + JSON.stringify(bad.error && bad.error.code) + ' status=' + bad.status
+      + ' clean.error=' + JSON.stringify(clean.error && clean.error.code));
+  // 结构锁:调用点级"必须传 name"。用零依赖扫描器(acorn 只是 eslint 的传递依赖,锁定测试不得挂在它上面)。
+  // 口径:名+左括号 → 括号配平 → 数顶层逗号;跳过行注释/块注释里的同名词。与 acorn 对表实测 18/5。
+  const scanCalls = (src, names) => {
+    const out = []
+    for (const nm of names) {
+      let at = -1
+      while ((at = src.indexOf(nm + '(', at + 1)) !== -1) {
+        const lineStart = src.lastIndexOf('\n', at) + 1
+        const before = src.slice(lineStart, at)
+        if (before.includes('//') || before.includes('/*') || before.includes('* ')) continue
+        let depth = 0, commas = 0, j = at + nm.length, closed = false, str = null
+        for (; j < src.length; j++) {
+          const ch = src[j]
+          if (str) { if (ch === '\\') { j++; continue } if (ch === str) str = null; continue }
+          if (ch === '"' || ch === "'" || ch === '`') { str = ch; continue }
+          if (ch === '(' || ch === '[' || ch === '{') depth++
+          else if (ch === ')' || ch === ']' || ch === '}') { depth--; if (depth === 0 && ch === ')') { closed = true; break } }
+          else if (ch === ',' && depth === 1) commas++
+        }
+        if (!closed) continue
+        const inner = src.slice(at + nm.length + 1, j)
+        out.push({ line: src.slice(0, at).split('\n').length, argc: inner.trim() === '' ? 0 : commas + 1 })
+      }
+    }
+    return out
+  };
+  const walkSrc = (d, acc = []) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name)
+      if (e.isDirectory()) { if (!['node_modules', 'test-runtime-data', 'workspaces', 'output', '.git'].includes(e.name)) walkSrc(p, acc) } else if (/\.(js|mjs|cjs)$/.test(e.name) && !/^test-/.test(e.name) && e.name !== 'env-int.js') acc.push(p)
+    }
+    return acc
+  };
+  const sites = [];
+  for (const f of walkSrc(import.meta.dirname)) {
+    for (const s of scanCalls(fs.readFileSync(f, 'utf-8').replace(/\r/g, ''), ['parsePositiveInt', 'parseNonNegativeInt'])) {
+      sites.push({ file: path.relative(import.meta.dirname, f).replace(/\\/g, '/'), ...s })
+    }
+  }
+  const missing = sites.filter(s => s.argc < 3);
+  check('#101b1 每一个 parse*Int 调用点都必须传第三个参数 name(实测缺 5 处)',
+    missing.length === 0, '缺 name=' + missing.map(m => m.file + ':' + m.line).join(','));
+  check('#101b2 反向哨兵:扫描器必须仍看见 >= 18 个调用点(否则 b1 是"空对空"的假绿——#27s9b/#74s1 同类病)',
+    sites.length >= 18, '扫描器看见=' + sites.length + '(acorn 对表实测 18)');
+}
+
+section('#102) CLI 输出上限的留痕时机:启动即点名,且同一变量每进程最多一次(#102)');
+{
+  // 现状(#96 之后):`adapters/cli-adapter.js:295` 把上限求值写在 runCommand 内部 ⇒ 两个可观测缺陷:
+  //   ① 配置写错时中枢**启动完全正常、零痕迹**,运维永远不知道自己写错过(直到第一条派发);
+  //   ② 反过来,一旦派发就开始**每次调用重复刷同一条 warn**,噪声随任务数线性增长。
+  // 锁的是行为,不指定实现:允许模块顶层求值、构造期求值或"已留痕"去重,只要满足 a1(启动即点名)与 a2(每进程至多一次)。
+  const CLI_ENV = 'AI_BRIDGE_CLI_MAX_OUTPUT_CHARS';
+  const HUB_PORT_102 = '9852';
+  const d102 = path.join(tmpRoot, 'cli102');
+  fs.mkdirSync(path.join(d102, 'workspaces'), { recursive: true });
+  fs.copyFileSync(path.join(import.meta.dirname, 'tools.json'), path.join(d102, 'tools.json'));
+  const hubEnv = (extra) => ({
+    ...process.env,
+    AI_BRIDGE_PORT: HUB_PORT_102,
+    AI_BRIDGE_HOST: '127.0.0.1',
+    AI_BRIDGE_DATA_DIR: d102,
+    AI_BRIDGE_DB: path.join(d102, 'b.db'),
+    AI_BRIDGE_WORKSPACE_ROOT: path.join(d102, 'workspaces'),
+    AI_BRIDGE_TOOLS_PATH: path.join(d102, 'tools.json'),
+    AI_BRIDGE_TOKEN: 't102-sandbox',
+    ...extra
+  });
+  const traceCount = (text) => (String(text || '').match(/\[env\][^\n]*AI_BRIDGE_CLI_MAX_OUTPUT_CHARS/g) || []).length;
+
+  const boot = (env) => spawnSync(process.execPath, ['server.js'], {
+    cwd: import.meta.dirname, env, encoding: 'utf-8', timeout: 3000, maxBuffer: 8 * 1024 * 1024
+  });
+  const noisy = boot(hubEnv({ [CLI_ENV]: '1e7' }));
+  check('#102a1 中枢启动即须点名该 env(派发前就该说,现状是零痕迹 ⇒ 配置写错无人知晓)',
+    traceCount(noisy.stderr) >= 1, '[env] 行数=' + traceCount(noisy.stderr) + ' stderr 摘要=' + String(noisy.stderr || '').replace(/\s+/g, ' ').slice(0, 160));
+
+  const dbl = path.join(tmpRoot, 'cli102-double.cjs');
+  fs.writeFileSync(dbl, `'use strict';
+const { runCommand } = require(${JSON.stringify(path.join(import.meta.dirname, 'adapters', 'cli-adapter.js'))});
+const one = () => runCommand(process.execPath, ['-e', 'process.stdout.write("y".repeat(50))'], { timeout: 20000 });
+(async () => {
+  const a = await one();
+  const b = await one();
+  process.stdout.write(JSON.stringify({ ok: true, la: a.length, lb: b.length }) + '\\n');
+})().catch(e => process.stdout.write(JSON.stringify({ ok: false, msg: String(e && e.message) }) + '\\n'));`, 'utf-8');
+  const twice = spawnSync(process.execPath, [dbl], {
+    cwd: import.meta.dirname, env: { ...hubEnv({ [CLI_ENV]: '1e7' }) }, encoding: 'utf-8', timeout: 40000, maxBuffer: 8 * 1024 * 1024
+  });
+  let tw = null;
+  try { tw = JSON.parse((twice.stdout || '').trim().split('\n').pop()); } catch (_) { /* 交给断言判失败 */ }
+  check('#102a2 同一变量的非法留痕每进程最多一次(现状每次 runCommand 刷一条 ⇒ 噪声随任务数线性增长)',
+    tw && tw.ok === true && traceCount(twice.stderr) === 1,
+    '留痕=' + traceCount(twice.stderr) + ' 结果=' + JSON.stringify(tw));
+
+  const clean = boot(hubEnv({}));
+  check('#102a3 反向哨兵:该 env 未设置时启动必须零留痕(点名不得变成开机噪音)',
+    traceCount(clean.stderr) === 0, '[env] 行数=' + traceCount(clean.stderr));
+
+  const bigRun = spawnSync(process.execPath, [dbl], {
+    cwd: import.meta.dirname, env: { ...hubEnv({ [CLI_ENV]: '10' }) }, encoding: 'utf-8', timeout: 40000, maxBuffer: 8 * 1024 * 1024
+  });
+  const smallRun = spawnSync(process.execPath, [dbl], {
+    cwd: import.meta.dirname, env: { ...hubEnv({ [CLI_ENV]: '100' }) }, encoding: 'utf-8', timeout: 40000, maxBuffer: 8 * 1024 * 1024
+  });
+  const parseOut = (r) => { try { return JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch (_) { return null } };
+  const big = parseOut(bigRun);
+  const small = parseOut(smallRun);
+  check('#102a4 反向哨兵:把求值挪到启动期后,合法上限仍必须真的生效(10 字符上限须终止 50 字符输出)',
+    big && big.ok === false && /上限/.test(String(big.msg)), '上限=10 那栏=' + JSON.stringify(big));
+  check('#102a5 反向哨兵:合法上限 100 下 50 字符输出必须成功,且零留痕(钳制既没空转也没噪音)',
+    small && small.ok === true && small.la === 50 && small.lb === 50 && traceCount(smallRun.stderr) === 0,
+    '上限=100 那栏=' + JSON.stringify(small) + ' 留痕=' + traceCount(smallRun.stderr));
+}
+
+section('#105) 隔离期 ACL 写被拒不得报成功(真启动中枢 + 真 HTTP)');
+{
+  // 实测取证(基线 dfa0e97,四重隔离沙箱 9863 的真中枢):clients-acl.json 被隔离时
+  //   POST /api/clients/approve ⇒ HTTP 200 {"success":true,"status":"approved"}
+  //   同一进程却写出了「存储文件 clients-acl.json 拒写（原因: 解析失败: …）」,且活文件不在
+  //   (只剩 .corrupt-* 保全件)⇒ **批准没落盘却告诉调用方成功**。这是 #43 收过的病
+  //   ("写被拒却报 200 成功")换到 ACL 面:#43 当年只修工作区路径,server.js 里 5 处
+  //   store.saveACL(acl) 全是**裸调用、返回值被丢**(实测 :1674/:1683/:1699/:1715/:1745)。
+  // 口径按 #43/#73:隔离期必须回 503 并带原因,不许 200,也不许用 404 假装。
+  const SERVER = path.join(import.meta.dirname, 'server.js');
+  const mkChild = (mode, port) => {
+    const dir = path.join(tmpRoot, 'acl105-' + mode);
+    const wsRoot = path.join(dir, 'workspaces');
+    fs.mkdirSync(wsRoot, { recursive: true });
+    fs.copyFileSync(path.join(import.meta.dirname, 'tools.json'), path.join(dir, 'tools.json'));
+    fs.writeFileSync(path.join(dir, 'clients-acl.json'),
+      mode === 'dirty' ? '{"allowlist":["good-client"],"blocklist":["bad-client"'
+        : '{"allowlist":["good-client"],"blocklist":[],"pending":[]}', 'utf-8');
+    const runner = path.join(tmpRoot, 'acl105-runner-' + mode + '.cjs');
+    fs.writeFileSync(runner, `'use strict';
+const http = require('http');
+const port = Number(process.env.CASE_PORT);
+const tok = process.env.CASE_TOK;
+require(process.env.CASE_SERVER);
+const call = (method, p, body) => new Promise(res => {
+  const data = JSON.stringify(body || {});
+  const q = http.request({ hostname: '127.0.0.1', port, path: p, method, headers: { authorization: 'Bearer ' + tok, 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) } }, rr => {
+    let b = '';
+    rr.on('data', d => { b += d });
+    rr.on('end', () => res({ status: rr.statusCode, body: b }));
+  });
+  q.on('error', e => res({ status: 0, body: String(e.code) }));
+  q.end(data);
+});
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+(async () => {
+  let health = { status: 0 };
+  for (let i = 0; i < 40; i++) {
+    health = await call('GET', '/api/health', {});
+    if (health.status === 200) break;
+    await sleep(300);
+  }
+  const approve = await call('POST', '/api/clients/approve', { clientId: 'p105' });
+  const deny = await call('POST', '/api/clients/deny', { clientId: 'p105' });
+  const kick = await call('POST', '/api/clients/kick', { clientId: 'p105' });
+  const list = await call('GET', '/api/clients', {});
+  await sleep(900);
+  // 末行才是本探针的结果:中枢自己会往 stdout 写启动横幅,整段 JSON.parse 必失败
+  process.stdout.write(JSON.stringify({ health: health.status, approve, deny, kick, listStatus: list.status }) + '\\n');
+  process.exit(0);
+})();`, 'utf-8');
+    const r = spawnSync(process.execPath, [runner], {
+      cwd: import.meta.dirname,
+      env: {
+        ...process.env,
+        CASE_SERVER: SERVER, CASE_PORT: String(port), CASE_TOK: 't105-' + mode,
+        AI_BRIDGE_PORT: String(port), AI_BRIDGE_HOST: '127.0.0.1',
+        AI_BRIDGE_DATA_DIR: dir, AI_BRIDGE_DB: path.join(dir, 'b.db'),
+        AI_BRIDGE_WORKSPACE_ROOT: wsRoot, AI_BRIDGE_TOOLS_PATH: path.join(dir, 'tools.json'),
+        AI_BRIDGE_TOKEN: 't105-' + mode
+      },
+      encoding: 'utf-8', timeout: 45000, maxBuffer: 8 * 1024 * 1024
+    });
+    let j = null;
+    // 只取 stdout 的最后一个非空行(前面的都是中枢自己的横幅);拿不到就报 null 让断言红得有形状
+    const lastLine = String(r.stdout || '').split(/\r?\n/).filter(Boolean).pop();
+    try { j = JSON.parse(lastLine); } catch (_) { /* 交给断言判失败 */ }
+    let live = null;
+    try { live = fs.readFileSync(path.join(dir, 'clients-acl.json'), 'utf-8'); } catch (_) { live = null; }
+    return { j, live, stderr: String(r.stderr || '') };
+  };
+
+  const dirty = mkChild('dirty', 9881);
+  const clean = mkChild('clean', 9882);
+  // 统一的"诚实拒绝"判据:5xx + 正文不许有 success:true + 必须给出原因(#43/#73 口径)
+  const refusedHonestly = (x) => !!x && x.status >= 500 && !/"success"\s*:\s*true/.test(x.body) && /原因/.test(x.body);
+  check('#105a1 隔离期 approve 不得报成功(须 5xx 且正文含原因;实测基线是 200 success:true)',
+    refusedHonestly(dirty.j && dirty.j.approve),
+    'approve=' + JSON.stringify(dirty.j && dirty.j.approve).slice(0, 200));
+  check('#105a2 隔离期 deny 同样不得报成功(它还会顺手踢掉在线客户端,更要说清没落盘)',
+    refusedHonestly(dirty.j && dirty.j.deny),
+    'deny=' + JSON.stringify(dirty.j && dirty.j.deny).slice(0, 200));
+  check('#105a3 隔离期 kick 同样不得报成功',
+    refusedHonestly(dirty.j && dirty.j.kick),
+    'kick=' + JSON.stringify(dirty.j && dirty.j.kick).slice(0, 200));
+  check('#105a4 被拒的批准确实没落盘(活 clients-acl.json 里不得出现 p105;原件已改名保全也算通过)',
+    !!dirty.j && !(typeof dirty.live === 'string' && dirty.live.includes('p105')),
+    '活文件存在=' + (dirty.live !== null) + ' 内容前 120=' + JSON.stringify(String(dirty.live).slice(0, 120)));
+  check('#105a5 反向哨兵:隔离期只影响写,读面必须照旧 200(降级不崩,#44/#52 同口径)',
+    !!dirty.j && dirty.j.health === 200 && dirty.j.listStatus === 200,
+    'health=' + (dirty.j && dirty.j.health) + ' GET /api/clients=' + (dirty.j && dirty.j.listStatus));
+  check('#105a6 反向哨兵:健康态 approve 必须照旧 200 success:true 且真的落盘(修复不许把正常路径一起拒掉)',
+    !!clean.j && clean.j.approve.status === 200 && /"success"\s*:\s*true/.test(clean.j.approve.body)
+      && typeof clean.live === 'string' && clean.live.includes('p105'),
+    'approve=' + JSON.stringify(clean.j && clean.j.approve).slice(0, 160) + ' 落盘含 p105=' + (typeof clean.live === 'string' && clean.live.includes('p105')));
+
+  const srvSrc = fs.readFileSync(SERVER, 'utf-8').replace(/\r/g, '');
+  const bare = srvSrc.split('\n').filter(L => /^\s*store\.saveACL\([^)]*\);\s*$/.test(L));
+  check('#105a7 结构锁:server.js 内每一处 store.saveACL 都必须消费返回值(实测基线 5 处裸调用)',
+    bare.length === 0, '裸调用=' + bare.length + ' 行号=' + srvSrc.split('\n')
+      .map((L, i) => [L, i + 1]).filter(([L]) => /^\s*store\.saveACL\([^)]*\);\s*$/.test(L)).map(([, i]) => i).join(','));
+}
+
+section('#106) 隔离期建会不得报成功(真启动中枢 + 真 HTTP + 读盘核对)');
+{
+  // 取证(基线 6f497e4 之后的树,四重隔离沙箱 9902,memory.json 启动即坏 ⇒ 中枢当场隔离):
+  //   POST /api/discuss ⇒ HTTP 200 {"meetingId":"meeting_1792789570943","status":"discussing",…}
+  //   同一次运行 logs.jsonl 却有:`存储文件 memory.json 拒写（原因: 解析失败: …）`,且 memory.json 已不在原位
+  //   ⇒ 会议**哪都没存住**(store 无缓存:每次读都走 load();createMeeting 自己也 saveSync),后续任何按该 id 的
+  //   interrupt/inject/status 实测都回 404「会议不存在」。这是 #43/#105 同型的谎:响应宣称已开始,落盘被拒。
+  // 台账更正:此前把本单写成"6 处丢弃返回值(含 :88/:89 包装)"——实测整句丢弃型只有 **5** 处,
+  //   且其中 interrupt/inject/后台 updateMeeting 三处在隔离态**根本走不到**(读不到会议就先 404),
+  //   真正可达并说谎的是**建会回执**;:88/:89 那个包装函数是有 return 的,由调用点决定,不计入。
+  const SERVER = path.join(import.meta.dirname, 'server.js');
+  const d106 = (mode, port) => {
+    const dir = path.join(tmpRoot, 'disc106-' + mode);
+    fs.mkdirSync(path.join(dir, 'workspaces'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'ws'), { recursive: true });
+    fs.copyFileSync(path.join(import.meta.dirname, 'tools.json'), path.join(dir, 'tools.json'));
+    if (mode === 'dirty') fs.writeFileSync(path.join(dir, 'memory.json'), '{"tasks":[],"meetings":[{"id":"x"', 'utf-8');
+    const runner = path.join(tmpRoot, 'disc106-runner.cjs');
+    fs.writeFileSync(runner, `'use strict';
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const port = Number(process.env.CASE_PORT);
+const tok = process.env.CASE_TOK;
+const dir = process.env.AI_BRIDGE_DATA_DIR;
+require(process.env.CASE_SERVER); // 在本进程内起真中枢
+const call = (method, p, body) => new Promise(res => {
+  const data = JSON.stringify(body || {});
+  const q = http.request({ hostname: '127.0.0.1', port, path: p, method, headers: { authorization: 'Bearer ' + tok, 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) } }, rr => {
+    let b = '';
+    rr.on('data', d => { b += d });
+    rr.on('end', () => res({ status: rr.statusCode, raw: b }));
+  });
+  q.on('error', e => res({ status: 0, raw: String(e.code) }));
+  q.setTimeout(8000, () => { q.destroy(); res({ status: 0, raw: 'TIMEOUT' }) });
+  q.end(data);
+});
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const jsonOf = (r) => { try { return JSON.parse(r.raw) } catch (e) { return null } };
+(async () => {
+  let health = { status: 0 };
+  for (let i = 0; i < 40; i++) { health = await call('GET', '/api/health'); if (health.status === 200) break; await sleep(300) }
+  // max_tokens=0 ⇒ 首位发言者前即自动止损:不派发任何真 CLI、不花配额(与 e2e 既有做法同)
+  const created = await call('POST', '/api/discuss', { topic: '#106 取证', participants: [], round2: false, implement: false, max_tokens: 0 });
+  const cb = jsonOf(created) || {};
+  const mid = cb.meetingId || null;
+  const it = await call('POST', '/api/discuss/interrupt', { meetingId: mid || 'no-such', reason: '#106' });
+  const inj = await call('POST', '/api/discuss/inject', { meetingId: mid || 'no-such', message: 'm' });
+  const lst = await call('GET', '/api/meetings');
+  let onDisk = false;
+  for (let i = 0; i < 12 && !onDisk; i++) {
+    await sleep(300);
+    try { onDisk = String(fs.readFileSync(path.join(dir, 'memory.json'), 'utf-8')).indexOf(String(mid)) !== -1 } catch (e) { onDisk = false }
+  }
+  process.stdout.write(JSON.stringify({
+    health: health.status, createdStatus: created.status, createdRaw: String(created.raw).slice(0, 240), mid,
+    itStatus: it.status, injStatus: inj.status, lstStatus: lst.status, onDisk
+  }) + '\\n');
+  process.exit(0);
+})();`, 'utf-8');
+    const r = spawnSync(process.execPath, [runner], {
+      cwd: import.meta.dirname,
+      env: {
+        ...process.env,
+        CASE_SERVER: SERVER, CASE_PORT: String(port), CASE_TOK: 't106-' + mode,
+        AI_BRIDGE_PORT: String(port), AI_BRIDGE_HOST: '127.0.0.1',
+        AI_BRIDGE_DATA_DIR: dir, AI_BRIDGE_DB: path.join(dir, 'b.db'),
+        AI_BRIDGE_WORKSPACE_ROOT: path.join(dir, 'ws'),
+        AI_BRIDGE_TOOLS_PATH: path.join(dir, 'tools.json'),
+        AI_BRIDGE_TOKEN: 't106-' + mode
+      },
+      encoding: 'utf-8', timeout: 60000, maxBuffer: 8 * 1024 * 1024
+    });
+    let j = null;
+    // 只取末行:中枢自己的横幅与 stdout 日志在同一条流上(整段 parse 必失败——我踩过一次)
+    const last = String(r.stdout || '').split(/\r?\n/).filter(Boolean).pop();
+    try { j = JSON.parse(last); } catch (_) { /* 交给断言判失败 */ }
+    return j;
+  };
+
+  const dirty = d106('dirty', 9903);
+  check('#106a1 隔离期建会不得回 2xx 宣称开会成功(必须 5xx 且给出原因;实测基线 200+meetingId)',
+    !!dirty && dirty.createdStatus >= 500 && /原因/.test(String(dirty.createdRaw)),
+    'createdStatus=' + (dirty && dirty.createdStatus) + ' body=' + JSON.stringify(dirty && dirty.createdRaw).slice(0, 200));
+  check('#106a2 旁证说谎前提:该会议确实没落到 memory.json(读盘核对 meetingId 不在)',
+    !!dirty && dirty.mid !== null && dirty.onDisk === false,
+    'mid=' + JSON.stringify(dirty && dirty.mid) + ' onDisk=' + JSON.stringify(dirty && dirty.onDisk));
+  check('#106a3 隔离期按该 id 的 interrupt/inject 必须仍 404(不得变 500,也不得谎报成功)',
+    !!dirty && dirty.itStatus === 404 && dirty.injStatus === 404,
+    'interrupt=' + (dirty && dirty.itStatus) + ' inject=' + (dirty && dirty.injStatus));
+  check('#106a4 反向哨兵:隔离期读面照旧 200(health 与 /api/meetings 都不许崩;#44/#52 降级不崩的口径)',
+    !!dirty && dirty.health === 200 && dirty.lstStatus === 200,
+    'health=' + (dirty && dirty.health) + ' meetings=' + (dirty && dirty.lstStatus));
+  const clean = d106('clean', 9904);
+  check('#106a5 反向哨兵:健康态建会必须照旧 200 + meetingId 且**真的落盘**(修复不许把正常路径一起拒掉)',
+    !!clean && clean.createdStatus === 200 && !!clean.mid && clean.onDisk === true,
+    JSON.stringify(clean));
+
+  const srvSrc = fs.readFileSync(SERVER, 'utf-8').replace(/\r/g, '');
+  const bareSync = srvSrc.split('\n').map((L, i) => [L, i + 1]).filter(([L]) => /^\s*store\.saveSync\(/.test(L));
+  check('#106a6 结构锁:server.js 不得再有整句丢弃 store.saveSync 返回值的写点(实测基线 5 处)',
+    bareSync.length === 0, '裸调用=' + bareSync.length + ' 行号=' + bareSync.map(([, i]) => i).join(','));
+}
+
+section('#109) store 内部的建会写点也必须把"落盘事实"回传(同一纪律不许有两把尺)');
+{
+  // 取证(基线 66e7925 的树,判据本轮由 measure 脚本回源实测,不沿用台账旧行号):
+  //   store.js 的 saveSync 调用点共 7 处(:294/:318/:338/:366/:397/:410/:525),其中 6 处都消费了返回值
+  //   (return saveSync / !saveSync 条件),**唯一一处整句丢弃是 :294 的 createMeeting**
+  //   —— 台账写的 :310 是 #104 之前(-16 行)的旧号。
+  //   后果不是"HTTP 说谎"(那一面 #106 已在调用方堵住:server.js 建会后 loadMemory().find() 反查,
+  //   找不到即 503),而是**诚实来源放错了地方**:store 知道真假却不回传,调用方只能"再读一遍碰巧找不到"
+  //   去猜(同一规则两处实现,#73/#81/#86/#104 家族)。第二个调用方一旦不猜,就会直接拿到游离对象。
+  //   本格把事实回传给调用方:判据 a2 钉 store 契约、a3 钉 server 消费,行为面由 #106a1~a5 全程不回退来守。
+  const STORE = path.join(import.meta.dirname, 'store.js');
+  const storeSrc = fs.readFileSync(STORE, 'utf-8').replace(/\r/g, '');
+  const srvSrc2 = fs.readFileSync(path.join(import.meta.dirname, 'server.js'), 'utf-8').replace(/\r/g, '');
+  const bareStore = storeSrc.split('\n').map((l, i) => [l, i + 1]).filter(([l]) => /^\s*saveSync\s*\([^)]*\);\s*$/.test(l));
+  check('#109a1 结构锁:store.js 内每一处 saveSync 都必须消费返回值(实测基线 1 处裸调=:294 createMeeting)',
+    bareStore.length === 0,
+    '裸调用=' + bareStore.length + ' 行号=' + bareStore.map(([, i]) => i).join(','));
+  const cm = storeSrc.match(/function createMeeting \([\s\S]*?\n\}/);
+  check('#109a2 createMeeting 必须把落盘事实回传给调用方(段内须消费 saveSync 返回值,不得再裸调)',
+    !!cm && /return\s+(saveSync|\{[^}]*persisted)/.test(cm[0]) && !/^\s*saveSync\s*\([^)]*\);\s*$/m.test(cm[0]),
+    '段命中=' + (!!cm) + ' 段内消费=' + (cm ? /return\s+(saveSync|\{[^}]*persisted)/.test(cm[0]) : 'n/a')
+      + ' 段内仍裸调=' + (cm ? /^\s*saveSync\s*\([^)]*\);\s*$/m.test(cm[0]) : 'n/a'));
+  check('#109a3 server 建会路径的诚实来源必须是 store 回传的 persisted(不得只靠"再读一遍找不到"反查)',
+    /const\s*\{\s*meeting\s*,\s*persisted\s*\}\s*=\s*store\.createMeeting\(/.test(srvSrc2)
+      && /let\s+metadataSaved\s*=\s*persisted\b/.test(srvSrc2),
+    '解构 persisted=' + /const\s*\{\s*meeting\s*,\s*persisted\s*\}\s*=\s*store\.createMeeting\(/.test(srvSrc2)
+      + ' metadataSaved 初值=persisted=' + /let\s+metadataSaved\s*=\s*persisted\b/.test(srvSrc2));
+  // 反向哨兵:编码手不得"顺手"把 store 其余写点的消费形态改坏(它们各锁着自己的行为面)
+  const retN = (storeSrc.match(/return\s+saveSync\s*\(/g) || []).length;
+  const condN = (storeSrc.match(/!\s*saveSync\s*\(/g) || []).length;
+  const allN = (storeSrc.match(/saveSync\s*\(/g) || []).length;
+  check('#109a4 反向哨兵:store 其余 saveSync 消费形态不得被重构顺手带走(return 5 处、条件 1 处、含定义共 8 处)',
+    retN === 5 && condN === 1 && allN === 8, 'return=' + retN + ' 条件=' + condN + ' 总数=' + allN);
+  check('#109a5 反向哨兵:建会 503 必须仍带 meetingId(#106a2"说谎前提"的旁证不许断)',
+    /meetingId:\s*meeting\.id/.test(srvSrc2), 'meetingId 透出=' + /meetingId:\s*meeting\.id/.test(srvSrc2));
+}
+
+section('#110) 讨论循环中途 memory 被隔离必须自动止损(不留幽灵循环、不继续烧派发)');
+{
+  // 取证(基线 3f9f7a6 的树,判据本轮实测):
+  //   讨论循环里的持久化点 = 闭包函数 `updateMeeting()`(server.js:2607,8 个调用点)+ `store.addMessage()`(11 处)
+  //   + `store.closeMeeting()`(1 处)。#106 R4 只让 updateMeeting **回传** null,注释自己写着
+  //   「现有调用点全部忽略返回值」⇒ 循环跑到一半 memory.json 被隔离时:每轮照派下一个发言者、
+  //   止损判定/轮次/统计全在闭包里走、磁盘一无所获,并且继续花真实派发配额(幽灵循环的存量变种)。
+  //   本段用「3 个本地假 CLI 参与者 + 首位发言者在途时把 memory.json 改成截断字节」把这件事变成
+  //   **可数的行为**:计数文件里假 CLI 被调几次。修好 ⇒ ≤1 次(看门狗在 2 次持久化失败后走
+  //   finalizeAutoStop 收尾,后续发言者根本不该被派发);现状 ⇒ 全部发言者都派完。
+  //   反向哨兵 a4 钉住"健康会议不许被看门狗误杀":同样的 3 个参与者、不损坏文件 ⇒ 必须照旧全派完。
+  const SERVER110 = path.join(import.meta.dirname, 'server.js');
+  const mkSandbox = (tag) => {
+    const dir = path.join(tmpRoot, 'disc110-' + tag);
+    fs.mkdirSync(path.join(dir, 'workspaces'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'ws'), { recursive: true });
+    const counter = path.join(dir, 'counter.txt').replace(/\\/g, '/');
+    const fake = path.join(dir, 'fake110.cjs');
+    fs.writeFileSync(fake, `'use strict';
+const fs = require('fs');
+try { fs.appendFileSync(${JSON.stringify(counter)}, String(Date.now()) + '\\n', 'utf-8'); } catch (e) {}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600); // 每位发言者 600ms,给"中途损坏"留出在途窗口
+console.log('观点:应加持久化看门狗 Z110_MARK');
+`, 'utf-8');
+    const tools = ['z110a', 'z110b', 'z110c'].map(n => ({
+      name: n, displayName: n, description: '#110 本地假 CLI(零网络零配额)',
+      transport: 'cli', command: process.execPath.replace(/\\/g, '/'), args: [fake.replace(/\\/g, '/')], timeout: 20000
+    }));
+    fs.writeFileSync(path.join(dir, 'tools.json'), JSON.stringify(tools), 'utf-8');
+    return { dir, counter };
+  };
+  const runner110 = path.join(tmpRoot, 'disc110-runner.cjs');
+  fs.writeFileSync(runner110, `'use strict';
+const http=require('http'),fs=require('fs'),path=require('path');
+const port=Number(process.env.CASE_PORT),tok=process.env.CASE_TOK,dir=process.env.AI_BRIDGE_DATA_DIR;
+const corrupt=process.env.CASE_CORRUPT==='1';
+require(process.env.CASE_SERVER);
+const call=(m,p,b)=>new Promise(res=>{const d=JSON.stringify(b||{});
+ const q=http.request({hostname:'127.0.0.1',port,path:p,method:m,headers:{authorization:'Bearer '+tok,'content-type':'application/json','content-length':Buffer.byteLength(d)}},rr=>{let x='';rr.on('data',y=>{x+=y});rr.on('end',()=>res({status:rr.statusCode,raw:x}))});
+ q.on('error',e=>res({status:0,raw:String(e.code)}));q.setTimeout(9000,()=>{q.destroy();res({status:0,raw:'TIMEOUT'})});q.end(d)});
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const count=()=>{try{return fs.readFileSync(path.join(dir,'counter.txt'),'utf-8').split(/\\r?\\n/).filter(Boolean).length}catch(e){return 0}};
+const lines=(f)=>{try{return String(fs.readFileSync(path.join(dir,f),'utf-8')).split(/\\r?\\n/).filter(Boolean)}catch(e){return []}};
+(async()=>{
+ let h={status:0};
+ for(let i=0;i<45;i++){h=await call('GET','/api/health');if(h.status===200)break;await sleep(300)}
+ const created=await call('POST','/api/discuss',{topic:'#110 取证',participants:['z110a','z110b','z110c'],round2:false,implement:false});
+ const cb=(()=>{try{return JSON.parse(created.raw)}catch(e){return {}}})();
+ const mid=cb.meetingId||null;
+ if(corrupt){await sleep(120);try{fs.writeFileSync(path.join(dir,'memory.json'),'{"tasks":[],"meetings":[{"id":"x"','utf-8')}catch(e){}}
+ await sleep(14000); // 留足一拍:#99 appendLog 异步落盘,读 logs.jsonl 前必须等
+ const logs=lines('logs.jsonl');
+ process.stdout.write(JSON.stringify({
+  health:h.status, createdStatus:created.status, mid,
+  dispatches:count(),
+  stopLines:logs.filter(l=>/自动止损/.test(l)).map(l=>l.slice(0,200)),
+  refuseLines:logs.filter(l=>/memory\\.json/.test(l)&&/(拒写|损坏|隔离)/.test(l)).length,
+  ghostLines:logs.filter(l=>mid&&/会议 /.test(l)&&l.indexOf(mid)!==-1&&/发言完成|第一轮开始|第二轮开始/.test(l)).length
+ })+'\\n');
+ process.exit(0);
+})();`, 'utf-8')
+  const run110 = (tag, port, corrupt) => {
+    const sb = mkSandbox(tag)
+    const r = spawnSync(process.execPath, [runner110], {
+      cwd: import.meta.dirname,
+      env: {
+        ...process.env,
+        CASE_SERVER: SERVER110, CASE_PORT: String(port), CASE_TOK: 't110-' + tag, CASE_CORRUPT: corrupt ? '1' : '0',
+        AI_BRIDGE_PORT: String(port), AI_BRIDGE_HOST: '127.0.0.1',
+        AI_BRIDGE_DATA_DIR: sb.dir, AI_BRIDGE_DB: path.join(sb.dir, 'b.db'),
+        AI_BRIDGE_WORKSPACE_ROOT: path.join(sb.dir, 'ws'), AI_BRIDGE_TOOLS_PATH: path.join(sb.dir, 'tools.json'),
+        AI_BRIDGE_TOKEN: 't110-' + tag
+      },
+      encoding: 'utf-8', timeout: 90000, maxBuffer: 16 * 1024 * 1024
+    })
+    const last = String(r.stdout || '').split(/\r?\n/).filter(Boolean).pop()
+    let j = null
+    try { j = JSON.parse(last) } catch (_) { /* 交给断言判失败 */ }
+    return { j, sb }
+  }
+  const dmg = run110('dmg', 9906, true)
+  const d = dmg.j
+  check('#110a1 中途被隔离后,剩余发言者不得继续被派发(看门狗在连续 2 次持久化失败后收手;实测基线=第一轮 3 位全派完)',
+    !!d && d.dispatches <= 2,
+    JSON.stringify(d && { dispatches: d.dispatches, createdStatus: d.createdStatus, stopLines: d.stopLines.length, refuseLines: d.refuseLines }).substring(0, 240));
+  check('#110a2 必须走既有自动止损路径,且原因写清真因(存储拒写/隔离),不得只留一句 warn',
+    !!d && Array.isArray(d.stopLines) && d.stopLines.length >= 1 && d.stopLines.some(l => /存储|拒写|隔离|memory/.test(l)),
+    '止损留痕=' + JSON.stringify(d && d.stopLines).substring(0, 300));
+  check('#110a3 反向哨兵:隔离不得把进程打死(health 仍 200、建会回执仍给出真实结果、memory 拒写留痕确实在)',
+    !!d && d.health === 200 && d.refuseLines >= 1,
+    JSON.stringify(d && { health: d.health, createdStatus: d.createdStatus, refuseLines: d.refuseLines }).substring(0, 200));
+  const hl = run110('healthy', 9907, false)
+  const h = hl.j
+  check('#110a4 反向哨兵:未被隔离的健康会议必须照旧全部派完并正常收尾(看门狗不许误杀正常路径;实测健康态派发 7 次=3 位发言+共识/投票等后续步)',
+    !!h && h.dispatches === 7 && h.refuseLines === 0 && h.health === 200,
+    JSON.stringify(h && { dispatches: h.dispatches, refuseLines: h.refuseLines, ghostLines: h.ghostLines, health: h.health }).substring(0, 240));
+  // 结构锁:循环内的持久化调用点不得再整句丢弃返回值(#106 R4 回传了 null 却没人接)
+  const loopSrc = fs.readFileSync(SERVER110, 'utf-8').replace(/\r/g, '')
+  // 判据第一版写成 `…\);\s*$`,把带**随行尾注释**的 `updateMeeting({ totalTokens }); // …` 放过去了
+  // ——实测漏 3 处(原基线真值是 20 而非 17)。这是 #77「L5 锁漏抓第三处写手」的同一病,由编码手 P2 提醒后我加固。
+  const bareRe = /^\s*(updateMeeting|store\.addMessage|store\.closeMeeting)\([^;]*\);\s*(\/\/.*)?$/
+  const bare110 = loopSrc.split('\n').map((l, i) => [l, i + 1]).filter(([l]) => bareRe.test(l)).map(([, i]) => i)
+  check('#110a5 结构锁:server.js 内 updateMeeting/store.addMessage/store.closeMeeting 不得有整句丢弃返回值的调用点(判据含尾注释形态;原基线实测 20 处,第一版漏抓 3 处)',
+    bare110.length === 0, '裸调用=' + bare110.length + ' 行号=' + bare110.slice(0, 24).join(','));
+  // P1(#109 核准并入本单):interrupt/inject 的 503 必须走同族薄封装,不得各写一遍 persistRefusal
+  const hasMR = /function meetingRefusal\s*\(/.test(loopSrc)
+  const dupRefusal = loopSrc.split('\n').filter(l => /persistRefusal\('memory',\s*`(中断会议|主持人注入)/.test(l)).length
+  check('#110a6 会议族 503 必须有单一构造器 meetingRefusal(interrupt/inject 不再各抄一遍 persistRefusal)',
+    hasMR && dupRefusal === 0, 'meetingRefusal 定义=' + hasMR + ' 仍在原地手抄=' + dupRefusal);
+}
+
+section('#114) 隔离期止损的"为何停止"必须还能被读回(第二落点健康,不随 memory 一起丢)');
+{
+  // 病灶(#110 的下游残项):finalizeAutoStop 的三处写入 updateMeeting / store.addMessage / closeMeeting
+  //   全部经 saveSync('memory') —— 而 memory 此刻已被隔离并改名,三次写入必然全被拒绝 ⇒
+  //   「(自动止损: 存储拒写…,讨论提前结束)」这句**只活在 logs.jsonl 与进程计数器里**;
+  //   GET /api/discuss/status/<id> 走 store.getMeeting,此时读不到会议 ⇒ 直接 404,
+  //   宿主/人来看"这场会为什么停了"得到的回答是"会议不存在"——把"存储故障"谎报成"没这回事"。
+  // 口径:止损原因必须另有一个**健康落点**(SQLite events,经既有 db.recordEvent 单点写),
+  //   并且 status 视图在 memory 读不到时仍要能从该落点把原因说回来。
+  // 三把反向自证防"实现图省事把它做成永远有答案":① 正常收尾的健康会议不得凭空多出止损记录;
+  //   ② 真正不存在的会议 id 仍必须 404;③ 不得为此再造第三个 JSON 侧文件(单 sink 纪律)。
+  const SERVER114 = path.join(import.meta.dirname, 'server.js');
+  const mkSandbox114 = (tag) => {
+    const dir = path.join(tmpRoot, 'sb114-' + tag);
+    fs.mkdirSync(dir, { recursive: true });
+    const counter = path.join(dir, 'counter.txt');
+    const fake = path.join(dir, 'fake114.cjs');
+    fs.writeFileSync(fake, `'use strict';
+const fs = require('fs');
+try { fs.appendFileSync(${JSON.stringify(counter)}, String(Date.now()) + '\\n', 'utf-8'); } catch (e) {}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600); // 每位发言者 600ms,给"中途损坏"留在途窗口
+console.log('观点:止损原因要落进第二落点 Z114_MARK');
+`, 'utf-8');
+    const tools = ['z114a', 'z114b', 'z114c'].map(n => ({
+      name: n, displayName: n, description: '#114 本地假 CLI(零网络零配额)',
+      transport: 'cli', command: process.execPath.replace(/\\/g, '/'), args: [fake.replace(/\\/g, '/')], timeout: 20000
+    }));
+    fs.writeFileSync(path.join(dir, 'tools.json'), JSON.stringify(tools), 'utf-8');
+    return { dir, counter };
+  };
+  const runner114 = path.join(tmpRoot, 'disc114-runner.cjs');
+  fs.writeFileSync(runner114, `'use strict';
+const http=require('http'),fs=require('fs'),path=require('path');
+const port=Number(process.env.CASE_PORT),tok=process.env.CASE_TOK,dir=process.env.AI_BRIDGE_DATA_DIR;
+const corrupt=process.env.CASE_CORRUPT==='1';
+require(process.env.CASE_SERVER);
+const call=(m,p,b)=>new Promise(res=>{const d=JSON.stringify(b||{});
+ const q=http.request({hostname:'127.0.0.1',port,path:p,method:m,headers:{authorization:'Bearer '+tok,'content-type':'application/json','content-length':Buffer.byteLength(d)}},rr=>{let x='';rr.on('data',y=>{x+=y});rr.on('end',()=>res({status:rr.statusCode,raw:x}))});
+ q.on('error',e=>res({status:0,raw:String(e.code)}));q.setTimeout(9000,()=>{q.destroy();res({status:0,raw:'TIMEOUT'})});q.end(d)});
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const count=()=>{try{return fs.readFileSync(path.join(dir,'counter.txt'),'utf-8').split(/\\r?\\n/).filter(Boolean).length}catch(e){return 0}};
+const lines=(f)=>{try{return String(fs.readFileSync(path.join(dir,f),'utf-8')).split(/\\r?\\n/).filter(Boolean)}catch(e){return []}};
+(async()=>{
+ let h={status:0};
+ for(let i=0;i<45;i++){h=await call('GET','/api/health');if(h.status===200)break;await sleep(300)}
+ const created=await call('POST','/api/discuss',{topic:'#114 取证',participants:['z114a','z114b','z114c'],round2:false,implement:false});
+ const cb=(()=>{try{return JSON.parse(created.raw)}catch(e){return {}}})();
+ const mid=cb.meetingId||null;
+ if(corrupt){await sleep(120);try{fs.writeFileSync(path.join(dir,'memory.json'),'{"tasks":[],"meetings":[{"id":"x"','utf-8')}catch(e){}}
+ await sleep(13000); // 留足一拍:止损收尾 + appendLog 异步落盘
+ const st=await call('GET','/api/discuss/status/'+(mid||'none'));
+ const ghost=await call('GET','/api/discuss/status/m114-does-not-exist');
+ let memReason=null;
+ try{memReason=String(fs.readFileSync(path.join(dir,'memory.json'),'utf-8')).includes('自动止损')}catch(e){memReason='NO-FILE'}
+ const jsonFiles=fs.readdirSync(dir).filter(f=>f.endsWith('.json')).sort().join(',');
+ const sideStop=fs.readdirSync(dir).filter(f=>/stop|auto/i.test(f)&&f.endsWith('.json')).join(',');
+ process.stdout.write(JSON.stringify({
+  health:h.status, createdStatus:created.status, mid,
+  dispatches:count(),
+  statusView:{http:st.status, body:String(st.raw).slice(0,900)},
+  ghostView:{http:ghost.status, body:String(ghost.raw).slice(0,160)},
+  memReason, jsonFiles, sideStop,
+  stopLines:lines('logs.jsonl').filter(l=>/自动止损/.test(l)).map(l=>l.slice(0,160)),
+  corruptFiles:fs.readdirSync(dir).filter(f=>f.includes('.corrupt-')).length
+ })+'\\n');
+ process.exit(0);
+})();`, 'utf-8')
+  const run114 = (tag, port, corrupt) => {
+    const sb = mkSandbox114(tag)
+    const r = spawnSync(process.execPath, [runner114], {
+      cwd: import.meta.dirname,
+      env: {
+        ...process.env,
+        CASE_SERVER: SERVER114, CASE_PORT: String(port), CASE_TOK: 't114-' + tag, CASE_CORRUPT: corrupt ? '1' : '0',
+        AI_BRIDGE_PORT: String(port), AI_BRIDGE_HOST: '127.0.0.1',
+        AI_BRIDGE_DATA_DIR: sb.dir, AI_BRIDGE_DB: path.join(sb.dir, 'b.db'),
+        AI_BRIDGE_WORKSPACE_ROOT: path.join(sb.dir, 'ws'), AI_BRIDGE_TOOLS_PATH: path.join(sb.dir, 'tools.json'),
+        AI_BRIDGE_TOKEN: 't114-' + tag
+      },
+      encoding: 'utf-8', timeout: 90000, maxBuffer: 16 * 1024 * 1024
+    })
+    const last = String(r.stdout || '').split(/\r?\n/).filter(Boolean).pop()
+    let j = null
+    try { j = JSON.parse(last) } catch (_) { /* 交给断言判失败,绝不静默绿 */ }
+    return { j, sb }
+  }
+  const dmg114 = run114('dmg', 9908, true)
+  const hl114 = run114('hlth', 9909, false)
+  const D = dmg114.j || {}, H = hl114.j || {}
+  const reasonIn = (s) => /自动止损|存储拒写|隔离/.test(String(s || ''))
+  check('#114a1 红:中途被隔离后 GET /api/discuss/status/<id> 仍必须把"为何停止"说回来(现状=读不到会议,直接 404)',
+    D.statusView?.http === 200 && reasonIn(D.statusView.body),
+    'status=' + (D.statusView && D.statusView.http) + ' body=' + JSON.stringify(String(D.statusView && D.statusView.body).substring(0, 300)) + ' mid=' + D.mid)
+  // 注意:隔离会把 memory.json 改名成 .corrupt-* 保全 ⇒ "原因不在 memory 落点"有两种真实形态
+  //   (文件已不在 = 'NO-FILE',或文件仍在但其中没有止损文案 = false)。判据必须两者都算,
+  //   否则就是"实现修好了也永远打不绿"的不可满足锁(本会话已栽过 6 次,这条注释就是防第 7 次)。
+  const memLacksReason = D.memReason === false || D.memReason === 'NO-FILE'
+  check('#114a2 单落点证明:该原因**不在** memory.json 落点里(写确实被拒/文件已被改名保全)却仍能从 API 读回 ⇒ 证明确实来自第二个落点,不是内存侥幸;'
+    + '同时 logs.jsonl 的止损留痕不得因此回退',
+    memLacksReason && D.statusView?.http === 200 && Array.isArray(D.stopLines) && D.stopLines.length >= 1,
+    'memory 落点状态=' + JSON.stringify(D.memReason) + ' status=' + (D.statusView && D.statusView.http) + ' 止损日志行=' + (D.stopLines || []).length)
+  check('#114a3 反向自证(不得把止损做成永远有答案):未被隔离的健康会议 status 必须 200 且不得凭空出现止损记录',
+    H.statusView?.http === 200 && !/自动止损|auto_stop/.test(String(H.statusView.body)),
+    'status=' + (H.statusView && H.statusView.http) + ' body含止损字样=' + /自动止损|auto_stop/.test(String(H.statusView && H.statusView.body)) + ' 派发货数=' + H.dispatches)
+  check('#114a4 反向自证:真正不存在的会议 id 仍必须 404(加了 SQLite 回读后不得把所有 id 都答成 200)',
+    D.ghostView?.http === 404, 'status=' + (D.ghostView && D.ghostView.http) + ' body=' + JSON.stringify(String(D.ghostView && D.ghostView.body).substring(0, 140)))
+  check('#114a5 单 sink 纪律:不得为止损新增第三个 JSON 侧文件(DATA_DIR 里不应出现 stop/auto 形态的 json)',
+    D.sideStop === '' && (Array.isArray(D.corruptFiles) ? D.corruptFiles : Number(D.corruptFiles || 0)) >= 1,
+    '侧文件=' + JSON.stringify(D.sideStop) + ' DATA_DIR json=' + JSON.stringify(D.jsonFiles) + ' 保全件数=' + JSON.stringify(D.corruptFiles))
+  const src114 = fs.readFileSync(SERVER114, 'utf-8').replace(/\r/g, '')
+  const inlineInsert = (src114.match(/INSERT INTO events/g) || []).length
+  check('#114a6 结构锁:事件写入必须走 db.recordEvent 单点(server.js 内 INSERT INTO events 必须 0 处,防第二套 SQL 手写)',
+    inlineInsert === 0 && /db\.recordEvent/.test(src114),
+    'server.js 内 INSERT INTO events=' + inlineInsert + ' 含 db.recordEvent=' + /db\.recordEvent/.test(src114))
+}
+
+section('#112) 行号锚点保真:源码/测试注释与说明书里的"点号锚点"必须指向真实非空行');
+{
+  // 取证(基线 237d04a,分母由判据自身重算,不沿用盘点脚本输出——#100 的教训):
+  //   只认 `文件.ext:NNN` 形态的**点号锚点**。为什么不扫裸 `:NNN`:本轮实测三类假阳性
+  //   —— db.js:279 的 `{input:200` 是 token 数、adapters/http-adapter.js:9 的 `localhost:8500` 是 URL 端口、
+  //   bridge-stdio.js:378 的 `server.js:1342,:1347` 里后者是对 server.js 的**续指**(按本文件行数判就成了假越界)。
+  //   基线实测(判据自己扫出来的数,非盘点脚本):源码+测试注释里点号锚点 84 处,失效 9 处
+  //   —— 7 处指向空行、1 处越界(把 db.js 第 1132 行当锚点,而 db.js 全文仅 369 行)、1 处目标不存在(裸名 cli-adapter 的第 139 行,
+  //   真路径带 adapters/ 前缀,即 #61a4 早就在文档里点名的那一例);README 37 处失效 1(server.js 第 1104 行是空行)、ARCHITECTURE 55 处失效 0。
+  //   失效 9 处**全在测试文件注释里,源码注释 0 处** ⇒ 本格零源码改动、不派编码手、不重启中枢。
+  //   订正后实测:失效 0(锚点总数随注释增删浮动,不钉死;green 时判据不打印,red 时明细带总数)。
+  //   本段自己的取证注释也进了自扫范围:写这段时我举的两个反例(db.js 1132 / server.js 1104)以锚点形态落进注释,
+  //   被 a1 当堂打回 2 处失效 ⇒ 改成"第 NNNN 行"的非锚点措辞。判据对作者同视,不豁免。
+  //   #61a3/a4 只查"路径可达 + 不越界",从不看那一行是不是空行,也不覆盖任何源码/测试注释 ⇒ 本段把两样都补上。
+  //   (本段自己也在自扫描范围内:写这段时我留下两处失效锚点当堂被抓,已就地改成合法锚点或去掉锚点形态。)
+  const D112 = import.meta.dirname
+  const ANCHOR_RE = /([A-Za-z0-9_.\-/]*\.(?:js|mjs|cjs|json|html)):(\d{1,5})(?!\d)/g
+  const lcCache = {}
+  const linesOf = (rel) => {
+    if (!(rel in lcCache)) {
+      const abs = path.join(D112, rel)
+      lcCache[rel] = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8').replace(/\r/g, '').split('\n') : null
+    }
+    return lcCache[rel]
+  }
+  const scanTargets = fs.readdirSync(D112).filter((e) => /\.(js|mjs)$/.test(e))
+  const deadSrc = []
+  let nSrc = 0
+  for (const f of scanTargets) {
+    const L = linesOf(f) || []
+    L.forEach((l, i) => {
+      if (!/(\/\/|^\s*\*|\/\*)/.test(l)) return
+      for (const m of l.matchAll(ANCHOR_RE)) {
+        nSrc++
+        const t = linesOf(m[1])
+        if (!t) { deadSrc.push(f + ':' + (i + 1) + ' `' + m[0] + '` 目标文件不存在'); continue }
+        const ln = Number(m[2])
+        if (ln > t.length) deadSrc.push(f + ':' + (i + 1) + ' `' + m[0] + '` 越界(' + m[1] + ' 共 ' + t.length + ' 行)')
+        else if (!String(t[ln - 1] || '').trim()) deadSrc.push(f + ':' + (i + 1) + ' `' + m[0] + '` 指向空行')
+      }
+    })
+  }
+  check('#112a1 源码与测试注释里的点号锚点必须可达、不越界且不指向空行(判据自扫 38 个 .js/.mjs,实测基线 84 处中 9 处失效,全在测试注释;源码注释 0 处)',
+    deadSrc.length === 0, '扫描=' + scanTargets.length + ' 个文件 锚点=' + nSrc + ' 失效=' + deadSrc.length + ' :: ' + JSON.stringify(deadSrc).substring(0, 600))
+  const docDead = []
+  let nDoc = 0
+  for (const doc of ['README.md', 'ARCHITECTURE.md']) {
+    const L = linesOf(doc) || []
+    L.forEach((l, i) => {
+      for (const m of l.matchAll(ANCHOR_RE)) {
+        nDoc++
+        const t = linesOf(m[1])
+        if (!t) { docDead.push(doc + ':' + (i + 1) + ' `' + m[0] + '` 目标不存在'); continue }
+        const ln = Number(m[2])
+        if (ln > t.length) docDead.push(doc + ':' + (i + 1) + ' `' + m[0] + '` 越界(' + t.length + ')')
+        else if (!String(t[ln - 1] || '').trim()) docDead.push(doc + ':' + (i + 1) + ' `' + m[0] + '` 指向空行')
+      }
+    })
+  }
+  check('#112a2 说明书锚点在 #61a3/a4 的"可达不越界"之上再补"不得指向空行"(实测基线 README 37 处失效 1、ARCHITECTURE 55 处失效 0)',
+    docDead.length === 0, '说明书锚点=' + nDoc + ' 失效=' + docDead.length + ' :: ' + JSON.stringify(docDead).substring(0, 300))
+  // 反向自证(双向,防过宽也防空转):三类"看着像行号"的东西必须 0 命中,而真锚点样本必须原样抓到 2 个。
+  const FP_SAMPLES = [
+    'const budget = {input:200, output:0};',                    // token 数,不是行号
+    'endpoint: "http://localhost:8500/generate",',             // URL 端口,不是行号
+    '// 节奏归入待审批档(5 秒,与 :985 同);见 :467 的守卫'        // 裸 :NNN(本文件/续指),不纳入点号判据
+  ]
+  const fpHits = FP_SAMPLES.map((s) => [...s.matchAll(ANCHOR_RE)].map((m) => m[0]))
+  const fpFlat = fpHits.flat()
+  const TP = '// 中枢只校验 tool(server.js:1342),cause.js:20 另有上限常量'
+  const tpHits = [...TP.matchAll(ANCHOR_RE)].map((m) => m[0])
+  check('#112a3 指纹双向自证:点号判据须放过 token 数/URL 端口/裸 :NNN 三类假阳性,且必须抓到真锚点(过宽=永远红,过窄=永远绿)',
+    fpFlat.length === 0 && tpHits.length === 2,
+    '误伤=' + JSON.stringify(fpFlat) + ' 真锚点抓到=' + JSON.stringify(tpHits))
+
+  // a4) README env 表**语义**锁:a1 只看"行存在且非空",看不见"行非空但说的是别的变量"这种漂移。
+  //   判据:env 表里**整行只有 1 个点号锚点**的行,该锚点所在行必须点名该 env(或剥掉 AI_BRIDGE_ 前缀的尾名)。
+  //   红基线(可复现:git show 162d873:ai-bridge/README.md 喂给本判据,源码取当前树)= 单锚点 env 行 14、红 11:
+  //     CONFIG 块 6 行整体错位 1-2 行(如 AI_BRIDGE_CORS 指 `};` 而非 CORS_ORIGIN 那行)、桥侧视觉/反向 sampling
+  //     4 处落在报表文本拼接行(如 AI_BRIDGE_VISION_PORT 指 lines.push('## 黑名单'))、PROXY_TIMEOUT 指空行。
+  //   为什么不判多锚点行(实测 3 行)与无锚点行(实测 16 行):前者合法地引用旁证行(README 的 AI_BRIDGE_CLOUD_URL
+  //   一行点了 edge-agent 的读取/抛错/https 校验三处,只有第一处点名 env),要求每个锚点都点名=打假红;
+  //   后者文档根本没声称位置,无所谓漂移。这条边界由 a4c 的反向自证钉住,不靠注释自觉。
+  const envRowOf = (l) => {
+    const em = l.match(/^\|\s*`(AI_BRIDGE_[A-Z0-9_]+)`/)
+    return em ? em[1] : null
+  }
+  const semBad = (env, line) => {
+    const ms = [...line.matchAll(ANCHOR_RE)]
+    if (ms.length !== 1) return false
+    const t = linesOf(ms[0][1])
+    const ln = Number(ms[0][2])
+    if (!t || ln > t.length) return true // 结构失效同样算语义不合(a1 已判,这里不豁免)
+    const target = String(t[ln - 1] || '')
+    return !(target.includes(env) || target.includes(env.replace(/^AI_BRIDGE_/, '')))
+  }
+  const allBad = (env, line) => [...line.matchAll(ANCHOR_RE)].some((m) => {
+    const t = linesOf(m[1])
+    const ln = Number(m[2])
+    if (!t || ln > t.length) return true
+    const target = String(t[ln - 1] || '')
+    return !(target.includes(env) || target.includes(env.replace(/^AI_BRIDGE_/, '')))
+  })
+  const envLines = linesOf('README.md') || []
+  const semHits = []
+  let nSingle = 0
+  let nMulti = 0
+  let nNone = 0
+  envLines.forEach((l, i) => {
+    const env = envRowOf(l)
+    if (!env) return
+    const k = [...l.matchAll(ANCHOR_RE)].length
+    if (k === 0) { nNone++; return }
+    if (k > 1) { nMulti++; return }
+    nSingle++
+    if (semBad(env, l)) semHits.push('README.md:' + (i + 1) + ' ' + env)
+  })
+  check('#112a4 README env 表单锚点行必须落在真点名该 env 的那一行(基线红 11/14,现须 0)',
+    semHits.length === 0, '单锚点=' + nSingle + ' 多锚点=' + nMulti + ' 无锚点=' + nNone + ' 语义不合=' + semHits.length + ' :: ' + JSON.stringify(semHits).substring(0, 400))
+  // a4b/a4c 双向自证:同一判据对"错位锚点"样本必须红、对真行必须绿;过宽版(要求行内每个锚点都点名)必须把
+  // 多锚点样本判红而本判据必须放过 —— 否则说明本判据根本没在收窄,而是永远为真或永远为假。
+  // 样本用具名 env + 显式第二锚点构造(不依赖某个真行的内容会不会变),真行只用来证明"豁免分支确实被走到"。
+  const corsReal = envLines.find((l) => envRowOf(l) === 'AI_BRIDGE_CORS') || ''
+  const corsMoved = corsReal.replace(/server\.js:\d+/, 'server.js:1') // server.js:1 = shebang,非空且不点名 CORS
+  const wideSample = '| `AI_BRIDGE_CORS` | x | 值（`server.js:74`），另见鉴权门（`server.js:1`） |'
+  check('#112a4b 判据有牙齿:CORS 真行判绿、其单锚点改指 shebang 判红;多锚点样本过宽版判红而本判据放过;豁免分支确被真数据走到',
+    nSingle > 0 && nMulti > 0 && corsReal.includes('server.js:') && !semBad('AI_BRIDGE_CORS', corsReal) && semBad('AI_BRIDGE_CORS', corsMoved)
+      && [...wideSample.matchAll(ANCHOR_RE)].length === 2 && allBad('AI_BRIDGE_CORS', wideSample) && !semBad('AI_BRIDGE_CORS', wideSample),
+    '单锚点=' + nSingle + ' 多锚点=' + nMulti + ' CORS 真行判=' + semBad('AI_BRIDGE_CORS', corsReal)
+      + ' 错位样本判=' + semBad('AI_BRIDGE_CORS', corsMoved) + ' 宽样本锚点数=' + [...wideSample.matchAll(ANCHOR_RE)].length
+      + ' 过宽版判=' + allBad('AI_BRIDGE_CORS', wideSample) + ' 本判据判=' + semBad('AI_BRIDGE_CORS', wideSample))
 }
 
 try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) {}

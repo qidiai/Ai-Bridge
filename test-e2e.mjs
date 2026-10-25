@@ -131,17 +131,43 @@ function makeMcpChannel (child) {
   };
 }
 
-async function waitServerReady (timeoutMs = 15000) {
+const HUB_POLL_MS = 200;
+const HUB_BOOT_BUDGET_MS = 20000;
+
+// 单次 /api/health 读取:只把响应体交回(或抛错),**不做就绪判定** —— 判定归 waitHubReady 单点。
+async function healthOnce (port, timeoutMs = 4000) {
+  return await new Promise((resolve, reject) => {
+    const r = http.request({ hostname: HOST, port, path: '/api/health', method: 'GET', timeout: timeoutMs }, res => {
+      let s = ''; res.on('data', c => { s += c }); res.on('end', () => { try { resolve(JSON.parse(s)); } catch { resolve({ raw: s.substring(0, 60) }); } });
+    });
+    r.on('error', reject); r.on('timeout', () => { r.destroy(); reject(new Error('health timeout')); }); r.end();
+  });
+}
+
+// 全文件唯一"等中枢就绪"实现(#115):有界轮询,返回 { ok, elapsedMs, last }。
+//   throwOnTimeout=true 时沿用旧 waitServerReady 语义(超时抛 'server 启动超时'),主实例调用点零改动;
+//   第二实例探针取 ok + elapsedMs,并把它打进断言详串 —— 使"慢启动"与"起不来"可分辨,
+//   这正是 #115 的立项理由:旧写法 `sleep(2000)` + 单次请求把"慢"判成"死",与前置套件争 CPU 时产出假红。
+async function waitHubReady (port, { timeoutMs = HUB_BOOT_BUDGET_MS, throwOnTimeout = false } = {}) {
   const start = Date.now();
+  let last = null;
   while (Date.now() - start < timeoutMs) {
-    // 就绪探针只验证 HTTP 主循环；/api/tools 会执行 CLI 可用性探测，不能作为启动判据。
+    // 就绪判据只认 HTTP 主循环:/api/tools 会执行 CLI 可用性探测,不能当启动判据(沿用旧 waitServerReady 的注释结论)。
     try {
-      const r = await req('GET', '/api/health');
-      if (r.status === 200 && r.body.status === 'ok') return true;
-    } catch { /* retry */ }
-    await sleep(300);
+      const body = await healthOnce(port);
+      if (body && body.status === 'ok') return { ok: true, elapsedMs: Date.now() - start, last: body };
+      last = body;
+    } catch (e) { last = { err: e.message }; }
+    await sleep(HUB_POLL_MS);
   }
-  throw new Error('server 启动超时');
+  if (throwOnTimeout) throw new Error('server 启动超时');
+  return { ok: false, elapsedMs: Date.now() - start, last };
+}
+
+// 主实例薄封装:两处调用点(启动、重启)语义逐字不变,轮询实现已收敛到 waitHubReady。
+async function waitServerReady (timeoutMs = 15000) {
+  const r = await waitHubReady(PORT, { timeoutMs, throwOnTimeout: true });
+  return r.ok;
 }
 
 async function waitClientConnected (name, timeoutMs = 15000) {
@@ -242,8 +268,8 @@ async function main () {
   check('#39e 清扫结果已落盘(不是只在内存里改)', orphanAfter.status === 'interrupted', JSON.stringify(orphanAfter).substring(0, 180));
 
   // 1.6) 第二实例真启动探针(#52 指定红集):预置"合法 JSON 但形状错"的 memory.json
-  //   (meetings 为对象)后启动一个独立中枢进程。现状(修复前):markOrphanMeetings 在顶层启动序列
-  //   抛 TypeError 且调用点无 try(server.js:2694)→ 进程起不来 → watchdog 会重启至熔断=整体不可用。
+  //   (meetings 为对象)后启动一个独立中枢进程。修复前:markOrphanMeetings 在顶层启动序列
+  //   抛 TypeError 且调用点无 try(该调用点现锚 server.js:2937,外面的 try 即 #52 的落点)→ 进程起不来 → watchdog 会重启至熔断=整体不可用。
   //   要求:坏形状数据只能让功能降级,绝不能阻止进程启动。
   section('坏形状数据不得阻止中枢启动:#52 红集(第二实例)');
   const BOOT_PORT = 9821;
@@ -259,17 +285,9 @@ async function main () {
   let bootOut = '';
   bootProc.stderr.on('data', d => { bootOut += d.toString(); });
   bootProc.stdout.on('data', d => { bootOut += d.toString(); });
-  await sleep(2000);
-  let bootHealth = null;
-  try {
-    bootHealth = await new Promise((resolve, reject) => {
-      const r = http.request({ hostname: HOST, port: BOOT_PORT, path: '/api/health', method: 'GET', timeout: 4000 }, res => {
-        let s = ''; res.on('data', c => s += c); res.on('end', () => { try { resolve(JSON.parse(s)); } catch (e) { resolve({ raw: s.substring(0, 80) }); } });
-      });
-      r.on('error', reject); r.on('timeout', () => { r.destroy(); reject(new Error('health timeout')); }); r.end();
-    });
-  } catch (e) { bootHealth = { err: e.message }; }
-  check('#52b1 预置畸形 memory.json 后中枢仍能启动并响应 /api/health', bootHealth && bootHealth.status === 'ok', JSON.stringify(bootHealth).substring(0, 120) + ' | stderr=' + bootOut.substring(0, 160));
+  const bootReady = await waitHubReady(BOOT_PORT);
+  const bootHealth = bootReady.last;
+  check('#52b1 预置畸形 memory.json 后中枢仍能启动并响应 /api/health', bootHealth && bootHealth.status === 'ok', JSON.stringify(bootHealth).substring(0, 120) + ' | 就绪耗时=' + bootReady.elapsedMs + 'ms 预算内=' + bootReady.ok + ' | stderr=' + bootOut.substring(0, 160));
   check('#52b2 启动进程未崩溃(仍在运行)', bootProc.exitCode === null, 'exitCode=' + bootProc.exitCode);
   try { bootProc.kill(); } catch { /* ignore */ }
   await sleep(400);
@@ -342,21 +360,21 @@ async function main () {
 
   // ① 默认(未设 env):注册表必须仍读仓库内 tools.json —— 生产中性哨兵,现在就该绿,修完也必须绿
   const defProc = spawnProbeHub(TOOLS_PORT_DEF, {}, 'default');
-  await sleep(2200);
+  const defReady = await waitHubReady(TOOLS_PORT_DEF);
   const defTools = await jreq(TOOLS_PORT_DEF, 'GET', '/api/tools');
   const defNames = (defTools.body.tools || []).map(t => t.name || t.id);
   check('#80a1 哨兵:未设 AI_BRIDGE_TOOLS_PATH 时注册表照旧读到仓库内 tools.json(生产中性,须全程为绿)',
-    defTools.status === 200 && defNames.includes('openclaw'), 'count=' + defNames.length + ' names=' + defNames.slice(0, 6).join(','));
+    defTools.status === 200 && defNames.includes('openclaw'), 'count=' + defNames.length + ' names=' + defNames.slice(0, 6).join(',') + ' 就绪耗时=' + defReady.elapsedMs + 'ms');
   try { defProc.kill(); } catch { /* ignore */ }
   await sleep(400);
 
   // ② 设 env:注册表必须改读隔离文件(现状:env 被无视 → 仍是生产 12 工具)
   const probeProc = spawnProbeHub(TOOLS_PORT_PROBE, { AI_BRIDGE_TOOLS_PATH: probeToolsPath }, 'probe');
-  await sleep(2200);
+  const probeReady = await waitHubReady(TOOLS_PORT_PROBE);
   const probeTools = await jreq(TOOLS_PORT_PROBE, 'GET', '/api/tools');
   const probeNames = (probeTools.body.tools || []).map(t => t.name || t.id);
   check('#80a2 设 AI_BRIDGE_TOOLS_PATH 后注册表必须按该文件装载(现状:env 无效,静态工具仍来自仓库 tools.json)',
-    probeNames.includes('probe-cli') && !probeNames.includes('openclaw'), 'names=' + probeNames.slice(0, 8).join(','));
+    probeNames.includes('probe-cli') && !probeNames.includes('openclaw'), 'names=' + probeNames.slice(0, 8).join(',') + ' 就绪耗时=' + probeReady.elapsedMs + 'ms');
   check('#80a3 载入诊断必须如实报出实际使用的文件名(现状:恒报 tools.json,派发失败时无法归因到配置源)',
     /probe-tools\.json/.test(JSON.stringify(probeTools.body)), JSON.stringify(probeTools.body.registry || probeTools.body.diag || probeTools.body.stats || '').substring(0, 160));
 
@@ -401,7 +419,8 @@ async function main () {
   }], null, 2), 'utf-8');
 
   const p40Proc = spawnProbeHub(P40_PORT, { AI_BRIDGE_TOOLS_PATH: p40ToolsPath }, 'brief-hub');
-  await sleep(2200);
+  const p40Ready = await waitHubReady(P40_PORT);
+  if (!p40Ready.ok) process.stdout.write(`(#40 简报探针:第二实例未在 ${p40Ready.elapsedMs}ms 内就绪)\n`);
   const p40Ws = await jreq(P40_PORT, 'POST', '/api/workspaces', { name: 'brief-ws', description: '#40 工作区' });
   const p40WsPath = (p40Ws.body && p40Ws.body.path) || '';
   const p40Dispatch = await jreq(P40_PORT, 'POST', '/api/dispatch', { task: '只写一个 hello.txt', tools: ['echo-cli'], workspace: 'brief-ws', auto_fallback: false });
@@ -480,9 +499,9 @@ async function main () {
   const tpView = async () => {
     try { const c = await req2('GET', '/api/clients'); return ((c.body && c.body.clients) || []).find(x => x.id === TP_CLIENT) || {}; } catch { return {}; }
   };
-  await sleep(1800);
+  const tpReady = await waitHubReady(TP_PORT);
   const reg2 = await req2('POST', '/api/client/register', { name: TP_CLIENT, capabilities: { sampling: true } }).catch(e => ({ err: e.message }));
-  check('#59a0 第二实例内客户端获准注册(否则走不到取任务路径)', reg2 && reg2.body && reg2.body.status === 'approved', JSON.stringify(reg2).substring(0, 150));
+  check('#59a0 第二实例内客户端获准注册(否则走不到取任务路径)', reg2 && reg2.body && reg2.body.status === 'approved', JSON.stringify(reg2).substring(0, 150) + ' 就绪耗时=' + tpReady.elapsedMs + 'ms');
   // 先开长轮询(取任务的正是它),等 firstPollAt 生效后再派发
   let pollTask = null;
   const pollP = req2('POST', '/api/poll', { clientId: TP_CLIENT }).then(r => { pollTask = r && r.body && r.body.task; return r; }).catch(() => {});
@@ -679,7 +698,7 @@ async function main () {
     'memory_search', 'memory_recent', 'logs', 'discuss', 'list_clients', 'manage_client',
     'list_workspaces', 'create_workspace', 'recognize_image'];
   check('tools/list 暴露全部核心工具', expected.every(n => names.includes(n)), '缺失: ' + expected.filter(n => !names.includes(n)).join(','));
-  check('被并工具已消失且总数 15', names.length === 15 && !['approve_client', 'deny_client', 'kick_client', 'discuss_status', 'discuss_interrupt', 'discuss_inject'].some(n => names.includes(n)), 'names=' + names.join(','));
+  check('被并工具已消失且总数 16(#58 增 task_status 后由 15→16,基线此条必须红)', names.length === 16 && !['approve_client', 'deny_client', 'kick_client', 'discuss_status', 'discuss_interrupt', 'discuss_inject'].some(n => names.includes(n)), 'names=' + names.join(','));
   const dispatchTool = (tl.result?.tools || []).find(t => t.name === 'dispatch');
   check('dispatch 工具含 context 参数', !!dispatchTool?.inputSchema?.properties?.context);
   check('dispatch 工具含 workspace 参数', !!dispatchTool?.inputSchema?.properties?.workspace);
@@ -1084,8 +1103,9 @@ async function main () {
       stdio: ['ignore', 'pipe', 'pipe']
     });
     negHub.stderr.on('data', () => {}); negHub.stdout.on('data', () => {});
-    await sleep(2000);
+    const negReady = await waitHubReady(NEG_HUB_PORT);
     let negErr = '';
+    if (!negReady.ok) process.stdout.write(`(负 env 探针:第二实例未在 ${negReady.elapsedMs}ms 内就绪,后续失联断言如实反映)\n`);
     const negProc = spawn(process.execPath, ['bridge-stdio.js'], {
       cwd: __dirname,
       env: { ...process.env, AI_BRIDGE_PORT: String(NEG_HUB_PORT), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-neg-env', AI_BRIDGE_HTTP_TIMEOUT: '-1' },
@@ -1230,6 +1250,109 @@ async function main () {
   const { estimateTokens } = require('./tool-registry.js');
   check('estimateTokens ASCII > 0', estimateTokens('hello world') > 0);
   check('estimateTokens CJK 密度更高', estimateTokens('这是一段中文测试文本内容') > estimateTokens('abcdefghijkl'));
+
+  // 12.5) MCP 工具面行为快照(#27 的前置护栏,指挥官亲笔;编码手禁改)
+  //   为什么先补护栏再派重构:实测 tools/list 暴露的 15 个工具里,只有 4 个在锁定套件中出现过
+  //   `tools/call`(list_tools 6 次、discuss 10、list_clients 2、manage_client 4),**其余 11 个零覆盖**;
+  //   而 #27 要把 `dispatchToolCall`(实测 365 行 / 15 个 case / 内联 11 次 httpPost + 8 次 httpGet)
+  //   挪成表驱动 —— 没快照就是没安全网:参数校验、错误归因、返回形状都可能悄悄变。
+  //   快照只打**零副作用、零配额**的路径:只读工具验形状;写类工具只验"参数无效必须被拒"(不落到真派发)。
+  //   recognize_image 不做行为快照:它一旦通过校验就会去连 Ollama(#85 那格处理),这里只钉它的结构体量。
+  section('MCP 工具面行为快照(#27 前置护栏)');
+  {
+    const call = async (name, args) => {
+      try {
+        const r = await mcp.request('tools/call', { name, arguments: args || {} });
+        const res = (r && r.result) || {};
+        return { text: (res.content || []).map(c => c.text || '').join('\n'), isError: !!res.isError, rpcErr: null };
+      } catch (e) {
+        return { text: '', isError: false, rpcErr: String((e && e.message) || e).substring(0, 60) };
+      }
+    };
+    const readOnly = ['list_switches', 'list_workspaces', 'token_stats', 'logs', 'memory_recent', 'list_clients'];
+    const roBad = [];
+    for (const t of readOnly) {
+      const r = await call(t, {});
+      if (r.rpcErr || r.isError || r.text.trim().length === 0) roBad.push(t + '=' + (r.rpcErr || ('isError=' + r.isError + ' len=' + r.text.length)));
+    }
+    check('#27s1 快照:6 个只读工具(list_switches/list_workspaces/token_stats/logs/memory_recent/list_clients)必须不抛、isError=false 且回话非空',
+      roBad.length === 0, '异常项=' + JSON.stringify(roBad).substring(0, 260));
+    const ms = await call('memory_search', { query: 'cube' });
+    check('#27s2 快照:memory_search 带 query 必须正常返回(表驱动化最容易把"可选参数"挪成必填)',
+      ms.rpcErr === null && ms.isError === false && ms.text.trim().length > 0, JSON.stringify(ms).substring(0, 160));
+    const tg = await call('toggle_tool', {});
+    check('#27s3 快照:toggle_tool 缺 tool 参数必须被拒,且归因含参数名(不得伪装成"已切换")',
+      tg.isError === true && /tool|参数/i.test(tg.text + tg.rpcErr), JSON.stringify({ isError: tg.isError, text: tg.text.substring(0, 90), rpcErr: tg.rpcErr }));
+    const cw = await call('create_workspace', {});
+    check('#27s4 红:create_workspace 缺 name 必须被拒 —— 现状**实测静默新建**:自动取名 workspace-xxxx 并建目录,回"工作区已创建"。'
+      + '表驱动化正好该把"必填参数"变成表项声明(与 #51 同族:静默替代代替校验)',
+      cw.isError === true && /name|参数|缺少/.test(cw.text + cw.rpcErr), JSON.stringify({ isError: cw.isError, text: cw.text.substring(0, 110), rpcErr: cw.rpcErr }));
+    const mc = await call('manage_client', { action: 'not-a-real-action', clientId: 'nobody' });
+    check('#27s5 快照:manage_client 未知 action 必须被拒(一个工具四件事,分支最容易被表驱动抹平)',
+      mc.isError === true && mc.text.length > 0, JSON.stringify({ isError: mc.isError, text: mc.text.substring(0, 90), rpcErr: mc.rpcErr }));
+    const dp = await call('dispatch', { task: '' });
+    check('#27s6 快照:dispatch 空 task 必须在校验阶段被拒(不得真派发、不得烧配额、不得回"成功 0 个"式假通过)',
+      dp.isError === true && /task|任务|参数|缺少/.test(dp.text + dp.rpcErr), JSON.stringify({ isError: dp.isError, text: dp.text.substring(0, 110), rpcErr: dp.rpcErr }));
+    const ho = await call('handoff', {});
+    check('#27s7 快照:handoff 缺参数必须被拒且归因可读',
+      ho.isError === true && (ho.text + ho.rpcErr).trim().length > 0, JSON.stringify({ isError: ho.isError, text: ho.text.substring(0, 90), rpcErr: ho.rpcErr }));
+    const un = await call('no_such_tool_xyz', {});
+    check('#27s8 快照:未知工具名必须回 isError 且文案含"未知/unknown"(#56/#81 一路的归因面,重构不得把它变成空成功)',
+      un.isError === true && /未知|unknown|不存在/.test(un.text + un.rpcErr), JSON.stringify({ isError: un.isError, text: un.text.substring(0, 110), rpcErr: un.rpcErr }));
+    // 【我自己护栏的漏,当场补】s3 只打了"全缺参",打不到"多要求了一个本来就可选的参数"。
+    //   中枢 server.js:1342 只校验 tool,而 :1347 是 `sw[tool.id] = !!body.enabled`
+    //   ⇒ "省略 enabled"本来就是**合法的"关闭它"**语义。#27 把 enabled 写进 requiredArgs 后,
+    //   这类调用被桥在发出前拒掉 = 语义丢失(实测回归,已开返工单 R1)。
+    // 先立前置态:s9b 考察"变关",若起手就是关,则"桥拒调用后仍然关"与"桥放行后变成关"两种世界
+    //   不可区分(实测红基线里 s9b 假绿,正是这个原因 —— workbuddy 在本套件默认就是关的)。
+    await req('POST', '/api/toggle', { tool: 'workbuddy', enabled: true });
+    const toolsPre = await req('GET', '/api/tools');
+    const wbPre = (toolsPre.body.tools || []).find(t => t.name === 'workbuddy' || t.id === 'workbuddy') || {};
+    check('#27s9a 前置锁:workbuddy 必须先被观测为 enabled=true,否则 s9b 的"关"无从归因(把前置写进套件,防恒真护栏)',
+      wbPre.enabled === true, 'pre.enabled=' + JSON.stringify(wbPre.enabled) + ' 中枢工具数=' + (toolsPre.body.tools || []).length);
+    const tgOnly = await call('toggle_tool', { tool: 'workbuddy' });
+    check('#27s9 快照:toggle_tool 只给 tool、省略 enabled 必须仍被接受(中枢 `!!body.enabled` 的既有"省略=关闭"语义不得被桥侧必填吃掉)',
+      tgOnly.rpcErr === null && tgOnly.isError === false && /关|off|false|禁用|已/.test(tgOnly.text),
+      JSON.stringify({ isError: tgOnly.isError, text: tgOnly.text.substring(0, 110), rpcErr: tgOnly.rpcErr }));
+    // 不靠正则猜桥的文案格式:直接读中枢 API 的 enabled 事实(桥打的就是这个实例)
+    const toolsAfter = await req('GET', '/api/tools');
+    const wb = (toolsAfter.body.tools || []).find(t => t.name === 'workbuddy' || t.id === 'workbuddy') || {};
+    check('#27s9b 快照:上一条必须真的把该工具从"开"判成"关"(中枢侧 enabled 必须为 false —— 证明省略 enabled 走的是 false 分支,不是被忽略)',
+      wb.enabled === false, 'pre.enabled=' + JSON.stringify(wbPre.enabled) + ' after.enabled=' + JSON.stringify(wb.enabled) + ' 中枢工具数=' + (toolsAfter.body.tools || []).length);
+    await req('POST', '/api/toggle', { tool: 'workbuddy', enabled: true }); // 复位,别给后续断言留状态
+
+    // 同一类病的第二处(实测枚举 15 个工具的 requiredArgs 对中枢真实校验面后得出):
+    //   表里的 requiredArgs 是**抄 inputSchema 的 required**,而 schema 早在 #27 之前就写着 required:['query'],
+    //   可 store.js:355 `if (!q) return {tasks: 前 10, experiences: 前 10}` 把「省略 query」定义成
+    //   **合法的"浏览最近"通道**。旧 dispatchToolCall 从不校验 schema ⇒ schema 只是文案;
+    //   抄成出桥前的硬门后,这条通道直接消失。先钉中枢侧事实,再钉桥侧必须放行。
+    const hubBrowse = await req('POST', '/api/memory/search', {});
+    check('#27s10a 前置锁:中枢 /api/memory/search 空 body 必须 200 且回 tasks+experiences 两个数组'
+      + '(store.js:355 的"浏览前 10"通道必须真实存在,否则 s10 的"该被放行"无从归因)',
+      hubBrowse.status === 200 && Array.isArray(hubBrowse.body.tasks) && Array.isArray(hubBrowse.body.experiences),
+      'status=' + hubBrowse.status + ' keys=' + Object.keys(hubBrowse.body || {}).join(','));
+    const msBrowse = await call('memory_search', {});
+    check('#27s10 快照:memory_search 省略 query 必须仍被接受并正常回话(浏览通道不得被桥侧必填吃掉——与 #27s9 同族)',
+      msBrowse.rpcErr === null && msBrowse.isError === false && !/缺少必填参数/.test(msBrowse.text) && msBrowse.text.trim().length > 0,
+      JSON.stringify({ isError: msBrowse.isError, text: msBrowse.text.substring(0, 110), rpcErr: msBrowse.rpcErr }));
+
+    const bs = fs.readFileSync(path.join(__dirname, 'bridge-stdio.js'), 'utf-8').replace(/\r/g, '');
+    const bStart = bs.indexOf('function dispatchToolCall (');
+    let depth = 0, started = false, bEnd = -1;
+    for (let n = bs.slice(0, bStart).length; n < bs.length; n++) {
+      if (bs[n] === '{') { depth++; started = true; }
+      else if (bs[n] === '}') { depth--; if (started && depth === 0) { bEnd = n + 1; break; } }
+    }
+    const fnBody = bEnd > 0 ? bs.slice(bStart, bEnd) : '';
+    const inline = (fnBody.match(/httpPost\(/g) || []).length + (fnBody.match(/httpGet\(/g) || []).length;
+    check('#27r1 红:dispatchToolCall 内不得再有内联 httpPost/httpGet —— 出站调用必须由表项驱动、统一走 requestJson 内核(现状 19 处)',
+      bStart > 0 && inline === 0, '函数体长度=' + fnBody.length + ' 内联出站=' + inline);
+    const riStart = fnBody.indexOf("case 'recognize_image'");
+    const riNext = fnBody.indexOf("case '", riStart + 5);
+    const riBody = riStart >= 0 ? fnBody.slice(riStart, riNext > riStart ? riNext : fnBody.length) : '';
+    check('#27r2 红:recognize_image 的 case 体必须交出去(现状 146 行内联 Ollama 调用,一个 case 占全函数 40%)——与 #85 同面,重构不得把它留在表里',
+      riStart >= 0 && riBody.split('\n').length < 40, 'case 体行数=' + riBody.split('\n').length);
+  }
 
   // 13) 可观测性:/api/metrics 运行指标端点
   section('运行指标端点 /api/metrics');
@@ -1552,6 +1675,414 @@ async function main () {
       }
     }
   }
+  // 107) 桥对中枢"存储拒写 503"的归因必须诚实(不得打成连接失败),而真连接失败仍须照旧退避。
+  //   取证(基线 1214aab 之后的树;假中枢逐种回执应答 + 真桥进程 stderr 原文):
+  //     503+persisted:false ⇒「[ai-bridge] 连接失败(1/100),1秒后重试: 准入名单无法落盘（…原因: …）」
+  //     —— 标签说"连接失败"、重试耗尽还要人"检查中枢是否存活",而隔离期中枢其实**活着**
+  //     (health/读面实测全 200)。根因:bridge-stdio.js:1019 的内层 catch 只特判 403+denied,
+  //     其余一律 throw 给 :970 的外层 catch 当连接层失败(指数退避 + 计入 100 次预算)。
+  //   锁的是**归因方向与预算归属**,不锁具体措辞;四条反向哨兵防"把 5xx 一律宽容"。
+  section('桥侧归因:存储拒写 503 不得算连接失败(#107)');
+  {
+    const mkFake = (port, responder) => new Promise(res => {
+      const s = http.createServer((rq, rs) => {
+        let b = '';
+        rq.on('data', d => { b += d });
+        rq.on('end', () => responder(rq, rs, b));
+      });
+      s.listen(port, HOST, () => res(s));
+    });
+    // 载荷形状取自 server.js 的 persistRefusal('acl', …) 真实产出(#106 R1 把 #105 的
+    // aclRefusal 泛化成单点后的新文案;桥只按 `persisted === false` 分流,不认措辞)
+    const refuseBody = JSON.stringify({
+      error: '存储文件 clients-acl.json 本轮已隔离，批准未落盘（原因: 解析失败: Expected \',\' or \']\' after array element in JSON at position 27），运行时状态与磁盘可能不一致，详见 logs.jsonl 与 .corrupt-* 保全件；勿据此认为「批准」已生效',
+      action: '批准',
+      clientId: 'e2e-refuse-probe',
+      persisted: false,
+      runtimeOccupiedNow: false
+    });
+    const runBridge = async (label, port) => {
+      const p = spawn(process.execPath, ['bridge-stdio.js'], {
+        cwd: __dirname,
+        env: { ...process.env, AI_BRIDGE_PORT: String(port), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: label },
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      let err = '';
+      p.stderr.on('data', d => { err += d.toString() });
+      p.stdout.on('data', () => {});
+      // 窗口 6600ms > 拒写的 5 秒重试节奏 ⇒ 至少能看第二条留痕,防"只验首行、后续行拼出连接失败却抓不到"
+      await sleep(6600);
+      const alive = p.exitCode === null;
+      try { p.stdin.end(); p.kill() } catch { /* ignore */ }
+      await sleep(200);
+      try { p.kill('SIGKILL') } catch { /* ignore */ }
+      return { err: err.replace(/\s+/g, ' '), lines: err.split(/\r?\n/).filter(Boolean), alive };
+    };
+    const json503 = (rs) => { rs.writeHead(503, { 'content-type': 'application/json' }); rs.end(refuseBody) };
+
+    const sA = await mkFake(9891, (rq, rs) => json503(rs));
+    const bA = await runBridge('e2e-refuse-probe', 9891);
+    await new Promise(r => sA.close(r));
+    // 逐行加强:不只"整体不含连接失败",还要"每一条诚实留痕自己那行里也没混连接失败"
+    // (编码手 P1 提醒:窗口 < 重试节奏时只能核验首行,后续行拼出"连接失败"抓不到)
+    const refuseLines = bA.lines.filter(l => /(拒写|名单)/.test(l));
+    check('#107a1 面对 503+persisted:false,桥不得打"连接失败",必须说清是名单拒写且带原因(进程须存活)',
+      bA.alive && !/连接失败/.test(bA.err) && refuseLines.length >= 1 && /原因/.test(bA.err)
+        && refuseLines.every(l => !/连接失败/.test(l)),
+      '留痕行数=' + refuseLines.length + ' stderr=' + bA.err.substring(0, 250));
+
+    const sB = await mkFake(9892, (rq, rs) => { rs.writeHead(500, { 'content-type': 'application/json' }); rs.end(JSON.stringify({ error: '内部错误' })) });
+    const bB = await runBridge('e2e-plain500-probe', 9892);
+    await new Promise(r => sB.close(r));
+    check('#107a2 反向哨兵:500 且**无** persisted 字段仍须按连接失败处理并退避(新分支不许把所有 5xx 都洗白)',
+      bB.alive && /连接失败\(1\/100\)/.test(bB.err) && /内部错误/.test(bB.err),
+      'stderr=' + bB.err.substring(0, 220));
+
+    const bC = await runBridge('e2e-deadport-probe', 9895); // 该端口不建服务
+    check('#107a3 反向哨兵:端口完全不可达仍须打"连接失败"并给出真因(T-D 既有归因不回退)',
+      bC.alive && /连接失败\(1\/100\)/.test(bC.err) && /无法连接|ECONNREFUSED/.test(bC.err),
+      'stderr=' + bC.err.substring(0, 220));
+
+    const sD = await mkFake(9894, (rq, rs) => { rs.writeHead(403, { 'content-type': 'application/json' }); rs.end(JSON.stringify({ status: 'denied', error: '已被管理员拒绝' })) });
+    const bD = await runBridge('e2e-denied-probe', 9894);
+    await new Promise(r => sD.close(r));
+    check('#107a4 反向哨兵:403 denied 的既有慢重试语义不得被新分支抢走(仍打"已被管理员拒绝",不打连接失败)',
+      bD.alive && /已被管理员拒绝/.test(bD.err) && !/连接失败/.test(bD.err),
+      'stderr=' + bD.err.substring(0, 220));
+  }
+  // 108) 注册/轮询的等待节奏必须"同一规则只写一遍":数值用具名常量,文案里的秒数由常量导出。
+  //   取证(基线 f1f4714 实测,分母由本轮命令重算,不沿用台账旧数):
+  //     setTimeout 直传裸数值 4 处(:955 拒写/:975 被拒/:979 待审批/:1065 轮询)
+  //     + Math.min 退避上限裸 30000 1 处(:984)
+  //     + 文案里又各自把秒数手写一遍 3 处(:954/:974/:978「N 秒后重试」)
+  //     = 同一类规则 8 处表达,分属 5 个语义档。台账原记"三处"是 #107 收口时的过期数,以实测为准。
+  //   本段的红是**结构性红**(复制确实在今天),行为面由 a6 用"文案秒数 vs 实测留痕间隔"同源交叉钉住。
+  section('桥侧等待节奏收敛为具名常量(#108)');
+  {
+    const bs = fs.readFileSync(path.join(__dirname, 'bridge-stdio.js'), 'utf-8').replace(/\r/g, '');
+    const bareSleep = bs.match(/setTimeout\(\s*\w+\s*,\s*\d+\s*\)/g) || [];
+    const bareSeconds = bs.match(/\d+\s*秒后重试/g) || [];
+    const bareCap = bs.match(/Math\.min\(\s*[^,)]+,\s*\d+\s*\)/g) || [];
+    const NAMES = ['REGISTER_PENDING_MS', 'REGISTER_REFUSED_MS', 'REGISTER_PERSIST_REFUSED_MS', 'REGISTER_BACKOFF_CAP_MS', 'POLL_RETRY_MS'];
+    const missing = NAMES.filter((n) => !new RegExp('const\\s+' + n + '\\s*=').test(bs));
+    const unused = NAMES.filter((n) => (bs.match(new RegExp('\\b' + n + '\\b', 'g')) || []).length < 2);
+    check('#108a1 节奏数值不得再裸传给 setTimeout(基线 4 处:拒写/被拒/待审批/轮询)',
+      bareSleep.length === 0, '裸数值直传=' + JSON.stringify(bareSleep));
+    check('#108a2 留痕文案里的秒数必须由常量导出(基线 3 处手写「N 秒后重试」,与延时各写一遍=改一处必分叉)',
+      bareSeconds.length === 0, '裸秒数=' + JSON.stringify(bareSeconds));
+    check('#108a3 退避上限不得是 Math.min 里的裸数值(基线 1 处 30000,与被拒档同值不同义)',
+      bareCap.length === 0, '裸上限=' + JSON.stringify(bareCap));
+    check('#108a4 五个语义档各自具名且真被引用(防"图省事并成一个 RETRY_MS"把不同语义捏一起)',
+      missing.length === 0 && unused.length === 0, '缺定义=' + JSON.stringify(missing) + ' 无引用=' + JSON.stringify(unused));
+    // 反向哨兵:非节奏族的 30000 各有自己的语义,不许被顺手并入(HTTP 超时默认 / 调用预算余量 / OCR 子进程超时)
+    const GUARDS = [
+      ['GET_TIMEOUT_MS 默认仍 30000', /parsePositiveInt\(process\.env\.AI_BRIDGE_HTTP_TIMEOUT,\s*30000,/],
+      ['CALL_BUDGET_MS 余量仍 +30000', /HTTP_TIMEOUT_MS\s*\+\s*30000/],
+      ['ocr.py 子进程超时仍 30000', /timeout:\s*30000,/]
+    ];
+    const broken = GUARDS.filter(([, re]) => !re.test(bs)).map(([n]) => n);
+    check('#108a5 反向哨兵:三处非节奏族的 30000 必须原样保留(误并会把 OCR/HTTP 超时与重试节奏绑死=真回归)',
+      broken.length === 0, '被误动=' + JSON.stringify(broken));
+    // 指纹自证(双向,防空对空也防过宽):三条判据都要"认得出当前写法"且"放得过重构后的写法"。
+    // 第一版 a3 写成 /Math\.min\([^)]*\d[^)]*\)/,把 retryDelay * 1.5 里的 1.5 也当成裸数值 ⇒ 正确重构后仍永远红;
+    // 现只看**第二个实参**,并由本条把两类失效都钉住。
+    const SELF = [
+      ['a1', /setTimeout\(\s*\w+\s*,\s*\d+\s*\)/, 'setTimeout(res, 5000)', 'setTimeout(res, REGISTER_PENDING_MS)'],
+      ['a2', /\d+\s*秒后重试/, '5 秒后重试', '${secs(REGISTER_PENDING_MS)} 秒后重试'],
+      ['a3', /Math\.min\(\s*[^,)]+,\s*\d+\s*\)/, 'Math.min(retryDelay * 1.5, 30000)', 'Math.min(retryDelay * 1.5, REGISTER_BACKOFF_CAP_MS)']
+    ];
+    const flawed = SELF.filter(([, re, bad, good]) => !re.test(bad) || re.test(good)).map(([n]) => n);
+    check('#108a7 指纹自证:三条节奏判据须认得当前写法、放得过重构后写法(过宽=永远红,过窄=永远绿)',
+      flawed.length === 0, '判据失效=' + JSON.stringify(flawed));
+  }
+  // 108b) 两个独立机制交叉:留痕宣称的秒数(文案)vs 实测两条留痕的墙钟间隔(行为)。
+  //   这一条是"文案与节奏同源"的证据 —— 只把常量改名而文案仍手写,数值一致也照样绿;
+  //   但若有人改了 setTimeout 的常量却忘了文案,gap 与 claimed 立刻分叉 ⇒ a6 红。
+  section('文案秒数与实测间隔同源:拒写档墙钟交叉(#108a6)');
+  {
+    const mkFake = (port, responder) => new Promise(res => {
+      const s = http.createServer((rq, rs) => {
+        let b = '';
+        rq.on('data', d => { b += d });
+        rq.on('end', () => responder(rq, rs, b));
+      });
+      s.listen(port, HOST, () => res(s));
+    });
+    const refuseBody = JSON.stringify({
+      error: '存储文件 clients-acl.json 本轮已隔离，批准未落盘（原因: 解析失败: Expected \',\' or \']\' after array element in JSON at position 27）；勿据此认为「批准」已生效',
+      action: '批准', clientId: 'e2e-pace-probe', persisted: false
+    });
+    const sP = await mkFake(9896, (rq, rs) => {
+      rs.writeHead(503, { 'content-type': 'application/json' });
+      rs.end(refuseBody);
+    });
+    const p = spawn(process.execPath, ['bridge-stdio.js'], {
+      cwd: __dirname,
+      env: { ...process.env, AI_BRIDGE_PORT: '9896', AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-pace-probe' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const at = [];
+    const t0 = Date.now();
+    p.stderr.on('data', d => { at.push({ t: Date.now() - t0, s: d.toString() }) });
+    p.stdout.on('data', () => {});
+    await sleep(7600); // 窗口 > 拒写档 5 秒节奏 ⇒ 至少拿到两条留痕,才能量出间隔
+    const alive = p.exitCode === null;
+    try { p.stdin.end(); p.kill() } catch { /* ignore */ }
+    await sleep(200);
+    try { p.kill('SIGKILL') } catch { /* ignore */ }
+    await new Promise(r => sP.close(r));
+    const paceChunks = at.filter(x => /(拒写|名单)/.test(x.s) && !/连接失败/.test(x.s));
+    const gap = paceChunks.length >= 2 ? paceChunks[1].t - paceChunks[0].t : null;
+    const mm = paceChunks.length ? paceChunks[0].s.match(/(\d+)\s*秒后重试/) : null;
+    const claimed = mm ? Number(mm[1]) : null;
+    check('#108a6 拒写档实测间隔必须与文案宣称的秒数一致(墙钟 4.4~7s 且 |gap-文案|<=1s;进程须存活)',
+      alive && gap !== null && claimed !== null && gap >= 4400 && gap <= 7000 && Math.abs(gap / 1000 - claimed) <= 1,
+      '存活=' + alive + ' 留痕条数=' + paceChunks.length + ' 实测间隔ms=' + gap + ' 文案宣称s=' + claimed
+        + ' 首行=' + (paceChunks.length ? JSON.stringify(paceChunks[0].s.replace(/\s+/g, ' ').substring(0, 150)) : '无'));
+  }
+  // 113) 留痕里的"秒数"只许有一个算法:#108 已把三档注册节奏的文案接到 pacingSeconds 单点,
+  //   但连接失败档(:989)仍自己写 `Math.round(retryDelay/1000)` —— 同一规则在表达式层面第二处实现。
+  //   取证(基线 2076f13,判据由本轮命令重算,不沿用台账旧数):`Math.round(…/1000)` 全文 2 处
+  //   = :42(pacingSeconds 定义本身,合法) + :989(重复实现,本单要收);pacingSeconds 调用 3 处。
+  //   本单是**纯重构**:两种写法今天算出的数一样,所以 a4 用真桥墙钟做"文案宣称秒数 vs 实测间隔"交叉,
+  //   钉住"改完还算得一样";a1/a2 是结构红(复制确实存在于今天)。
+  section('留痕秒数只剩一个算法(#113)');
+  {
+    const bs113 = fs.readFileSync(path.join(__dirname, 'bridge-stdio.js'), 'utf-8').replace(/\r/g, '');
+    const lines113 = bs113.split('\n');
+    const DIV = /Math\.round\([^)]*\/\s*1000\s*\)/;
+    const divHits = lines113.map((l, i) => [l, i + 1]).filter(([l]) => DIV.test(l));
+    // 唯一的合法例外:pacingSeconds 自己的定义行
+    const legit = divHits.filter(([, i]) => /^const pacingSeconds\s*=/.test(lines113[i - 1].trim()));
+    check('#113a1 结构锁:毫秒→秒的换算全仓只许有 pacingSeconds 一处实现(实测基线 2 处=定义行 + :989 连接失败档)',
+      divHits.length === 1 && legit.length === 1,
+      '换算处数=' + divHits.length + ' 行号=' + divHits.map(([, i]) => i).join(',') + ' 合法定义处=' + legit.length);
+    const failLine = lines113.map((l, i) => [l, i + 1]).filter(([l]) => /连接失败\(\$\{retryCount\}/.test(l));
+    check('#113a2 连接失败档的留痕秒数必须引用 pacingSeconds(与其余三档同一单点,不再各算一遍)',
+      failLine.length === 1 && /pacingSeconds\(retryDelay\)/.test(failLine[0][0]) && !DIV.test(failLine[0][0]),
+      '找到行数=' + failLine.length + ' 走单点=' + (failLine.length === 1 ? /pacingSeconds\(retryDelay\)/.test(failLine[0][0]) : 'n/a')
+        + ' 仍自算=' + (failLine.length === 1 ? DIV.test(failLine[0][0]) : 'n/a'));
+    // 指纹双向自证:判据要认得当前写法、放得过重构后写法,且"允许 1 处"的例外只认真定义行
+    const SELF113 = [
+      ['认得重复实现', DIV.test('${Math.round(retryDelay/1000)}'), true],
+      ['放过单点调用', DIV.test('${pacingSeconds(retryDelay)}'), false],
+      ['放过定义行', /^const pacingSeconds\s*=/.test('const pacingSeconds = (ms) => Math.round(ms / 1000);'), true]
+    ];
+    const flawed113 = SELF113.filter(([n, got, want]) => got !== want).map(([n]) => n);
+    check('#113a3 指纹自证:判据须认得重复写法、放过单点调用与真正的定义行(过宽=永远红,过窄=永远绿)',
+      flawed113.length === 0, '判据失效=' + JSON.stringify(flawed113));
+  }
+  // 113b) 行为交叉(真桥 × 不可达端口):连接失败档退避序列与文案宣称秒数必须同源
+  //   现状期望:retryDelay 1000→1500→2250(×1.5),文案分别写 1/2/2 秒;Math.round 与 pacingSeconds
+  //   算的是同一个数,所以本条**前置即绿**,它是"改完还算得一样"的行为哨兵,不是缺陷红。
+  section('退避实测间隔与文案宣称秒数同源(#113a4)');
+  {
+    const port113 = 9899; // 故意不建服务:走连接失败档
+    const p = spawn(process.execPath, ['bridge-stdio.js'], {
+      cwd: __dirname,
+      env: { ...process.env, AI_BRIDGE_PORT: String(port113), AI_BRIDGE_HOST: HOST, AI_BRIDGE_CLIENT: 'e2e-backoff-probe' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const at = [];
+    const t0 = Date.now();
+    p.stderr.on('data', d => { at.push({ t: Date.now() - t0, s: d.toString() }) });
+    p.stdout.on('data', () => {});
+    await sleep(7200); // 覆盖前四次退避(约 0.05+1+1.5+2.25 ≈ 4.8s)
+    const alive = p.exitCode === null;
+    try { p.stdin.end(); p.kill() } catch { /* ignore */ }
+    await sleep(200);
+    try { p.kill('SIGKILL') } catch { /* ignore */ }
+    const backoffChunks = at.filter(x => /连接失败\(\d+\/100\)/.test(x.s));
+    const backoffLines = backoffChunks.map(x => x.s).join('').split(/\r?\n/).filter(l => /连接失败\(\d+\/100\)/.test(l));
+    const seq = [];
+    for (let i = 0; i < backoffLines.length; i++) {
+      const m = backoffLines[i].match(/(\d+)\s*秒后重试/)
+      seq.push({ n: i + 1, claimed: m ? Number(m[1]) : null })
+    }
+    // 墙钟交叉:第 i 条宣称"c 秒后重试",第 i+1 条的实际到达间隔就该≈c 秒(容差 ±1s——
+    // Math.round(1500/1000)=2 而实睡 1.5s,若写死"间隔==宣称×1000"就成了今天也过不了的不可满足锁)
+    const gaps = []
+    for (let i = 0; i + 1 < backoffChunks.length; i++) {
+      const c = seq[i] && seq[i].claimed
+      const g = backoffChunks[i + 1].t - backoffChunks[i].t
+      if (c !== null && c !== undefined) gaps.push({ 宣称s: c, 实测ms: g, 偏差s: Math.abs(g / 1000 - c) })
+    }
+    // 第 i 条(从 2 起)与上一条的文案差应体现 ×1.5 退避;并核文案宣称秒数落在 1/2/2 的期望序列上
+    const expected = [1, 2, 2];
+    const tail = seq.slice(0, 3).map(x => x.claimed);
+    check('#113a4 行为哨兵:连接失败档文案宣称秒数必须等于退避序列(1,2,2 秒)、实测间隔与宣称同源(偏差<=1s)、进程存活',
+      alive && seq.length >= 3 && tail.every((v, i) => v === expected[i]) && gaps.length >= 2 && gaps.every(x => x.偏差s <= 1),
+      '存活=' + alive + ' 留痕条数=' + seq.length + ' 文案秒数序列=' + JSON.stringify(tail) + ' 期望=' + JSON.stringify(expected)
+        + ' 墙钟核对=' + JSON.stringify(gaps.slice(0, 3)) + ' 首行=' + JSON.stringify((backoffLines[0] || '').replace(/\s+/g, ' ').substring(0, 150)));
+  }
+
+  // ── #115) 中枢"启动就绪"等待不得靠固定睡眠 ──
+  // 取证(基线 af574a1,判据由本轮命令实测,不凭记忆):
+  //   本套件的启动等待有两种写法并存 —— 主实例走 waitServerReady(有界轮询 15s),而两个第二实例探针
+  //   (畸形 memory.json 启动探针、反向预算探针)写的是 `await sleep(2000)` + 一次性 4s 请求。
+  //   实测:双跑时第 1 轮 #52b1/#80a1 会红、单独重跑 249/249 全绿(#111 那格记账),
+  //   红因不是产品而起不来,是前置套件(#106/#110 段会起多个带 90s 超时的沙箱中枢)争 CPU 让 2s 窗口不够。
+  //   ⇒ 这是**工装脆弱性**:判据把"慢"当"死",且两种写法并存意味着以后新增探针还会照抄错的那一种(#104/#108/#111 同族:同一规则两处实现)。
+  //   修法口径:等待收敛为**一把** waitHubReady(有界轮询、具名节奏、返回耗时),两处探针改走它;
+  //   #52b1 的判据强度**不降**——仍然要求真响应 /api/health 且 status=ok,只是允许在预算内等,并把耗时打进 detail
+  //   使"慢启动"与"起不来"可分辨。a4 是对照哨兵:同一延迟听法的假中枢上,旧形状必须失败、新单点必须成功
+  //   ——缺了它,就无法区分"修好了等待"与"把判据放宽成永远绿"(本会话第 6 次防不可满足/空转锁)。
+  section('启动等待必须是有界轮询、且只有一把实现(#115)');
+  {
+    const SRC115 = fs.readFileSync(path.join(__dirname, 'test-e2e.mjs'), 'utf-8').replace(/\r/g, '');
+    // **自扫描的反噬(本轮实测到,当场认领)**:第一版直接对本文件全文做文本匹配,结果被本段自己的样本代码污染
+    //   —— 打印出"调用=3 具名=true"而函数根本还没定义(那 3 处是 a2/a3/a4 里的调用,`const HUB_POLL_MS = ` 命中的
+    //   是我自己写的正则字面量)。 ⇒ 判据只许扫描**本段之前**的文本(实现与探针调用点都在前面),并把工厂调用点算进 spawn 归因。
+    const MARK115 = '启动等待必须是有界轮询';
+    const cutAt = SRC115.indexOf(MARK115);
+    const SRC115L = (cutAt > 0 ? SRC115.slice(0, cutAt) : SRC115).split('\n');
+    const HEAD115 = SRC115L.join('\n');
+    const nWait = (HEAD115.match(/await waitHubReady\(/g) || []).length;
+    const nOldPoll = (HEAD115.match(/async function waitServerReady/g) || []).length;
+    const hasDef = /async function waitHubReady \(/.test(HEAD115);
+    const hasNames = /const HUB_POLL_MS = /.test(HEAD115) && /const HUB_BOOT_BUDGET_MS = /.test(HEAD115);
+    // 口径先测量再落笔(防第 7 次"不可满足锁"):本文件单独成句的 `await sleep(N)` 共 42 处、其中 N>=1000 有 14 处,
+    //   但绝大多数是**墙钟窗口**(#108a6 的 7600、#113a4 的 7200、留痕节奏窗 6600/2500/1400/1200),不是就绪等待
+    //   ⇒ 拿"全文件禁大睡眠"当判据今天就没有绿灯可走。真正的缺陷形状只有一种:**spawn 中枢之后先睡够再判**。
+    //   判据按该形状归因:每个中枢 spawn(含 spawnProbeHub 工厂的调用点)向后 60 行内,
+    //   先遇到有界轮询=合格;先遇到单独成句的睡眠=违规;直接进断言=该处自带重试循环(如 #42/#43 段的 for 轮询)。
+    const SPAWN_RE = /spawn\(process\.execPath, \['server\.js'\]|spawnProbeHub\(/;
+    const POLL_RE = /await (waitHubReady|waitServerReady)\(/;
+    const ALONE_SLEEP_RE = /^\s*await sleep\(\d+\);\s*(\/\/.*)?$/;
+    const spawnAt = [];
+    SRC115L.forEach((l, i) => { if (SPAWN_RE.test(l)) spawnAt.push(i); });
+    const fixedFirstSet = new Set();
+    let selfRetry = 0;
+    for (const s of spawnAt) {
+      for (let k = s; k < Math.min(s + 60, SRC115L.length); k++) {
+        const l = SRC115L[k];
+        if (POLL_RE.test(l)) break; // 有界轮询打头 ⇒ 这一处合格
+        if (ALONE_SLEEP_RE.test(l)) { fixedFirstSet.add((k + 1) + ':' + l.trim().replace(/\s+/g, ' ').substring(0, 26)); break }
+        if (/^\s*check\(/.test(l)) { selfRetry++; break } // 直接进断言(自带重试循环的探针走这一支)
+      }
+    }
+    const fixedFirst = [...fixedFirstSet]; // 去重:工厂定义行与其调用点会指向同一处睡眠
+    // a1 结构锁:等待收敛为**一把** waitHubReady(定义 1 处 + 调用 >=3 + 节奏具名),且"先睡够再判"的探针清零;
+    //   旧 waitServerReady 至多保留 1 处定义且必须是薄封装(否则"等就绪"仍有两把尺,#104/#108/#111 同族病)。
+    check('#115a1 结构锁:waitHubReady 单点定义+调用>=3+节奏具名,且 server.js spawn 后"先固定睡眠再判定"0 处(实测基线:spawn 11 处中先睡后判 6 处=262/345/355/404/483/1087,自带重试 2 处,单点未定义)',
+      hasDef && nWait >= 3 && hasNames && fixedFirst.length === 0 && nOldPoll <= 1,
+      '定义=' + hasDef + ' 调用=' + nWait + ' 具名=' + hasNames + ' 旧轮询定义=' + nOldPoll
+        + ' spawn=' + spawnAt.length + '处 先睡后判=' + fixedFirst.length + '处 ' + JSON.stringify(fixedFirst)
+        + ' 自带重试=' + selfRetry + '处');
+    const HAS_HELPER = typeof waitHubReady === 'function';
+    const F115 = { DELAY: 9781, NEVER: 9782, OLD: 9783 };
+    const delayedHub = (port, delayMs) => {
+      const srv = http.createServer((q, r) => {
+        r.writeHead(200, { 'content-type': 'application/json' });
+        r.end(JSON.stringify({ status: 'ok', port }));
+      });
+      const timer = setTimeout(() => { try { srv.listen(port, HOST); } catch { /* 端口被占就不监听,等价于永不就绪 */ } }, delayMs);
+      return {
+        close: () => new Promise((res) => {
+          clearTimeout(timer);
+          if (srv.listening) { try { srv.close(() => res()); } catch { res(); } } else res();
+        })
+      };
+    };
+    // 旧形状的忠实复刻:睡眠 2000ms 后**只发一次**请求(超时 4s)。用于 a4 对照,证明判据没被放宽。
+    const oldShape = async (port) => {
+      await sleep(2000);
+      try {
+        return await new Promise((resolve, reject) => {
+          const r = http.request({ hostname: HOST, port, path: '/api/health', method: 'GET', timeout: 4000 }, (res) => {
+            let s = ''; res.on('data', (c) => { s += c }); res.on('end', () => { try { resolve(JSON.parse(s)); } catch { resolve({ raw: s.substring(0, 60) }); } });
+          });
+          r.on('error', reject); r.on('timeout', () => { r.destroy(); reject(new Error('health timeout')); }); r.end();
+        });
+      } catch (e) { return { err: e.message }; }
+    };
+    const done = [];
+    // a2 行为锁:服务在 2.6s 后才监听 ⇒ 单点必须在预算内等到,且把耗时如实报出来(不早退、不悬空)。
+    const p2 = delayedHub(F115.DELAY, 2600); done.push(p2.close);
+    const a2 = (async () => {
+      if (!HAS_HELPER) return { ok: false, why: 'waitHubReady 不存在' };
+      const r = await waitHubReady(F115.DELAY, { timeoutMs: 9000 });
+      return { ok: !!(r && r.ok) && r.elapsedMs >= 2300 && r.elapsedMs <= 9500, r };
+    })();
+    // a3 有界性:端口永不开 ⇒ 必须 ok=false 且真的把预算等满(提前放弃=假绿,超出预算+2s=悬空)。
+    const a3 = (async () => {
+      if (!HAS_HELPER) return { ok: false, why: 'waitHubReady 不存在' };
+      const t = Date.now();
+      const r = await waitHubReady(F115.NEVER, { timeoutMs: 2500 });
+      const spent = Date.now() - t;
+      return { ok: !!(r && r.ok === false) && spent >= 2500 && spent <= 4500, spent, r };
+    })();
+    // a4 对照:同样 2.6s 才监听的两台假中枢上,旧形状必须失败、新单点必须成功。
+    const p4 = delayedHub(F115.OLD, 2600); done.push(p4.close);
+    const a4 = (async () => {
+      const oldRes = await oldShape(F115.OLD);
+      const oldFailed = !(oldRes && oldRes.status === 'ok');
+      if (!HAS_HELPER) return { ok: false, oldFailed, why: 'waitHubReady 不存在' };
+      const r = await waitHubReady(F115.OLD, { timeoutMs: 9000 });
+      return { ok: oldFailed && !!(r && r.ok), oldFailed, r, oldRes };
+    })();
+    const [r2, r3, r4] = await Promise.all([a2, a3, a4]);
+    await Promise.all(done.map((f) => f()));
+    check('#115a2 行为锁:服务 2.6s 后才监听时,单点必须在预算内等到并如实报耗时(基线红=函数不存在)',
+      r2.ok, '结果=' + JSON.stringify(r2).substring(0, 220));
+    check('#115a3 有界性:端口永不开时必须判 false 且把 2500ms 预算等满(不早退、不悬空)',
+      r3.ok, '实耗=' + r3.spent + 'ms 结果=' + JSON.stringify(r3).substring(0, 220));
+    check('#115a4 对照哨兵:同一延迟监听场景下旧形状(sleep2000+单次请求)必须失败、新单点必须成功 ⇒ 判据强度未降',
+      r4.ok, '旧形状失败=' + r4.oldFailed + ' 新单点=' + JSON.stringify(r4.r || r4.why || null) + ' 旧读数=' + JSON.stringify(r4.oldRes || null).substring(0, 90));
+  }
+
+  // ── #58 MCP 面:异步派发的入口 + 结果取回 ──
+  // 取证(2026-10-24,现网 9800 零配额实测):中枢侧异步**早已存在且可用** —— POST /api/dispatch 带 async:true
+  //   ⇒ HTTP 202 / 13.5ms 返回 {taskId:"atask_...",status:"running"},GET /api/task/:id 内存优先、回落 SQLite。
+  //   桥侧三处断链:① dispatch 的 inputSchema 未声明 async ⇒ 守 schema 的宿主根本不会用它;② 桥无任何 /api/task/
+  //   出站、无 task_status 工具 ⇒ 入了队也取不回;③ 桥的 dispatch 渲染器无条件按同步形状取 r.results/successCount
+  //   ⇒ 真把 async 透传过去,"刚入队"会被渲染成"跑完了但没结果"(这是缺陷,不是缺失)。
+  // 位置说明:本段必须放在 main() 最末尾——异步任务会产生反向 sampling 与聚合计数增量,夹在中间会污染既有断言
+  //   的观测值(如 lastSamplingTask / dispatchTotal);放在末尾 ⇒ 其后没有任何断言可被带偏。判据一律取"形状证据"
+  //   (taskId 是否交回、状态字样是否出现),不锁整句文案。
+  section('#58: MCP 面异步派发 + 结果取回(桥只有同步窗口那一段)');
+  const tl58 = await mcp.request('tools/list', {});
+  const tools58 = (tl58.result && tl58.result.tools) || [];
+  const names58 = tools58.map(t => t.name);
+  const disp58 = tools58.find(t => t.name === 'dispatch');
+  const callText58 = (r) => (((r || {}).result || {}).content || []).map(c => (c && c.text) || '').join('\n');
+  const R58 = {
+    a3: { ok: false, d: '拿不到 taskId,后续取回判据无法执行' },
+    a4: { ok: false, d: '拿不到 taskId,后续取回判据无法执行' },
+    a5: { ok: false, d: '拿不到 taskId,后续取回判据无法执行' },
+    a6: { ok: false, d: '拿不到 taskId,后续取回判据无法执行' }
+  };
+  check('#58a1 红:dispatch 的 schema 必须声明 async(boolean),且 tools/list 必须出现 task_status(桥侧现在没有异步入口)',
+    disp58?.inputSchema?.properties?.async?.type === 'boolean' && names58.includes('task_status'),
+    'async声明=' + JSON.stringify(disp58?.inputSchema?.properties?.async || null) + ' 含task_status=' + names58.includes('task_status') + ' 工具总数=' + names58.length);
+  const as58 = await mcp.request('tools/call', { name: 'dispatch', arguments: { task: '#58 异步派发不得占用宿主同步窗口', tools: [CLIENT], async: true } });
+  const asText58 = callText58(as58);
+  const id58 = asText58.match(/atask_\d+_[0-9a-f]+/);
+  check('#58a2 红:异步派发必须把 taskId 交回宿主,不得按同步形状渲染(现状=渲染器读 r.results 把"刚入队"渲染成"跑完了但没结果")',
+    !!id58, 'taskId命中=' + !!id58 + ' isError=' + JSON.stringify(!!(((as58 || {}).result || {}).isError)) + ' 文本前320=' + JSON.stringify(asText58.substring(0, 320)));
+  if (id58) {
+    const tid58 = id58[0];
+    const st58 = callText58(await mcp.request('tools/call', { name: 'task_status', arguments: { taskId: tid58 } }));
+    R58.a3 = { ok: /running|done|failed/.test(st58), d: 'taskId=' + tid58 + ' 首次取回文本=' + JSON.stringify(st58.substring(0, 280)) };
+    let term58 = st58, polls58 = 0; const t058 = Date.now();
+    // 有界轮询(#115 立的规矩:等状态不许写死 sleep,必须有预算且如实报耗时/轮数)
+    while (Date.now() - t058 < 20000 && !/done|failed/.test(term58)) {
+      await sleep(500); polls58++;
+      term58 = callText58(await mcp.request('tools/call', { name: 'task_status', arguments: { taskId: tid58 } }));
+    }
+    R58.a4 = { ok: /done|failed/.test(term58), d: '轮数=' + polls58 + ' 耗时=' + (Date.now() - t058) + 'ms 终态文本=' + JSON.stringify(term58.substring(0, 280)) };
+    const miss58 = callText58(await mcp.request('tools/call', { name: 'task_status', arguments: { taskId: 'atask_000000_zzzzzz' } }));
+    R58.a5 = { ok: /不存在/.test(miss58) && !/undefined|\[object/.test(miss58), d: '文本=' + JSON.stringify(miss58.substring(0, 220)) };
+    const noArg58 = callText58(await mcp.request('tools/call', { name: 'task_status', arguments: {} }));
+    R58.a6 = { ok: /缺少必填参数/.test(noArg58), d: '文本=' + JSON.stringify(noArg58.substring(0, 200)) };
+  }
+  check('#58a3 红:task_status 必须能按 taskId 取回并点名状态(running/done/failed 之一,现状=桥报"未知工具")', R58.a3.ok, R58.a3.d);
+  check('#58a4 红:同一 taskId 必须经 task_status 到达终态(取回链路端到端可用,轮数与耗时如实打印)', R58.a4.ok, R58.a4.d);
+  check('#58a5 红:查不存在的 taskId 必须点名"不存在",不得静默空文本、不得报成成功', R58.a5.ok, R58.a5.d);
+  check('#58a6 出桥前必填校验:task_status 缺 taskId 必须被桥侧拦下(与 #27s9 同口径:requiredArgs 取中枢真实校验面)', R58.a6.ok, R58.a6.d);
+  const sync58 = callText58(await mcp.request('tools/call', { name: 'dispatch', arguments: { task: '#58 反向自证:不带 async 仍走同步形状', tools: [CLIENT] } }));
+  check('#58a7 反向自证(加分支不得把既有同步面带崩):不带 async 时不得出现 taskId,且必须回到同步渲染形状',
+    !/atask_\d/.test(sync58) && /##/.test(sync58), 'taskId出现=' + /atask_\d/.test(sync58) + ' 含同步小节标题=' + /##/.test(sync58) + ' 文本前260=' + JSON.stringify(sync58.substring(0, 260)));
 }
 
 async function cleanup () {

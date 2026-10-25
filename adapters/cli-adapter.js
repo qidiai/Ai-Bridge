@@ -9,6 +9,7 @@
  * 配置字段:
  *   command:        命令名 (如 "openclaw")
  *   commandPaths:   绝对路径候选 (如 ["{{LOCALAPPDATA}}/AtomCode/atomcode.exe"])
+ *                   #81 起:候选命中既决定可用位,也真正用于执行期(两侧同一把尺)
  *   args:            参数模板 (支持 {{task}} {{messageFile}} {{sessionId}} {{outputDir}} {{workspaceDir}} {{taskId}})
  *   inputMode:       arg | message-file | stdin
  *   outputMode:      stdout-text | stdout-json | file
@@ -25,13 +26,21 @@
  *   outputDir 始终用于存放 input.txt 等桥接中间产物。
  */
 
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const { BaseAdapter } = require('./base');
+const { parsePositiveInt } = require('../env-int');
 
 // Windows CreateProcess 命令行上限约 32K 字符，留出模板其余部分的安全余量
 const MAX_ARG_TASK_LEN = 24000;
+
+// 输出总量上限(字符数,非精确字节):防失控子进程无限吐出拖垮内存;可用 env 覆盖,默认 10MB
+// #96 R4:走 env-int 单点整串解析(带变量名留痕),不再手搓 parseInt 前缀宽容
+// #102 R1/R2:求值挪到模块顶层(runCommand 之外)——server.js 经 tool-registry.js 加载本文件即点名,
+// 配置写错在启动那一刻向 stderr 留痕;模块顶层每进程只执行一次 ⇒ 同一非法值最多留痕一次。
+// R3:上限仍在每次 runCommand 的 checkOutputLimit 里真正执行(判定式与 kill 逻辑一字未动)。
+const MAX_OUTPUT_CHARS = parsePositiveInt(process.env.AI_BRIDGE_CLI_MAX_OUTPUT_CHARS, 10 * 1024 * 1024, 'AI_BRIDGE_CLI_MAX_OUTPUT_CHARS');
 
 class CliAdapter extends BaseAdapter {
   constructor (config) {
@@ -45,18 +54,12 @@ class CliAdapter extends BaseAdapter {
 
   /**
    * 检测命令是否可用
-   * 1. 检查 commandPaths 中的绝对路径
-   * 2. 用 where.exe 查 PATH
+   * #81:与执行期共用同一个解析函数 resolveCommandPath —— 不存在第二把"命令在哪里"的尺,
+   * 于是 available === true 的含义就是"执行期确实能解析出一个可执行文件"(回环)。
+   * 只做路径判定,绝不 spawn 真实命令(启动期每个工具都 detect 一次,副作用与成本都不可接受)。
    */
   async detect () {
-    // 1. 检查配置的绝对路径
-    for (const p of this.commandPaths) {
-      const resolved = resolveEnvVars(p);
-      if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) return true;
-    }
-
-    // 2. 查 PATH
-    return findInPath(this.config.command);
+    return (await resolveCommandPath(this.config.command, this.commandPaths)) !== null;
   }
 
   /**
@@ -137,7 +140,10 @@ class CliAdapter extends BaseAdapter {
       stdout = await runCommand(this.config.command, args, {
         timeout: opts.timeout || this.timeout,
         cwd: workspaceDir,
-        stdin
+        stdin,
+        // #81 同源:commandPaths 不再是一条"只喂可用位、不喂执行"的半截通道 ——
+        // 执行期同样把它交给同一个解析器,命中就用那个绝对路径去 spawn
+        commandPaths: this.commandPaths
       });
     } finally {
       if (longTaskFile) { try { fs.rmSync(longTaskFile, { force: true }); } catch (_) {} }
@@ -209,73 +215,78 @@ class CliAdapter extends BaseAdapter {
 }
 
 // ============================================================
-// 安全命令解析 + 执行（从 tool-registry.js 原样搬来，不改逻辑）
+// 命令解析唯一入口（#81：可用位与执行期同源）
+// detect() 与 runCommand() 都必须且只经 resolveCommandPath；
+// 绝对路径 / 相对路径 / commandPaths 三条支路各只写这一处，禁止任何一侧再各写一遍 existsSync。
 // ============================================================
 
-/** Find command in PATH */
-async function findInPath (name) {
-  return new Promise((resolve) => {
-    const isWin = process.platform === 'win32';
-    const checker = isWin ? 'where' : 'which';
-    const child = spawn(checker, [name], { shell: false, stdio: ['ignore', 'pipe', 'ignore'] });
-    let found = '';
-    child.stdout.on('data', d => found += d);
-    child.on('close', code => resolve(code === 0 && found.trim().length > 0));
-    child.on('error', () => resolve(false));
-  });
+/** 路径是否为真实文件（不存在、或是目录 → false） */
+function isExecFile (p) {
+  return !!p && fs.existsSync(p) && fs.statSync(p).isFile();
 }
 
-/** 安全解析 Windows 下的命令路径(避免 shell:true 注入面) */
-function resolveWindowsCommand (cmd) {
-  if (path.isAbsolute(cmd) && fs.existsSync(cmd) && fs.statSync(cmd).isFile()) return cmd;
-  if (fs.existsSync(cmd) && fs.statSync(cmd).isFile()) return path.resolve(cmd);
-  try {
-    const r = spawnSync('where', [cmd], { encoding: 'utf-8', windowsHide: true });
-    if (r.status === 0 && r.stdout) {
-      const lines = r.stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-      const preferred = lines.find(l => /\.(cmd|bat|exe)$/i.test(l) && fs.existsSync(l));
-      if (preferred) return preferred;
-      const first = lines.find(l => l && fs.existsSync(l));
-      if (first) return first;
-    }
-  } catch (_) {}
-  return null;
+/**
+ * PATH 探测：全项目唯一的 where/which 子进程调用点（每次调用至多 1 个子进程）
+ * @returns {Promise<string|null>} 命中的可执行文件路径；查不到返回 null
+ */
+async function findInPath (name) {
+  const isWin = process.platform === 'win32';
+  const checker = isWin ? 'where' : 'which';
+  const raw = await new Promise((resolve) => {
+    // windowsHide:改造前执行期那次 PATH 查询是带 windowsHide: true 的同步调用,
+    // 合并成单一入口后必须把这项带着,否则服务态(无控制台)会多出控制台闪窗
+    const child = spawn(checker, [name], { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let found = '';
+    child.stdout.on('data', d => found += d);
+    // 退出码非 0 / 子进程起不来(ENOENT 等)一律归一为"查不到"，不抛出
+    child.on('close', code => resolve(code === 0 ? found : ''));
+    child.on('error', () => resolve(''));
+  });
+  if (!raw) return null;
+  const lines = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  // .cmd/.bat/.exe 优先（裸名常被 npm shim 接管）：执行期原本就是这个偏好，
+  // 现在可用位与它同一把尺，不再出现"detect 认第一行、执行认另一行"的错位
+  const preferred = lines.find(l => /\.(cmd|bat|exe)$/i.test(l) && isExecFile(l));
+  return preferred || lines.find(l => isExecFile(l)) || null;
+}
+
+/**
+ * 把一个 CLI 配置解析成真实可执行文件路径；解析不出来 = 不可用。
+ * 支路顺序（前三条纯 fs、零子进程）：
+ *   ① command 本身是绝对路径且存在
+ *   ② command 是相对当前 cwd 且存在的路径
+ *   ③ commandPaths 候选（{{ENV}} 模板解析行为不变）
+ *   ④ PATH 查询 —— 整个函数里唯一一次 where/which 子进程
+ * ①②③ 都不命中才走 ④；绝对路径查不到时也会落到 ④（与改造前逐字同结果，
+ * Windows 下 `where <绝对路径>` 恒退出码 2 而已，不额外起子进程数量）。
+ * @returns {Promise<string|null>}
+ */
+async function resolveCommandPath (cmd, commandPaths) {
+  const candidates = Array.isArray(commandPaths) ? commandPaths : [];
+  const usable = typeof cmd === 'string' && cmd.trim() !== '';
+  if (usable && path.isAbsolute(cmd) && isExecFile(cmd)) return cmd;
+  if (usable && !path.isAbsolute(cmd) && isExecFile(cmd)) return path.resolve(cmd);
+  for (const p of candidates) {
+    const resolved = resolveEnvVars(p);
+    if (isExecFile(resolved)) return resolved;
+  }
+  return usable ? findInPath(cmd) : null;
 }
 
 /** Run command safely (严格按退出码判成败;无 shell:true 注入面) */
-function runCommand (cmd, args, opts = {}) {
+async function runCommand (cmd, args, opts = {}) {
+  // #81 同源:执行期与 detect() 共用 resolveCommandPath(含 commandPaths),
+  // 消灭"标着可用、派发即失败"与"跑得动却标不可用"两个对称缺陷。
+  const resolved = await resolveCommandPath(cmd, opts.commandPaths);
+  if (!resolved) {
+    throw new Error(`命令未找到或无法安全解析: ${cmd}(已禁用 shell 回退以防命令注入)`);
+  }
+  // .cmd/.bat 不能直接交给 CreateProcess,必须经 cmd.exe /c 拉起(路径本身已由解析器确认可存在)
+  const isBatch = /\.(?:cmd|bat)$/i.test(resolved);
+  const actualCmd = isBatch ? (process.env.ComSpec || 'cmd.exe') : resolved;
+  const actualArgs = isBatch ? ['/c', resolved, ...args] : args;
+
   return new Promise((resolve, reject) => {
-    const isWin = process.platform === 'win32';
-    let actualCmd = cmd;
-    let actualArgs = args;
-
-    if (isWin) {
-      // 先检查 commandPaths 绝对路径
-      let resolved = null;
-      // 如果 cmd 本身就是绝对路径且存在
-      if (path.isAbsolute(cmd) && fs.existsSync(cmd) && fs.statSync(cmd).isFile()) {
-        resolved = cmd;
-      } else {
-        resolved = resolveWindowsCommand(cmd);
-      }
-      if (!resolved) {
-        reject(new Error(`命令未找到或无法安全解析: ${cmd}(已禁用 shell 回退以防命令注入)`));
-        return;
-      }
-      const lower = resolved.toLowerCase();
-      if (lower.endsWith('.cmd') || lower.endsWith('.bat')) {
-        actualCmd = process.env.ComSpec || 'cmd.exe';
-        actualArgs = ['/c', resolved, ...args];
-      } else {
-        actualCmd = resolved;
-        actualArgs = args;
-      }
-    } else {
-      // 非 Windows：如果命令不在 PATH 中，尝试直接执行
-      actualCmd = cmd;
-      actualArgs = args;
-    }
-
     const child = spawn(actualCmd, actualArgs, {
       cwd: opts.cwd || process.cwd(),
       timeout: opts.timeout || 120000,
@@ -286,9 +297,8 @@ function runCommand (cmd, args, opts = {}) {
 
     let stdout = '';
     let stderr = '';
-    // 输出总量上限(字符数,非精确字节):防失控子进程无限吐出拖垮内存;可用 env 覆盖,默认 10MB
-    const envMaxOutput = parseInt(process.env.AI_BRIDGE_CLI_MAX_OUTPUT_CHARS);
-    const MAX_OUTPUT_CHARS = (Number.isFinite(envMaxOutput) && envMaxOutput > 0) ? envMaxOutput : 10 * 1024 * 1024;
+    // #102 R3:MAX_OUTPUT_CHARS 已在模块顶层求值(见文件头),此处仅引用;
+    // checkOutputLimit 判定式与 kill 逻辑保持原样 —— 上限仍在每次 runCommand 里真正执行
     let settled = false; // 防 kill 后 close/error 事件二次 resolve/reject
     function settleReject (err) {
       if (settled) return;

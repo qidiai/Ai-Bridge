@@ -63,11 +63,11 @@ const CONFIG = {
   EXECUTE_TIMEOUT: parsePositiveInt(process.env.AI_BRIDGE_EXECUTE_TIMEOUT, 900000, 'AI_BRIDGE_EXECUTE_TIMEOUT'), // 可配:默认 15 分钟,慢客户端(如本地大模型宿主)可再放宽单次执行窗口
   POLL_TIMEOUT: 30000,
   MAX_TASK_LENGTH: 50000,
-  MAX_CONCURRENT_DISPATCH: parsePositiveInt(process.env.AI_BRIDGE_MAX_CONCURRENT_DISPATCH, 5),
-  RESULT_MAX_CHARS: parsePositiveInt(process.env.AI_BRIDGE_RESULT_MAX_CHARS, 2000), // dispatch 结果 content 截断上限(可配,防长产出被硬砍)
+  MAX_CONCURRENT_DISPATCH: parsePositiveInt(process.env.AI_BRIDGE_MAX_CONCURRENT_DISPATCH, 5, 'AI_BRIDGE_MAX_CONCURRENT_DISPATCH'),
+  RESULT_MAX_CHARS: parsePositiveInt(process.env.AI_BRIDGE_RESULT_MAX_CHARS, 2000, 'AI_BRIDGE_RESULT_MAX_CHARS'), // dispatch 结果 content 截断上限(可配,防长产出被硬砍)
   MAX_CONCURRENT_MEETINGS: 3,
   TOOL_STATUS_TTL: 60000,
-  CLIENT_TTL: parsePositiveInt(process.env.AI_BRIDGE_CLIENT_TTL, 5 * 60 * 1000),
+  CLIENT_TTL: parsePositiveInt(process.env.AI_BRIDGE_CLIENT_TTL, 5 * 60 * 1000, 'AI_BRIDGE_CLIENT_TTL'),
   MAX_MEETING_TOKENS: parsePositiveInt(process.env.AI_BRIDGE_MEETING_MAX_TOKENS, 100000, 'AI_BRIDGE_MEETING_MAX_TOKENS'),
   MEETING_MAX_MS: parsePositiveInt(process.env.AI_BRIDGE_MEETING_MAX_MS, 10 * 60 * 1000, 'AI_BRIDGE_MEETING_MAX_MS'),
   AUTH_TOKEN: process.env.AI_BRIDGE_TOKEN || null,
@@ -109,7 +109,11 @@ function recordTokens (tool, usage, duration) {
   stats.total.output += output;
   stats.total.total += total;
   stats.total.calls += 1;
-  store.saveSync('stats', stats); // store.saveSync 内部有自旋锁保护
+  // #106 R5:消费返回值,拒写只加计数不另起日志帧(store 的唯一写手已对每次拒写留痕,
+  // 再写就是 #103 修掉的"同一事件两帧"病;计数经 /api/health 的 counters 暴露,供 #33 上报用)。
+  // SQLite traffic 表仍是权威账本:token 明细逐条 db.recordTraffic 写穿,stats 镜像被拒不丢账。
+  const saved = store.saveSync('stats', stats); // store.saveSync 内部有自旋锁保护
+  if (!saved) { METRICS.statsPersistRefused = (METRICS.statsPersistRefused || 0) + 1; }
   store.appendLog('debug', `recordTokens: ${statsKey} ${JSON.stringify({input,output,total})}`, { tool: statsKey });
 }
 
@@ -222,8 +226,8 @@ function modelEnabled (m) {
 }
 
 // ── 反代幂等缓存(内存 LRU,不落盘避免敏感内容持久化;仅缓存 200 成功响应) ──
-const CACHE_TTL = parsePositiveInt(process.env.AI_BRIDGE_CACHE_TTL, 10 * 60 * 1000);
-const CACHE_MAX = parsePositiveInt(process.env.AI_BRIDGE_CACHE_MAX, 100);
+const CACHE_TTL = parsePositiveInt(process.env.AI_BRIDGE_CACHE_TTL, 10 * 60 * 1000, 'AI_BRIDGE_CACHE_TTL');
+const CACHE_MAX = parsePositiveInt(process.env.AI_BRIDGE_CACHE_MAX, 100, 'AI_BRIDGE_CACHE_MAX');
 const _respCache = new Map(); // key → { value(Buffer), at }
 function cacheKey (modelId, body) {
   // #47 明确决定:cacheKey **不按 stream 分键**。缓存值只存非流式 chat.completion JSON
@@ -464,6 +468,41 @@ function aclClientKeys (id) {
     keys.add(assignedClientId(id));
   }
   return [...keys];
+}
+
+// #106 R1「持久化被拒」通用诚实回执构造器(#105 aclRefusal 的泛化,单点文案,
+// 与 #103 storageNotice 的"唯一写手"同精神):store.saveSync 在键被隔离时返回 false
+// 而不抛错(#43/#44 立的保守拒写规矩)⇒ 任何写点都不得宣称成功(#43/#105 同族:
+// 响应必须与落盘实况同真)。ACL 的 5 个调用点与建会等拒写面共用这一个实现,
+// 不留第二份拼字符串(#103/#97 的病:同一文案多处实现)。
+// 原因一律取自 store.quarantineReason(key)(与 store 的拒写留痕同源,类别由真因决定,
+// 不在此处硬编猜测),取不到时诚实写"原因未记录",绝不编造。
+// 纯函数:不写日志(拒写留痕已由 store 的唯一写手负责,此处再写就是同一事件两帧)、
+// 不改状态、不抛错。第三参二态:字符串 ⇒ 按 clientId 呈现;对象 ⇒ 原样展开进正文
+// (运行时副作用/主体标识由各调用点如实传入,如建会带 meetingId、ACL 带 runtimeKicked)。
+function persistRefusal (key, action, subjectOrExtra) {
+  const name = store.FILES[key] ? path.basename(store.FILES[key]) : String(key);
+  const reason = store.quarantineReason(key) || '原因未记录';
+  const extra = (subjectOrExtra && typeof subjectOrExtra === 'object') ? subjectOrExtra : { clientId: subjectOrExtra };
+  return {
+    error: `存储文件 ${name} 本轮已隔离，${action}未落盘（原因: ${reason}），`
+      + '运行时状态与磁盘可能不一致，详见 logs.jsonl 与 .corrupt-* 保全件；'
+      + '勿据此认为「' + action + '」已生效',
+    action,
+    persisted: false,
+    ...extra
+  };
+}
+
+// #105 ACL 写被拒的对外口径:保留原调用签名的薄封装,拼串只存在于 persistRefusal 一处。
+function aclRefusal (action, clientId, runtime) {
+  return persistRefusal('acl', action, { clientId, ...runtime });
+}
+
+// #110 P1(#109 核准并入):会议族 503 的单一构造器,与 aclRefusal 同型——
+// 键/顺序/文案骨架全部由 persistRefusal 给出,本处只透传 action 与 meetingId,响应体逐字不变。
+function meetingRefusal (action, meetingId) {
+  return persistRefusal('memory', action, { meetingId });
 }
 
 function clientState (info, now = Date.now()) {
@@ -1065,10 +1104,30 @@ async function doHandoff (task, existingCode, fromTool, toTool, workspaceRef = n
 
 // ── HTTP 路由(带全局 try/catch + 鉴权 + CORS 限制) ──
 
+// 对端是否回环 —— 本函数是全文件唯一的物理对端地址读点,两条免鉴权路由(代理透传 / Web UI)共用同一把尺。
+//   判据取 socket 而非报文:反代/网关转发时 x-forwarded-for 之类的头可能是调用方篡改值,
+//   拿它判"我在本地"等于把门交给客户端;只认 TCP 层对端。
+//   返回 true 的集合:IPv4 回环 /8(含 127.0.0.1)、IPv6 的 ::1、IPv4-mapped 形态 ::ffff:127.0.0.1。
+//   取不到 req.socket 或地址时按"非回环"处理(fail closed):宁可多要凭据,也不放过过宽的放行。
+function isLoopbackPeer (req) {
+  const addr = req && req.socket ? req.socket.remoteAddress : null;
+  if (!addr || typeof addr !== 'string') return false;
+  if (addr === '::1') return true; // IPv6 回环
+  if (addr.startsWith('127.')) return true; // IPv4 回环 /8(含 127.0.0.1)
+  if (addr.startsWith('::ffff:127.')) return true; // IPv4-mapped IPv6 形态(如 ::ffff:127.0.0.1)
+  return false;
+}
+
+// 凭据比较改为恒定时间:先比长度(不等直接 false,timingSafeEqual 长度不等会抛 RangeError),等长再比字节。
+//   语义与此前逐字相等完全一致:未配置 AI_BRIDGE_TOKEN 时恒 true;其余不等一律 false。
 function checkAuth (req) {
   if (!CONFIG.AUTH_TOKEN) return true;
   const auth = req.headers['authorization'];
-  return auth === `Bearer ${CONFIG.AUTH_TOKEN}`;
+  if (typeof auth !== 'string') return false;
+  const expected = Buffer.from(`Bearer ${CONFIG.AUTH_TOKEN}`, 'utf-8');
+  const actual = Buffer.from(auth, 'utf-8');
+  if (actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(actual, expected);
 }
 
 function sendJSON (res, code, data) {
@@ -1128,6 +1187,13 @@ function extractUsage (text) {
 }
 
 async function handleProxy (req, res, p, search) {
+  // 对端约束先于一切副作用:路由查表、读 body、打上游全在其后。
+  //   放行条件 = 回环对端 **或**（中枢已配置凭据 **且** 凭据校验通过）。回环免凭据:被接管的本地工具不感知中枢存在。
+  //   非回环对端必须出示"中枢确实配置了"的凭据才可借道;中枢未设置 AI_BRIDGE_TOKEN 时对非回环一律拒 ——
+  //   否则 checkAuth 在未配凭据时恒 true,这条门会退化成"局域网免费中继"(AI_BRIDGE_HOST=0.0.0.0 时尤其致命)。
+  //   收紧只作用于本支路:/api/* 与 /v1/* 在未配凭据时仍零负担,由 checkAuth 自身语义保留,此处不改。
+  const proxyPeerAllowed = isLoopbackPeer(req) || (!!CONFIG.AUTH_TOKEN && checkAuth(req));
+  if (!proxyPeerAllowed) { sendJSON(res, 403, { error: '禁止访问: /proxy/ 仅接受回环对端或已鉴权调用方' }); return; }
   const parts = p.split('/').filter(Boolean); // ['proxy', source, key, ...rest]
   if (parts.length < 3) { sendJSON(res, 400, { error: '路径格式: /proxy/<source>/<key>/<上游路径>' }); return; }
   const source = parts[1];
@@ -1261,7 +1327,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 透传代理(免鉴权:被接管工具不感知中枢存在;仅监听本地回环,风险受控)
+    // 透传代理:仅回环对端、或中枢已配置凭据且凭据校验通过的调用方可用
+    //   (未配置凭据的中枢对非回环一律拒;判定在 handleProxy 开头,先于路由查表与读 body)
     if (p.startsWith('/proxy/')) {
       await handleProxy(req, res, p, url.search);
       return;
@@ -1276,8 +1343,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Web UI(不需要鉴权,但只允许本地访问)
+    // Web UI:仅回环对端可访问(非回环对端一律 403,且不得回出页面内容)
     if (p === '/' && req.method === 'GET') {
+      if (!isLoopbackPeer(req)) { sendJSON(res, 403, { error: '禁止访问: Web UI 仅允许本地访问' }); return; }
       const html = fs.readFileSync(path.join(__dirname, 'ui.html'), 'utf-8');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(html);
@@ -1669,18 +1737,31 @@ const server = http.createServer(async (req, res) => {
         });
         clientTombstones.delete(finalName);
         // 加入后从待审批队列清除
+        // #105:saveACL 返回 false（键被隔离⇒保守拒写）时不得再回 200 approved:
+        // 运行时登记确实已发生（上面 connectedClients.set），但名单变更没落盘,
+        // 必须 503 + 原因,并把"运行时已注册"如实带上（R3/R4）。
         if (acl.pending.some(pd => pd.clientId === finalName)) {
           acl.pending = acl.pending.filter(pd => pd.clientId !== finalName);
-          store.saveACL(acl);
+          const saved = store.saveACL(acl);
+          if (!saved) {
+            sendJSON(res, 503, aclRefusal('注册（白名单放行）', finalName, { runtimeRegistered: true }));
+            return;
+          }
         }
         log('info', `客户端 ${finalName} 已加入(白名单)`);
         sendJSON(res, 200, { success: true, status: 'approved', clientId: finalName, reused: false, lifecycle: 'connecting', supportsSampling: body.capabilities?.sampling === true });
         return;
       }
       // 3) 陌生客户端:进待审批队列,不占用调度
+      // #105:隔离期 loadACL() 只会拿到空结构,任何"进待审批"都不可能持久化 ⇒ 必须 503,
+      // 不得再回 pending 的 200（R4）;陌生客户端不占用调度,运行时未登记,如实呈现。
       if (!acl.pending.some(pd => pd.clientId === finalName)) {
         acl.pending.push({ clientId: finalName, name: clientId, requestedAt: new Date().toISOString() });
-        store.saveACL(acl);
+        const saved = store.saveACL(acl);
+        if (!saved) {
+          sendJSON(res, 503, aclRefusal('注册（进待审批）', finalName, { runtimeRegistered: false }));
+          return;
+        }
       }
       log('info', `客户端 ${finalName} 请求加入,进入待审批队列`);
       sendJSON(res, 200, { success: false, status: 'pending', clientId: finalName, message: '等待管理员批准' });
@@ -1696,7 +1777,14 @@ const server = http.createServer(async (req, res) => {
       if (!acl.allowlist.includes(id)) acl.allowlist.push(id);
       acl.blocklist = acl.blocklist.filter(x => x !== id);
       acl.pending = acl.pending.filter(pd => pd.clientId !== id);
-      store.saveACL(acl);
+      // #105:必须消费返回值——拒写时名单没变,回 200 success:true 就是对调用方撒谎。
+      // 批准本身不产生运行时副作用,runtimeOccupiedNow 只是实况观察(该 id 此刻是否在连),
+      // 既不写成"什么都没发生",也不写成"全部成功"。
+      const saved = store.saveACL(acl);
+      if (!saved) {
+        sendJSON(res, 503, aclRefusal('批准', id, { runtimeOccupiedNow: connectedClients.has(id) }));
+        return;
+      }
       log('info', `客户端 ${id} 已批准加入`);
       sendJSON(res, 200, { success: true, clientId: id, status: 'approved' });
       return;
@@ -1712,13 +1800,18 @@ const server = http.createServer(async (req, res) => {
       if (!acl.blocklist.includes(id)) acl.blocklist.push(id);
       acl.allowlist = acl.allowlist.filter(x => !aclKeys.includes(x));
       acl.pending = acl.pending.filter(pd => !aclKeys.includes(pd.clientId));
-      store.saveACL(acl);
-      // 若已连接,同时踢出
+      const saved = store.saveACL(acl);
+      // 若已连接,同时踢出(运行时副作用照旧发生,不因写被拒而改变既有语义;
+      // #105 只把"没落盘"如实说清:正文带 runtimeKicked,既不谎报成功也不谎报"什么都没发生")
       const client = connectedClients.get(id);
       if (client) {
         if (client.pendingReject) client.pendingReject(new Error('已被管理员拒绝'));
         rememberClientDisconnect(id, client, 'admin_denied');
         connectedClients.delete(id);
+      }
+      if (!saved) {
+        sendJSON(res, 503, aclRefusal('拒绝并拉黑', id, { runtimeKicked: !!client }));
+        return;
       }
       log('info', `客户端 ${id} 已被拒绝并拉黑`);
       sendJSON(res, 200, { success: true, clientId: id, status: 'denied' });
@@ -1742,7 +1835,13 @@ const server = http.createServer(async (req, res) => {
       // 同时移除同名 CLI 冲突客户端的原始授权名（如 openclaw/client-openclaw）。
       acl.allowlist = acl.allowlist.filter(x => !aclKeys.includes(x));
       if (body.block && !acl.blocklist.includes(id)) acl.blocklist.push(id);
-      store.saveACL(acl);
+      // #105:踢出（运行时副作用已发生）与拉黑（名单变更）是两件事,写被拒时必须各说各的:
+      // runtimeKicked 如实反映"在线客户端确实被踢掉了",error 如实反映"名单没落盘"。
+      const saved = store.saveACL(acl);
+      if (!saved) {
+        sendJSON(res, 503, aclRefusal(body.block ? '踢出并拉黑' : '踢出', id, { runtimeKicked: !!client }));
+        return;
+      }
       log('info', `客户端 ${id} 已被踢出${body.block ? '并拉黑' : ''}`);
       sendJSON(res, 200, { success: true, clientId: id, kicked: !!client, blocked: !!body.block });
       return;
@@ -2335,9 +2434,11 @@ const server = http.createServer(async (req, res) => {
       const meetingMaxMs = Math.min(CONFIG.MEETING_MAX_MS, Number.isFinite(body.max_ms) ? Math.max(0, body.max_ms) : CONFIG.MEETING_MAX_MS);
 
       // 异步讨论:立即返回 meetingId,后台逐轮执行
-      const meeting = store.createMeeting(body.topic, participants);
-      // 元数据真正落盘:load→找到该会议→赋值→save(原先改游离对象再 save(loadMemory()) 是空操作)
-      {
+      const { meeting, persisted } = store.createMeeting(body.topic, participants);
+      // 建会是否落盘,事实由 store 给(#109),不再靠"再读一遍碰巧找不到"反查判成败。
+      // 下面的 load→find 只负责"取回对象补运行时字段";找不到 m 作为竞态防御支路保留,仍须 503。
+      let metadataSaved = persisted;
+      if (metadataSaved) {
         const mem = store.loadMemory();
         const m = mem.meetings.find(x => x.id === meeting.id);
         if (m) {
@@ -2347,8 +2448,14 @@ const server = http.createServer(async (req, res) => {
           m.round2Guidance = body.round2_guidance || '';
           m.round2 = body.round2 !== false;
           m.implement = body.implement || false;
-          store.saveSync('memory', mem);
+          metadataSaved = store.saveSync('memory', mem);
+        } else {
+          metadataSaved = false;
         }
+      }
+      if (!metadataSaved) {
+        sendJSON(res, 503, persistRefusal('memory', `建会 ${meeting.id}（元数据持久化）`, { meetingId: meeting.id, started: false }));
+        return;
       }
       METRICS.meetingsStarted++;
       log('info', `会议 ${meeting.id} 创建(异步), 话题: "${body.topic.substring(0, 60)}", 参与者: ${participants.join(', ')}`);
@@ -2374,7 +2481,28 @@ const server = http.createServer(async (req, res) => {
     if (p.startsWith('/api/discuss/status/') && req.method === 'GET') {
       const meetingId = p.split('/').pop();
       const meeting = store.getMeeting(meetingId);
-      if (!meeting) { sendJSON(res, 404, { error: '会议不存在' }); return; }
+      if (!meeting) {
+        // #114:memory 读不到会议有两种事实——"真的没这场会"与"memory 落点此刻不可读(已隔离并改名保全)"。
+        // 后者若也答 404,等于把存储故障谎报成没这回事。故先回读第二个健康落点(全局库 events 表):
+        // 有止损记录 ⇒ 200 降级视图把原因说回来;一条都没有 ⇒ 维持原 404(不得把所有 id 都答成 200)。
+        // meetingId 来自 URL 路径分段(外部可控),已在 db.queryEvents 内走绑定参数,此处不做任何 SQL 拼接。
+        const autoStops = db.queryEvents({ source: meetingId, eventType: 'auto_stop' });
+        if (autoStops.length > 0) {
+          const latest = autoStops[0];
+          sendJSON(res, 200, {
+            meetingId,
+            degraded: true,
+            status: '存储不可读（memory 已被隔离/拒写，会议终态读不到）',
+            interrupted: true,
+            interruptReason: latest.detail || null,
+            autoStops: autoStops.map(s => ({ ts: s.ts, reason: s.detail || '', durationMs: s.durationMs || 0 })),
+            note: 'memory 落点当前不可读，以上止损记录读自全局库 events 表（第二个健康落点），不含会议正文'
+          });
+          return;
+        }
+        sendJSON(res, 404, { error: '会议不存在' });
+        return;
+      }
       sendJSON(res, 200, {
         meetingId: meeting.id,
         topic: meeting.topic,
@@ -2408,7 +2536,10 @@ const server = http.createServer(async (req, res) => {
       meeting.interrupted = true;
       meeting.interruptReason = body.reason || '用户手动中断';
       meeting.status = 'interrupted';
-      store.saveSync('memory', mem);
+      // #106 R3:一致性消费(隔离态实测走不到——读不到会议先在上面 404,不为此编造新语义;
+      // 404 判定、200 响应体、db 写穿顺序均一字不动,只有"真找到会议却写被拒"才走诚实 503)
+      const saved = store.saveSync('memory', mem);
+      if (!saved) { sendJSON(res, 503, meetingRefusal(`中断会议 ${body.meetingId}`, body.meetingId)); return; }
       db.recordMeeting(meeting); // 终态写穿全局库
       log('info', `会议 ${body.meetingId} 被中断: ${body.reason || '手动'}`);
       sendJSON(res, 200, { success: true, meetingId: body.meetingId, reason: meeting.interruptReason, messages: meeting.messages });
@@ -2433,7 +2564,9 @@ const server = http.createServer(async (req, res) => {
       } else {
         meeting.guidance = body.message;
       }
-      store.saveSync('memory', mem);
+      // #106 R3:一致性消费(同上,隔离态走不到这里;写被拒才 503,200 响应体与日志不动)
+      const saved = store.saveSync('memory', mem);
+      if (!saved) { sendJSON(res, 503, meetingRefusal(`主持人注入 ${body.meetingId}`, body.meetingId)); return; }
       log('info', `会议 ${body.meetingId} 主持人注入: ${(body.message || '').substring(0, 60)}`);
       sendJSON(res, 200, { success: true, meetingId: body.meetingId, message: '注入成功,下一轮生效' });
       return;
@@ -2494,13 +2627,42 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
     return null;
   }
 
+  // #110 持久化看门狗:memory 在循环中途被隔离时必须自动止损、停止继续派发(幽灵循环的存量变种)。
+  // 判据按 truthy:updateMeeting() 成功回 meeting 对象、失败回 null;store.addMessage/closeMeeting()
+  // 回布尔——两处都把返回值原样喂给 notePersist。只有"连续"失败才算(一次成功清零),防偶发一次
+  // 失败误杀健康会议;连续 2 次 ⇒ storageDead(),闸门在每次将要派发前收手走既有 finalizeAutoStop。
+  let persistFails = 0;
+  let storageStopped = false; // 防递归:finalizeAutoStop 自身的三处写入不得再次触发放门狗
+
+  function notePersist (ok) {
+    if (!storageStopped) {
+      if (ok) persistFails = 0;
+      else persistFails++;
+    }
+    return ok;
+  }
+
+  function storageDead () {
+    return persistFails >= 2;
+  }
+
+  // 派发前的闸门:成立则走既有自动止损收尾并回传 true(调用方必须立即 return,绝不再派发)。
+  // storageStopped 在 finalizeAutoStop 内置位,本函数也只可能让 finalizeAutoStop 被调用一次。
+  function checkStorageDead () {
+    if (!storageDead()) return false;
+    finalizeAutoStop('存储拒写（memory 已被隔离，本轮无法落盘）');
+    return true;
+  }
+
   function updateMeeting(updates) {
     const mem = store.loadMemory();
     const meeting = mem.meetings.find(m => m.id === meetingId);
     if (!meeting) return null;
     Object.assign(meeting, updates);
-    store.saveSync('memory', mem);
-    return meeting;
+    // #106 R4:消费返回值——写被拒(隔离)时该轮更新其实没存住,按"取不到"同一口径回 null。
+    // 后台循环的控制流/止损判定/中断判定均不改(现有调用点全部忽略返回值)。
+    const saved = store.saveSync('memory', mem);
+    return saved ? meeting : null;
   }
 
   function checkInterrupted() {
@@ -2510,23 +2672,37 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
   }
 
   function closeMeeting(summary) {
-    updateMeeting({ totalTokens }); // 先把最终 token 落盘,再关会写穿 DB(修:原时序颠倒导致 SQLite 副本 total_tokens 永久少记)
-    store.closeMeeting(meetingId, summary);
+    notePersist(updateMeeting({ totalTokens })); // 先把最终 token 落盘,再关会写穿 DB(修:原时序颠倒导致 SQLite 副本 total_tokens 永久少记)
+    notePersist(store.closeMeeting(meetingId, summary)); // #110 返回值喂看门狗,不再整句丢弃
     db.recordMeeting(store.getMeeting(meetingId)); // 终态写穿全局库(跨重启可查)
   }
 
   // 自动止损收尾:标注中断原因 + 记一条系统消息 + 关闭会议
   function finalizeAutoStop (reason) {
+    storageStopped = true; // #110 防递归:止损收尾自身的写入不再计入看门狗,且闸门只可能走到这里一次
     METRICS.meetingsAutoStopped++;
-    updateMeeting({ interrupted: true, interruptReason: '自动止损: ' + reason });
-    store.addMessage(meetingId, '系统', `(自动止损: ${reason},讨论提前结束)`);
+    // #114:止损原因必须另有一条不随 memory 一起丢的落点。下面三处写入(updateMeeting /
+    // store.addMessage / closeMeeting)全部经 saveSync('memory'),memory 被隔离并改名保全时必然全被拒;
+    // 没有这一笔,GET /api/discuss/status 读不到会议就只能答"会议不存在",把存储故障谎报成没这回事。
+    // 落库走既有单点 recordEvent(全局库 events 表),本文件不手写 SQL、不新建表/列。
+    const elapsedMs = Date.now() - meetingStart; // 只读一次钟:detail 与 durationMs 不得互相打架
+    db.recordEvent({
+      source: meetingId,
+      channel: 'hub',
+      type: 'auto_stop',
+      success: false,
+      durationMs: elapsedMs,
+      detail: `自动止损(${elapsedMs}ms): ${reason}`
+    });
+    notePersist(updateMeeting({ interrupted: true, interruptReason: '自动止损: ' + reason }));
+    notePersist(store.addMessage(meetingId, '系统', `(自动止损: ${reason},讨论提前结束)`));
     closeMeeting(`自动止损: ${reason}, ${totalTokens} tokens`);
     log('warn', `会议 ${meetingId} 自动止损: ${reason}`);
   }
 
   try {
     // 第一轮
-    updateMeeting({ round: 1, status: 'discussing' });
+    notePersist(updateMeeting({ round: 1, status: 'discussing' }));
     log('info', `会议 ${meetingId} 第一轮开始`);
     const round1Results = {};
 
@@ -2534,6 +2710,7 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
       if (checkInterrupted()) { log('info', `会议 ${meetingId} 第一轮被中断`); break; }
       autoStop = overBudget();
       if (autoStop) { log('warn', `会议 ${meetingId} 第一轮触发自动止损: ${autoStop}`); break; }
+      if (checkStorageDead()) return; // #110 每次将要派发发言之前查一次闸门:存储已死立即止损,绝不再派发
       const mem = store.loadMemory();
       const mtg = mem.meetings.find(m => m.id === meetingId);
       const currentGuidance = mtg?.guidance || guidance;
@@ -2543,16 +2720,16 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
         const result = await executeTool(name, `你正在参加一个 AI 技术讨论会。\n\n话题: ${topic}${gText}\n\n请给出你的技术观点和方案,简洁有料。`, { taskId: `${name}_${meetingId}_r1_${Date.now()}` });
         if (isEmptyOutput(result)) throw new Error('空产出(无输出)'); // 落入下方既有"发言失败"分支
         const content = result.content.substring(0, 2000);
-        store.addMessage(meetingId, name, content);
+        notePersist(store.addMessage(meetingId, name, content));
         round1Results[name] = { content, tokens: result.tokens.total };
         totalTokens += result.tokens.total;
         log('debug', `会议 ${meetingId}: ${name} 第一轮发言完成, ${result.tokens.total} tokens`);
       } catch (e) {
-        store.addMessage(meetingId, name, `(发言失败: ${e.message})`);
+        notePersist(store.addMessage(meetingId, name, `(发言失败: ${e.message})`));
         round1Results[name] = { content: `(发言失败: ${e.message})`, tokens: 0 };
       }
     }
-    updateMeeting({ totalTokens }); // 每轮结束持久化一次 token(避免每位发言者触发两次全量重写)
+    notePersist(updateMeeting({ totalTokens })); // 每轮结束持久化一次 token(避免每位发言者触发两次全量重写)
 
     if (autoStop) { finalizeAutoStop(autoStop); return; }
     if (checkInterrupted()) {
@@ -2563,13 +2740,14 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
 
     // 第二轮
     if (doRound2 && Object.keys(round1Results).length > 1) {
-      updateMeeting({ round: 2 });
+      notePersist(updateMeeting({ round: 2 }));
       log('info', `会议 ${meetingId} 第二轮开始`);
 
       for (const name of participants) {
         if (checkInterrupted()) { log('info', `会议 ${meetingId} 第二轮被中断`); break; }
         autoStop = overBudget();
         if (autoStop) { log('warn', `会议 ${meetingId} 第二轮触发自动止损: ${autoStop}`); break; }
+        if (checkStorageDead()) return; // #110 每次将要派发发言之前查一次闸门:存储已死立即止损,绝不再派发
 
         const othersText = Object.entries(round1Results)
           .filter(([speaker]) => speaker !== name)
@@ -2594,13 +2772,13 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
         try {
           const result = await executeTool(name, `你正在参加一个 AI 技术讨论会。\n\n话题: ${topic}\n\n以下是其他参与者的观点:\n\n${othersText}${injectText}\n\n请基于讨论,给出你的补充意见或最终结论。`, { taskId: `${name}_${meetingId}_r2_${Date.now()}` });
           if (isEmptyOutput(result)) throw new Error('空产出(无输出)'); // 落入下方既有"发言失败"分支
-          store.addMessage(meetingId, name, result.content.substring(0, 2000));
+          notePersist(store.addMessage(meetingId, name, result.content.substring(0, 2000)));
           totalTokens += result.tokens.total;
         } catch (e) {
-          store.addMessage(meetingId, name, `(第二轮发言失败: ${e.message})`);
+          notePersist(store.addMessage(meetingId, name, `(第二轮发言失败: ${e.message})`));
         }
       }
-      updateMeeting({ totalTokens }); // 每轮结束持久化一次 token
+      notePersist(updateMeeting({ totalTokens })); // 每轮结束持久化一次 token
     }
 
     if (autoStop) { finalizeAutoStop(autoStop); return; }
@@ -2612,6 +2790,7 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
     // 自动实现前再验一次预算(时长可能在等待中超限)
     const preImplStop = overBudget();
     if (preImplStop) { finalizeAutoStop(preImplStop); return; }
+    if (checkStorageDead()) return; // #110 进入共识总结等后续步之前查一次闸门
 
     // 共识引擎:讨论正常结束后自动生成共识总结(结论/分歧/行动项),沉淀到经验库供 memory_search 复用
     const speeches = (store.getMeeting(meetingId)?.messages || []).filter(m => m.content && !m.content.startsWith('(') && m.speaker !== '主持人' && m.speaker !== '系统');
@@ -2622,14 +2801,15 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
         const sumResult = await executeTool(participants[0], `你是会议主持人。请对以下 AI 讨论会做共识总结,输出三部分:1)达成的结论 2)主要分歧 3)行动项。简洁列点。\n\n话题: ${topic}\n\n讨论记录:\n${digest}`, { taskId: `consensus_${meetingId}_${Date.now()}` });
         totalTokens += sumResult.tokens.total || 0;
         consensus = sumResult.content.substring(0, 2000);
-        store.addMessage(meetingId, '共识总结', consensus);
+        notePersist(store.addMessage(meetingId, '共识总结', consensus));
         store.writeExperience('会议共识', `话题: ${topic}\n${consensus}`, ['讨论会', '共识']);
         log('info', `会议 ${meetingId} 共识总结完成, ${sumResult.tokens.total} tokens`);
       } catch (e) {
-        store.addMessage(meetingId, '系统', `(共识总结失败: ${e.message})`);
+        notePersist(store.addMessage(meetingId, '系统', `(共识总结失败: ${e.message})`));
       }
     }
 
+    if (checkStorageDead()) return; // #110 进入共识度投票之前查一次闸门
     // 共识度评分:共识总结产出后,请每位参与者对共识表态(赞成/有保留/反对),量化收敛程度
     if (consensus && participants.length >= 2 && !overBudget()) {
       const votes = [];
@@ -2650,8 +2830,8 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
         const approve = votes.filter(v => v.stance === '赞成').length;
         const consensusScore = Math.round((approve / votes.length) * 100);
         const voteDigest = votes.map(v => `${v.tool}: ${v.stance}${v.reason ? ' — ' + v.reason : ''}`).join('\n');
-        store.addMessage(meetingId, '共识度', `共识度 ${consensusScore}%(${approve}/${votes.length} 赞成)\n${voteDigest}`);
-        updateMeeting({ consensusScore, consensusVotes: votes });
+        notePersist(store.addMessage(meetingId, '共识度', `共识度 ${consensusScore}%(${approve}/${votes.length} 赞成)\n${voteDigest}`));
+        notePersist(updateMeeting({ consensusScore, consensusVotes: votes }));
         log('info', `会议 ${meetingId} 共识度评分: ${consensusScore}%(${approve}/${votes.length})`);
       }
     }
@@ -2659,7 +2839,8 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
     // 自动实现
     let implResult = null;
     if (doImplement) {
-      updateMeeting({ round: 3, status: 'implementing' });
+      if (checkStorageDead()) return; // #110 进入自动实现之前查一次闸门:存储已死立即止损,绝不再派发
+      notePersist(updateMeeting({ round: 3, status: 'implementing' }));
       log('info', `会议 ${meetingId} 开始自动实现`);
       const finalMeeting = store.getMeeting(meetingId);
       const discussionSummary = (finalMeeting.messages || [])
@@ -2670,9 +2851,9 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
       try {
         implResult = await doDispatch(implTask, participants, true);
         totalTokens += implResult.totalTokens || 0;
-        store.addMessage(meetingId, '系统', `自动实现完成: ${implResult.successCount}/${implResult.total} 成功, ${implResult.totalTokens} tokens`);
+        notePersist(store.addMessage(meetingId, '系统', `自动实现完成: ${implResult.successCount}/${implResult.total} 成功, ${implResult.totalTokens} tokens`));
       } catch (e) {
-        store.addMessage(meetingId, '系统', `自动实现失败: ${e.message}`);
+        notePersist(store.addMessage(meetingId, '系统', `自动实现失败: ${e.message}`));
       }
     }
 
@@ -2684,7 +2865,7 @@ async function runDiscussionAsync(meetingId, topic, participants, guidance, roun
   } catch (err) {
     // 顶层异常兜底:会议不会卡在 'discussing'
     log('error', `会议 ${meetingId} 异常: ${err.message}\n${err.stack}`);
-    store.addMessage(meetingId, '系统', `(会议异常: ${err.message})`);
+    notePersist(store.addMessage(meetingId, '系统', `(会议异常: ${err.message})`));
     closeMeeting(`异常终止: ${err.message}, ${totalTokens} tokens`);
   }
 }

@@ -10,11 +10,28 @@
  * 向 stderr 写一条 warn(同时含变量名与"非法/回落"字样);未设置该 env 则静默落默认,不噪音告警。
  */
 
+// 整串匹配(#96 R1):只接受纯十进制整数(可带显式 +/- 号),杜绝 parseInt 的前缀宽容——
+// "1e7"→1、"10MB"→10、"0x10"→16、"12.9"→12、"1,5"→1、"5 5"→5、"1_000"→1 这类
+// "吃掉前半截当合法值且零留痕"的写法一律判非法回落默认。
+const STRICT_INT_RE = /^[+-]?\d+$/;
+
 // 核心归一:allowZero=false 要求 >0(F1 正整数语义);
 // allowZero=true 要求 >=0(如 AI_BRIDGE_DAILY_TOKEN_BUDGET 的"0=不设预算"特例,F3)。
 function _normalizeEnvInt (v, def, name, allowZero) {
-  const n = parseInt(v);
-  const valid = Number.isFinite(n) && (allowZero ? n >= 0 : n > 0);
+  let n;
+  if (typeof v === 'number') {
+    // 数字入参仅接受安全整数(小数/NaN/Infinity/超大整数都非法,#96u8/u9)
+    if (Number.isSafeInteger(v)) n = v;
+  } else if (typeof v === 'string') {
+    const s = v.trim();
+    if (STRICT_INT_RE.test(s)) {
+      const parsed = Number(s);
+      // 超出安全整数范围的位数回落默认,而非返回 float 形态大数(防 ERR_OUT_OF_RANGE 崩进程)
+      if (Number.isSafeInteger(parsed)) n = parsed;
+    }
+  }
+  // 其它类型(boolean/null/undefined)不产生候选值,n 保持 undefined ⇒ 非法
+  const valid = n !== undefined && (allowZero ? n >= 0 : n > 0);
   // 仅当"env 已设置(非 undefined/空串)"且非法、且调用方提供了变量名时才留痕,避免噪音告警。
   if (!valid && name != null && v !== undefined && v !== '') {
     const rule = allowZero ? '必须为非负整数' : '必须为正整数';

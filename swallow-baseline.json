@@ -1,11 +1,11 @@
 {
   "selector": "CatchClause:not(:has(CallExpression)):not(:has(ThrowStatement)):not(:has(ReturnStatement))",
-  "total": 45,
+  "total": 43,
   "files": {
     "server.js": 19,
-    "bridge-stdio.js": 5,
-    "adapters/cli-adapter.js": 4,
+    "bridge-stdio.js": 4,
     "store.js": 4,
+    "adapters/cli-adapter.js": 3,
     "codely-client.js": 3,
     "qidi-sync.js": 3,
     "output-cleaner.js": 2,

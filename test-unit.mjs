@@ -32,6 +32,7 @@ const {
   rankRoutingProfiles
 } = require('./routing-score.js');
 const crypto = require('node:crypto');
+const { parsePositiveInt, parseNonNegativeInt } = require('./env-int.js');
 
 // codely-client 为可选模块(开源版剔除),缺失时跳过签名测试段
 let codelySigningKey = null;
@@ -234,6 +235,62 @@ async function main () {
     const fallbackVer = codelyCliVersion(true);
     check('exe 缺失时回退内置版本', fallbackVer === '1.0.0-release.52', `实际 ${fallbackVer}`);
     delete process.env.CODELY_CLI_EXE;
+  }
+
+  // ── #96 env 数字解析:必须整串匹配,不许前缀宽容(指挥官亲笔锁定,编码手禁改) ──
+  //   病根实测(env-int.js:16 `parseInt(v)` 无 radix、前缀宽容):
+  //     "1e7"→1  "10MB"→10  "0x10"→16  "12.9"→12  "1,5"→1  "5 5"→5  "1_000"→1
+  //   全部**当作合法值返回**,且**一条留痕都不写**。业务后果是真金白银:
+  //     AI_BRIDGE_CLI_MAX_OUTPUT_CHARS=1e7 ⇒ 上限 1 字符 ⇒ 每条 CLI 派发被"输出超上限"误杀
+  //     AI_BRIDGE_DAILY_TOKEN_BUDGET=1e6   ⇒ 预算 1 token ⇒ 中枢当天拒绝一切任务
+  //     AI_BRIDGE_PORT=0x2668              ⇒ 16 ⇒ 桥连的是不存在端口
+  //   反向哨兵同样重要:不许将钳制改成"一律拒绝"或"一律噪音"。
+  section('#96 env 数字解析:整串匹配 + 非法必留痕');
+  {
+    const scratch = [];
+    const capture = (fn) => {
+      const orig = console.error;
+      console.error = (...a) => { scratch.push(a.join(' ')); };
+      try { return fn(); } finally { console.error = orig; }
+    };
+    check('#96u1 科学计数法 "1e7" 不得被当成 1(必须回落默认)', parsePositiveInt('1e7', 999) === 999, '实际 ' + parsePositiveInt('1e7', 999));
+    check('#96u2 带单位 "10MB" 不得被当成 10', parsePositiveInt('10MB', 999) === 999, '实际 ' + parsePositiveInt('10MB', 999));
+    check('#96u3 十六进制 "0x10" 不得被当成 16', parsePositiveInt('0x10', 999) === 999, '实际 ' + parsePositiveInt('0x10', 999));
+    check('#96u4 小数串 "12.9" 不得静默截成 12', parsePositiveInt('12.9', 999) === 999, '实际 ' + parsePositiveInt('12.9', 999));
+    check('#96u5 千分位 "1,5" 不得被当成 1', parsePositiveInt('1,5', 999) === 999, '实际 ' + parsePositiveInt('1,5', 999));
+    check('#96u6 一次给两个数 "5 5" 不得被当成 5', parsePositiveInt('5 5', 999) === 999, '实际 ' + parsePositiveInt('5 5', 999));
+    check('#96u7 下划线分组 "1_000" 不得被当成 1', parsePositiveInt('1_000', 999) === 999, '实际 ' + parsePositiveInt('1_000', 999));
+    check('#96u8 超出安全整数的位数不得返回 float 形态大数(防 ERR_OUT_OF_RANGE 崩进程)',
+      parsePositiveInt('99999999999999999999', 999) === 999, '实际 ' + parsePositiveInt('99999999999999999999', 999));
+    check('#96u9 数字入参里的小数 12.9 不得静默截成 12', parsePositiveInt(12.9, 999) === 999, '实际 ' + parsePositiveInt(12.9, 999));
+    check('#96u10 反向哨兵:纯数字串/首尾空白/显式正号仍是正解',
+      parsePositiveInt(' 12 ', 999) === 12 && parsePositiveInt('12345', 999) === 12345 && parsePositiveInt('+8', 999) === 8);
+    check('#96u11 反向哨兵:数字入参仍兼容安全整数(30000→30000)', parsePositiveInt(30000, 999) === 30000, '实际 ' + parsePositiveInt(30000, 999));
+    check('#96u12 反向哨兵:0 的两把尺不动(正整数拒 0、非负收 0)',
+      parsePositiveInt('0', 999) === 999 && parseNonNegativeInt('0', 7) === 0);
+    check('#96u13 反向哨兵:负数照旧回落(负数直通是 #49 F1 的病,不许复发)',
+      parsePositiveInt('-5', 999) === 999 && parseNonNegativeInt('-5', 7) === 7);
+    check('#96u14 反向哨兵:未设置/空串静默落默认(不许噪音告警)',
+      capture(() => parsePositiveInt(undefined, 999, 'ZTEST_UNSET')) === 999 && scratch.length === 0
+        && capture(() => parsePositiveInt('', 999, 'ZTEST_EMPTY')) === 999 && scratch.length === 0);
+    check('#96u15 留痕新增:前缀宽容型非法值("1e7")必须与 "abc" 同口径留痕(变量名 + 非法/回落字样)',
+      (() => {
+        scratch.length = 0;
+        const r = capture(() => parsePositiveInt('1e7', 999, 'ZTEST_PREFIX'));
+        return r === 999 && scratch.some(s => /ZTEST_PREFIX/.test(s) && /非法|无效|不是正数|必须为正|回落/.test(s));
+      })(), 'stderr=' + JSON.stringify(scratch));
+    check('#96u16 反向哨兵:合法值不得留痕(钳制不得变成噪音)',
+      (() => {
+        scratch.length = 0;
+        const r = capture(() => parsePositiveInt('12345', 999, 'ZTEST_OK'));
+        return r === 12345 && scratch.length === 0;
+      })(), 'stderr=' + JSON.stringify(scratch));
+    check('#96u17 反向哨兵:#49 F2 既有留痕路径不回退(负数带 name 必须说清)',
+      (() => {
+        scratch.length = 0;
+        const r = capture(() => parsePositiveInt('-5', 999, 'ZTEST_NEG'));
+        return r === 999 && scratch.some(s => /ZTEST_NEG/.test(s) && /非法|无效|不是正数|必须为正|回落/.test(s));
+      })(), 'stderr=' + JSON.stringify(scratch));
   }
 }
 

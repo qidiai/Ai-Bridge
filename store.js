@@ -31,11 +31,22 @@ const FILES = {
 // (ACL blocklist 被洗空 = 准入失效;switches 被洗空 = 已关工具全部回启)。
 const _corrupt = new Set();
 
+// #74:隔离真因的可查状态。真因(load 的 e.message / shapeReason 的结果)此前只进 appendLog,
+// 下游查不到,于是三处对外文案各自硬编猜测类别,形状非法场景也被统写成解析类 → 归因方向被
+// 带偏(#54/#74 同族)。这里把 key→真因 存成进程内状态,由 quarantineReason() 统一暴露。
+const _corruptReason = new Map();
+
+// #97/#104:有界原因摘要的唯一实现在 ./cause(零依赖纯函数,store 与 tool-registry 共用此把尺)
+const { causeOf } = require('./cause');
+
 // 保全坏文件并置脏标志:原字节改名留档,后续该 key 的写一律被闸门拒绝。
 // 绝不抛错(load 是在业务路径上被调的,抛错会让会议中途夭折并堵死并发闸门)。
 function quarantine (key, reason) {
   if (_corrupt.has(key)) return;
   _corrupt.add(key); // 先置脏:即使下面改名失败,这道闸门也必须生效
+  _corruptReason.set(key, reason); // 只记首次:第一个真因才是真因,后续不得覆盖
+  // #97:reason 必须由调用方以唯一尺组合为 <类别>: <causeOf(...)>(已压平且有界);
+  // 此处不得再截断——重新过秤会把类别前缀截没(归因事故),保守策略保持原样。
   let bakInfo = '保全改名失败,原坏文件仍在但绝不覆写';
   if (fs.existsSync(FILES[key])) {
     const bak = FILES[key] + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-');
@@ -44,7 +55,9 @@ function quarantine (key, reason) {
       bakInfo = `已保全为 ${path.basename(bak)}`;
     } catch (_) { /* 权限/占用:保持无备份名,脏标志不回退 */ }
   }
-  appendLog('error', `存储文件 ${path.basename(FILES[key])} 损坏(${bakInfo};原因: ${reason}),本进程内拒绝覆写`);
+  // #103:损坏帧改由唯一写手 storageNotice 产出(过去这里是半角括号 + 尾部多余的「,本进程内
+  // 拒绝覆写」,与 :165 的拒写帧不同形)。原因取自 quarantineReason(key)——上面已 set,顺序不动。
+  appendLog('error', storageNotice(key, '损坏', bakInfo));
 }
 
 // 每 key 的字段形状契约(#44)。只对"文件里实际存在的字段"检查类型,缺失属合法稀疏,
@@ -100,18 +113,30 @@ function shapeReason (key, data) {
 function load (key) {
   const f = FILES[key];
   if (!f || !fs.existsSync(f)) return {}; // 文件不存在:合法的空,不是损坏,不隔离
+  // #97:"读"与"解析"是两类故障,不得塞进同一个 try 靠 e.message 的引擎措辞猜类别
+  // (V8/libuv 句式不是类别标签)。原因统一组合为 <类别>: <causeOf(错误)>,
+  // 保守策略不变:仍隔离、仍返回空结构、绝不抛错。
+  let raw;
+  try {
+    raw = fs.readFileSync(f, 'utf-8');
+  } catch (e) {
+    // 读阶段失败(EISDIR/EPERM/EBUSY 之类):连字节都没拿到,与"拿到了但不是合法 JSON"不同类
+    quarantine(key, `读取失败: ${causeOf(e)}`);
+    return {}; // 仍返回空结构保住可用性,绝不抛错
+  }
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
+    parsed = JSON.parse(raw);
   } catch (e) {
-    // 读不确定即不覆写:解析失败与 EBUSY/EPERM 之类的读错误同等对待,保守保全
-    quarantine(key, e.message);
+    // 解析阶段失败(JSON.parse 依规范只抛 SyntaxError):字节读到了但不是合法 JSON
+    quarantine(key, `解析失败: ${causeOf(e)}`);
     return {}; // 仍返回空结构保住可用性,绝不抛错
   }
   // #44:能解析但形状非法(字段类型/容器/顶层三种错)与解析失败同口径,
   // 保守保全+拒写,绝不抛错(调用方在业务路径与启动序列上,抛错会把保守策略升级成故障)。
   if (!assertShape(key, parsed)) {
-    quarantine(key, shapeReason(key, parsed));
+    // 形状非法有自己的类别,且 shapeReason() 的字段名细节保留在冒号之后(二者都要)
+    quarantine(key, `形状非法: ${causeOf(shapeReason(key, parsed))}`);
     return {};
   }
   return parsed;
@@ -122,7 +147,9 @@ const _syncLocks = new Map();
 function saveSync (key, data) {
   if (_corrupt.has(key)) {
     // 不抛错,只回传 false:损坏期间的任何"补救性写入"都是二次破坏
-    appendLog('error', `拒绝覆写 ${path.basename(FILES[key])}:本轮已因解析损坏被隔离`);
+    // #74:日志说清真因,不硬编类别猜测(形状非法被写成"解析损坏"会带偏归因方向)
+    // #103:拒写帧改由唯一写手 storageNotice 产出,与损坏帧同形(原因同样取 quarantineReason(key))
+    appendLog('error', storageNotice(key, '拒写'));
     return false;
   }
   // 自旋等待锁(同步版,最多等 2 秒)
@@ -144,6 +171,36 @@ function saveSync (key, data) {
     _syncLocks.set(key, false);
   }
   return true;
+}
+
+// #73 隔离态的只读访问器:让调用方能查"这个 key 本轮是否已被隔离",而不用自造第二把尺去猜
+// (#81/#86 的病:同一规则多处实现)。纯读——不写日志、不改状态、不抛错;未知/非法 key 返回 false。
+// 刻意不提供 clearQuarantine/resetQuarantine:隔离是进程级脏标志,"重启即恢复"是既有语义(#30)。
+function isQuarantined (key) {
+  return _corrupt.has(key);
+}
+
+// #74 与 isQuarantined 同处、同粒度的真因访问器:让对外文案能由**真因**组合,而不是调用点
+// 各自硬编猜测类别(解析失败 ≠ 形状非法)。纯读——不写日志、不改状态、不抛错;
+// 未隔离/未知 key 返回 null(锁定测试按 null 断言)。
+function quarantineReason (key) {
+  return _corruptReason.has(key) ? _corruptReason.get(key) : null;
+}
+
+// #103 损坏留痕与拒写留痕的唯一写手:过去 store.js 有两套句式各拼各的
+// (:74「存储文件 X 损坏(…;原因: …),本进程内拒绝覆写」半角括号+尾部多余句 vs
+// :165「拒绝覆写 X:本轮已隔离（原因: …）」全角括号+无 basename 前缀),同一件事两种帧形状,
+// 运维无法用一条正则把某次损坏的全部留痕捞全(与 #97 收拾过的"多处硬编文案"同族病)。
+// 收敛为固定骨架:存储文件 <basename> <event>（原因: <reason>[; <detail>]）——
+//   括号一律全角「（）」;「原因: 」用半角冒号+空格;detail(如保全改名结果)存在时以
+//   「; <detail>」放在同一对括号内、原因之后。
+// reason 一律取自 quarantineReason(key)(损坏/拒写两事件同源 ⇒ 两帧的原因子串天然相等),
+// basename 由 FILES[key] 求、未知 key 用 String(key) 兜底(绝不抛错)。
+// 纯函数:不写日志、不改状态、不抛错。
+function storageNotice (key, event, detail) {
+  const base = FILES[key] ? path.basename(FILES[key]) : String(key);
+  const reason = quarantineReason(key) || '原因未记录';
+  return `存储文件 ${base} ${event}（原因: ${reason}${detail ? '; ' + detail : ''}）`;
 }
 
 // ── 日志(JSONL 追加,带简单锁防交错 + 按大小轮转) ──
@@ -222,6 +279,7 @@ function loadMemory () {
 
 // ── 会议(多 Agent 讨论) ──
 
+// #109:隔离期 saveSync 返回 false 不抛错,调用方必须知道建会有没有落盘;本函数是 store 内唯一曾丢弃该返回值的写点,故回传 { meeting, persisted }。
 function createMeeting (topic, participants) {
   const mem = loadMemory();
   const meeting = {
@@ -234,8 +292,8 @@ function createMeeting (topic, participants) {
   };
   mem.meetings.unshift(meeting);
   if (mem.meetings.length > 50) mem.meetings = mem.meetings.slice(0, 50);
-  saveSync('memory', mem);
-  return meeting;
+  const persisted = saveSync('memory', mem);
+  return { meeting, persisted };
 }
 
 // 单条发言内容上限与单会议发言条数上限(缓解 memory.json 全量重写膨胀)
@@ -286,10 +344,14 @@ function closeMeeting (meetingId, summary) {
 // 字段形状与人工中断路径(server.js /api/discuss/interrupt)逐字段一致,不改 closedAt/summary/messages。
 function markOrphanMeetings () {
   const mem = loadMemory();
-  // 形状非法与解析失败同口径处理:保全坏文件、本进程拒绝覆写,绝不抛错——
-  // 启动期数据异常只能降级功能,不能阻止进程起来(#52:该函数在 server.js 顶层启动序列被调用)
+  // #103:此处曾有 quarantine('memory', <手抄 shapeReason 文案>) —— 实测永不可观测:
+  //   meetings 形状真非法时,loadMemory 内部的 load() 已按「形状非法: <字段名> …」写入真因,
+  //   而 quarantine 只记首次(first-write-wins,:61 早退),手抄文案进不了 _corruptReason;
+  //   若只是「缺 meetings 的合法稀疏对象」,loadMemory 已补齐为 [] 数组,更进不到本分支。
+  //   留着它只会随 shapeReason 规则静默变质(#74/#77 家族的第二把尺),故删除该调用。
+  // 守卫本体保留:若上游绕过 load 传入非数组 meetings,启动清扫按既有语义返回 [] 且绝不抛错——
+  //   启动期数据异常只能降级功能,不能阻止进程起来(#52:该函数在 server.js 顶层启动序列被调用)。
   if (!Array.isArray(mem.meetings)) {
-    quarantine('memory', 'meetings 字段形状非法(须为数组)');
     return [];
   }
   const swept = [];
@@ -327,6 +389,12 @@ function recordTask (task) {
       fallbackFrom: r.fallbackFrom
     })),
     successCount: task.successCount,
+    // #62:调用点(server.js 的 taskRecord)本就带着路由分解结果,但白名单曾把它们丢掉 ⇒
+    //   事后查台账只剩 successCount,分不清"3 个里 skipped 2 个"和"只点名了 1 个"。
+    //   原样赋值、不加兜底(与相邻 successCount 同构),且仍逐字段列举——不整对象落盘(#62a2 反哨)。
+    requested: task.requested,
+    total: task.total,
+    skipped: task.skipped,
     totalTokens: task.totalTokens,
     fallbackLog: task.fallbackLog,
     workspace: task.workspace || null
@@ -466,7 +534,7 @@ function saveACL (acl) {
 
 module.exports = {
   FILES,
-  load, saveSync,
+  load, saveSync, isQuarantined, quarantineReason, causeOf, storageNotice,
   appendLog, readLogs, clearLogs,
   loadMemory, recordTask, writeExperience, searchMemory, getToolStats, getToolObservations, getRecentTasks,
   createMeeting, addMessage, getMeeting, getRecentMeetings, closeMeeting, markOrphanMeetings,

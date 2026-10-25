@@ -73,17 +73,8 @@ function addConfigs (tools, seen, configs) {
 //   本模块不得为此新增对 store.js 的引用(#46a4):bridge-stdio.js:12 也 require tool-registry,
 //   一旦加上 store 依赖,每个 MCP 桥进程都会在加载期 mkdir 数据目录。
 //   损坏原件必须原样留在原处:不改名、不覆写、不隔离(#46a5;P0 的 .corrupt-* 隔离只用于运行数据)。
-const DIAG_ERROR_MAX = 200; // 原因摘要上限,与 #54/#74 的 causeOf 同尺:压换行、超长取尾部并保留开头错误码
-
-/** 有界原因摘要:SyntaxError/EBUSY 这类第一顺位归因(开头的错误码/异常名)不得被截掉 */
-function boundedReason (e) {
-  const msg = String((e && e.message) || e || '').replace(/\s+/g, ' ').trim();
-  if (!msg) return '未知故障（无异常信息）';
-  if (msg.length <= DIAG_ERROR_MAX) return msg;
-  const codeMatch = /^[A-Z]+(?=:| )/.exec(msg);
-  const prefix = codeMatch ? codeMatch[0] + ': ' : '';
-  return prefix + '…' + msg.slice(-(DIAG_ERROR_MAX - prefix.length - 1));
-}
+//   有界原因摘要由 ./cause 单点产出(#54/#74/#97/#104 同一条尺,本模块不得改挂 store.js)。
+const { causeOf } = require('./cause');
 
 // 诊断状态:仅在每次 loadTools() 后整体更新;kimi 热更新(resyncKimiTools)走自身 try/catch,不得写这里。
 // { status: 'ok'|'missing'|'corrupt-parse'|'corrupt-shape', error: string|null, file: basename, entryCount: number }
@@ -120,7 +111,7 @@ function loadTools () {
       configs = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     } catch (e) {
       status = 'corrupt-parse';
-      error = boundedReason(e);
+      error = causeOf(e);
     }
     if (status === 'ok' && !Array.isArray(configs)) {
       // 能解析但顶层不是数组:null/数字/字符串/对象都算([] 是合法空配置,不走这支)

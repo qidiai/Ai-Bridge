@@ -102,20 +102,18 @@ function saveState (state) {
 /* ── 落盘失败归因(返工单 R1:#54 同族,原因必须指向真因且有界) ──────────────
  * store.saveSync 有两种失败形态,语义完全不同,必须分别上报,不得折成一个布尔:
  *   - 返回 false : 该 key 本轮已被隔离(损坏/形状非法)→ 拒绝覆写。此时没有异常对象,
- *                  只能如实写"被拒绝持久化",绝不伪造底层原因。
+ *                  只能引用 store 里存的**真因**(quarantineReason),绝不硬编类别猜测。
+ *                  (#74:此前此处与 store.js 写闸门日志、:198 的 503 三处都写死了同一句
+ *                  解析类猜测,形状非法场景实测照抄 ⇒ 运维去查"谁写坏了 JSON",归因被带偏。)
  *   - 抛异常     : 真实写入故障(权限/磁盘满/EISDIR/...)→ 带底层原因签名。
+ * #97:有界原因摘要只剩一把尺 store.causeOf(尾部优先+错误码补回);本地第二套实现
+ * (旧的 causeOf 函数与 const CAUSE_MAX 常量)已删除——同一规则两处实现且互相矛盾正是 #86 的病。
  */
-const CAUSE_MAX = 200;
-const REFUSED_CAUSE = '被拒绝持久化（workspaces 本轮已因解析损坏被隔离，见 logs.jsonl 与 .corrupt-* 备份）';
 
-/** 有界原因摘要:压掉换行,超长时保留尾部(真因多在末尾)并把开头错误码补回,总长不超过 CAUSE_MAX */
-function causeOf (e) {
-  const msg = String((e && e.message) || e || '').replace(/\s+/g, ' ').trim();
-  if (!msg) return '未知写入故障（无异常信息）';
-  if (msg.length <= CAUSE_MAX) return msg;
-  const codeMatch = /^[A-Z]+(?=:| )/.exec(msg);
-  const prefix = codeMatch ? codeMatch[0] + ': ' : '';
-  return prefix + '…' + msg.slice(-(CAUSE_MAX - prefix.length - 1));
+/** #74:写被拒文案由单一真相源的真因组合;真因缺失时保持中性诚实,不许退回具体猜测 */
+function refusedCause () {
+  const reason = store.quarantineReason('workspaces') || '原因未记录';
+  return `被拒绝持久化（workspaces 本轮已隔离，原因: ${reason}，见 logs.jsonl 与 .corrupt-* 备份）`;
 }
 
 /** 唯一落盘入口的失败采集:永不抛、永不含糊,返回 { ok, cause, err } */
@@ -124,9 +122,9 @@ function trySaveState (state) {
   try {
     raw = saveState(state);
   } catch (e) {
-    return { ok: false, refused: false, cause: causeOf(e), err: e };
+    return { ok: false, refused: false, cause: store.causeOf(e), err: e };
   }
-  if (raw === false) return { ok: false, refused: true, cause: REFUSED_CAUSE, err: null };
+  if (raw === false) return { ok: false, refused: true, cause: refusedCause(), err: null };
   return { ok: true, refused: false, cause: '', err: null };
 }
 
@@ -189,6 +187,17 @@ function get (ref) {
 }
 
 function requireRecord (state, ref) {
+  // #73 单一守卫点:workspaces 被隔离时 loadState 返回空结构,记录"看不见"≠"不存在"。
+  // 隔离期我们证明不了任何记录在册与否,只能如实报 503 降级(绝不能谎称 404「不存在」,
+  // 那会把存储故障伪装成用户错误,与 #54/#74 归因误导同族)。archive/restore/remove/
+  // resolveForDispatch 皆经此处、beginRun 经 resolveForDispatch ⇒ 一处覆盖五个 op,
+  // 且在任何状态变更与文件操作之前(隔离期 remove{deleteFiles:true} 不得删受管目录)。
+  if (store.isQuarantined('workspaces')) {
+    // #74:类别由真因组合,不在此处硬编猜测(形状非法 ≠ 解析损坏);真因缺失时保持中性措辞。
+    const reason = store.quarantineReason('workspaces') || '原因未记录';
+    throw fail(503, `无法判定工作区 ${ref} 的在册状态:workspaces 数据本轮已隔离(原因: ${reason}),` +
+      `记录可能仍在 .corrupt-* 保全件里(详见 logs.jsonl),请修复文件后重启进程恢复,勿据此重建`);
+  }
   const rec = findRecord(state, ref);
   if (!rec) throw fail(404, `工作区不存在: ${ref}`);
   return rec;
@@ -353,9 +362,11 @@ function remove (ref, opts = {}) {
     } catch (e) {
       const rollback = trySaveState(state);
       if (!rollback.ok) {
-        store.appendLog('error', `工作区删除回滚失败，注册表与磁盘不一致需人工核查: ${rec.name} — 回收原因: ${causeOf(e)} — 回滚原因: ${rollback.cause}`);
+        store.appendLog('error', `工作区删除回滚失败，注册表与磁盘不一致需人工核查: ${rec.name} — 回收原因: ${store.causeOf(e)} — 回滚原因: ${rollback.cause}`);
+        // #75:回滚失败时响应必须与日志同真——绝不能宣称"已恢复注册表登记"(那是积极错误的断言)
+        throw fail(500, `工作区目录回收失败，回滚注册表登记也失败，注册表与磁盘不一致需人工核查: ${rec.name} — 回收原因: ${store.causeOf(e)} — 回滚原因: ${rollback.cause}`);
       }
-      throw fail(500, `工作区目录回收失败，已恢复注册表登记: ${rec.name} — ${causeOf(e)}`);
+      throw fail(500, `工作区目录回收失败，已恢复注册表登记: ${rec.name} — ${store.causeOf(e)}`);
     }
   }
 

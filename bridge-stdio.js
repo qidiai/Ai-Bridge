@@ -24,14 +24,22 @@ const CAP_EXEC = /^(1|true|yes|on)$/i.test(process.env.AI_BRIDGE_CAP_EXEC || '')
 // 为什么 POST 预算必须大于中枢单次执行窗口(server.js CONFIG.EXECUTE_TIMEOUT,默认 900000):
 // 桥若先判死,中枢其实还在正常执行——宿主收到的是误报失败,桥侧台账还会写进一条脏失败记录。
 // 960000 = 900000(窗口) + 30000(余量)。AI_BRIDGE_HTTP_TIMEOUT 可覆盖;未设/NaN/0 落回默认。
-// POST 预算的归一不带 name(锁 F1 的 resolveDefault 要求默认数紧邻 `;`);同一 env 的非法留痕由下方 GET 站点负责。
-const HTTP_TIMEOUT_MS = parsePositiveInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 960000);
+// #49b:补回变量名实参与其余站点同尺(test-audit-fixes 的 defaultOf() 已认三形态,不必再为锁省略 name)。
+// 该预算同时是 POST 的 inactivity 超时与**绝对 deadline**(见 requestJson),二者同源不同尺。
+const HTTP_TIMEOUT_MS = parsePositiveInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 960000, 'AI_BRIDGE_HTTP_TIMEOUT');
 // GET 预算独立且更短:pollLoop 用 httpGet 拉任务,30s 快速失败是桥自愈路径的节奏;
 // 若把 GET 默认也抬到同步预算,#38a 的"黑洞约 30010ms 自行回 isError"会变成永久悬空(回归)。
 // 设了 AI_BRIDGE_HTTP_TIMEOUT 时与 POST 同源覆盖。
 const GET_TIMEOUT_MS = parsePositiveInt(process.env.AI_BRIDGE_HTTP_TIMEOUT, 30000, 'AI_BRIDGE_HTTP_TIMEOUT');
 // callTool 总预算:必须严格大于内层 HTTP 预算,保证单请求工具由内层先判死、错误文案稳定为"请求超时"
 const CALL_BUDGET_MS = HTTP_TIMEOUT_MS + 30000;
+// ── #108 注册/轮询等待节奏:同一规则只写一遍,留痕里的秒数一律由常量导出 ──
+const REGISTER_PENDING_MS = 5000;            // 待审批:等管理员批准
+const REGISTER_REFUSED_MS = 30000;           // 被管理员拒绝:冷却后再问一次
+const REGISTER_PERSIST_REFUSED_MS = REGISTER_PENDING_MS; // 中枢拒写(#107):刻意与待审批同档,不烧连接失败预算
+const REGISTER_BACKOFF_CAP_MS = 30000;       // 连接失败指数退避上限(与被拒档同值不同义,禁止合并)
+const POLL_RETRY_MS = 5000;                  // 长轮询失败重试
+const pacingSeconds = (ms) => Math.round(ms / 1000); // 留痕用秒数,由毫秒常量导出
 // 服务端会在客户端名与内置 CLI 重名时分配 client- 前缀 ID。
 // 后续 poll/result/unregister 必须使用服务端返回的 ID，否则会陷入“未注册→重注册”死循环。
 let registeredClientId = CLIENT_NAME;
@@ -54,9 +62,21 @@ const MCP_TOOLS = [
         context: { type: 'string', description: '任务上下文(背景/现有代码/约束等),会前置注入给子工具' },
         tools: { type: 'array', items: { type: 'string' }, description: '工具名列表,留空用所有已开启的' },
         workspace: { type: 'string', description: '工作区名称或 ID(见 list_workspaces);CLI 工具将在该目录执行' },
-        auto_fallback: { type: 'boolean', description: '工具限额/失败时自动转给其他工具接力(默认 true)', default: true }
+        auto_fallback: { type: 'boolean', description: '工具限额/失败时自动转给其他工具接力(默认 true)', default: true },
+        async: { type: 'boolean', description: 'true ⇒ 立即返回 taskId、任务在后台执行,用 task_status 取结果(不占用本次调用的同步等待窗口);缺省/false ⇒ 维持现有同步等待(工具跑完才返回)' }
       },
       required: ['task']
+    }
+  },
+  {
+    name: 'task_status',
+    description: '查询异步派发任务的状态与结果:传 dispatch 异步受理时返回的 taskId。状态为 running(后台执行中)/ done(已完成,给结果要点)/ failed(失败,给原因);taskId 不存在时如实报"任务不存在"。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: '异步任务的 taskId(dispatch 传 async:true 时立即返回,形如 atask_<毫秒>_<十六进制>)' }
+      },
+      required: ['taskId']
     }
   },
   {
@@ -71,9 +91,9 @@ const MCP_TOOLS = [
       type: 'object',
       properties: {
         tool: { type: 'string', description: '工具名' },
-        enabled: { type: 'boolean', description: 'true开 false关' }
+        enabled: { type: 'boolean', description: 'true开/false关;省略视为false(关闭)' }
       },
-      required: ['tool', 'enabled']
+      required: ['tool']
     }
   },
   {
@@ -92,11 +112,12 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: '工作区名称(唯一,省略时用目录名或自动生成)' },
+        name: { type: 'string', description: '工作区名称(必填,唯一)' },
         path: { type: 'string', description: '已有目录的绝对路径;省略则创建受管工作区' },
         description: { type: 'string', description: '用途说明' },
         exclusive: { type: 'boolean', description: '独占模式:同一时间只允许一个任务使用该工作区' }
-      }
+      },
+      required: ['name']
     }
   },
   {
@@ -125,9 +146,8 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: '搜索关键词' }
-      },
-      required: ['query']
+        query: { type: 'string', description: '搜索关键词;省略则返回最近记录(浏览通道)' }
+      }
     }
   },
   {
@@ -221,63 +241,99 @@ const MCP_TOOLS = [
 
 // ── HTTP 请求 ──
 
-function httpPost (path, body, timeoutMs = HTTP_TIMEOUT_MS) {
+/**
+ * 出站 HTTP 的**唯一实现**(#49b F1 单点化)。
+ * httpPost/httpGet 退化为薄封装:token 头、请求发送、状态码阶梯(2xx 解析 JSON 后 resolve /
+ * 非 2xx reject 且带 err.status + err.body)、JSON 解析失败分支——全部只在这里写一次。
+ * 曾两份实现漂成 POST=`服务返回格式错误` / GET=`格式错误` 两种措辞(#49n7),现只留一种。
+ *
+ * 两种超时,职责不同,同源同预算(#49b F2):
+ *   timeoutMs  —— Node 的 **inactivity** 型 socket 超时:只在连接上没有字节流动时触发。
+ *                 对端每 40ms 吐 1 字节且永不 end 时它**永不触发**(实测桥 12s 仍不自行回话=#49n2)。
+ *   deadlineMs —— **墙钟**绝对期限:与对端是否续命完全无关,到期必掐。缺省即取 timeoutMs,
+ *                 也就是"该次调用生效的预算"——绝不引入更小的魔数上限。
+ *                 /api/poll 是服务端 30 秒长轮询(server.js:64 CONFIG.POLL_TIMEOUT=30000),
+ *                 它吃 POST 默认预算 960000ms,deadline 与之同值 ⇒ 32 倍余量,掐不到它。
+ *
+ * 三种失败归因互可区分(#49n3;每条都带生效预算数值,运维分得清是 1500 的预算还是 960000 的窗口):
+ *   ① 连接失败   `无法连接 AI Bridge 服务(host:port)。请先启动: node server.js\n错误: <Node 原始码>`
+ *   ② 无响应超时 `请求超时:对端全程无响应,连接空闲 1500ms`(黑洞 #38a/#53a;墙钟那条则写作
+ *                `…绝对 deadline 1500ms 到期`,两者都表明"一个字节都没回来")
+ *   ③ 慢速续命   `请求超时:对端慢速续命(已回 37 字节却永不结束),绝对 deadline 1500ms 到期`(drip #49n2)
+ * 对外契约不变:非 2xx 仍 reject 且带 status/body;/api/poll 的 404 `未注册` 仍触发重注册,
+ * /api/client/register 的 403 `denied` 仍走 30s 慢重试;`桥调用失败: ` 前缀仍由上层 tools/call 统一加。
+ */
+function requestJson (method, urlPath, body, opts) {
+  const options = opts || {};
+  const timeoutMs = options.timeoutMs;
+  const deadlineMs = Number.isFinite(options.deadlineMs) && options.deadlineMs > 0 ? options.deadlineMs : timeoutMs;
   return new Promise((resolve, reject) => {
-    const data = JSON.stringify(body);
-    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) };
+    const data = body === undefined || body === null ? null : JSON.stringify(body);
+    const headers = {};
     if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;
+    if (data !== null) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(data);
+    }
+    let settled = false;
+    let wall = null;
+    let recvBytes = 0; // 已收到的响应字节数:现场区分"完全无响应"与"慢速续命"的唯一证据
+    const settle = (err, value) => {
+      // 先到先得:deadline 里 destroy 之后 socket 还可能回 ECONNRESET,不得覆盖已写好的归因
+      if (settled) return;
+      settled = true;
+      if (wall) clearTimeout(wall); // 绝不遗留孤儿定时器(否则每次调用都挂一个 16 分钟的 timer)
+      if (err) reject(err); else resolve(value);
+    };
+    // 归因现场判据:收到过字节 = 对端在慢速续命(inactivity 型超时看不见这种病);一个字节都没收到 = 无响应。
+    // 三种失败各自可辨:①无法连接 ②无响应超时 ③慢速续命被绝对 deadline 掐断;每条都带生效预算数值。
+    const stallReason = () => recvBytes > 0
+      ? `对端慢速续命(已回 ${recvBytes} 字节却永不结束)`
+      : '对端全程无响应';
     const req = http.request({
-      hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, method: 'POST',
+      hostname: BRIDGE_HOST, port: BRIDGE_PORT, path: urlPath, method,
       headers,
       timeout: timeoutMs
     }, res => {
       let d = '';
-      res.on('data', c => d += c);
+      res.on('data', c => { d += c; recvBytes += c.length; });
       res.on('end', () => {
         // L1':非 2xx reject 带结构化上下文(status/body),错误体 error 原文透传(取不到则 HTTP <code>)
         let parsed = null; let parsedOk = false;
-        try { parsed = JSON.parse(d); parsedOk = true; } catch (_) {}
+        try { parsed = JSON.parse(d); parsedOk = true; } catch (_) { parsedOk = false; }
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          if (parsedOk) resolve(parsed); else reject(new Error('服务返回格式错误'));
+          if (parsedOk) settle(null, parsed); else settle(new Error('服务返回格式错误'));
           return;
         }
         const err = new Error((parsedOk && (parsed.error || parsed.message)) || ('HTTP ' + res.statusCode));
         err.status = res.statusCode;
         err.body = parsedOk ? parsed : null;
-        reject(err);
+        settle(err);
       });
     });
-    req.on('error', e => reject(new Error(`无法连接 AI Bridge 服务(${BRIDGE_HOST}:${BRIDGE_PORT})。请先启动: node server.js\n错误: ${e.message}`)));
-    req.on('timeout', () => { req.destroy(); reject(new Error('请求超时')); });
-    req.write(data); req.end();
+    // ① 连接层失败:带上目标地址与 Node 原始错误,便于分清"中枢没起来"与"起来了但不回话"
+    req.on('error', e => settle(new Error(`无法连接 AI Bridge 服务(${BRIDGE_HOST}:${BRIDGE_PORT})。请先启动: node server.js\n错误: ${e.message}`)));
+    // ② inactivity 型超时:Node 只发 'timeout' 事件、不自动销毁 socket,不监听就永久悬空(#38 的根因)
+    req.on('timeout', () => {
+      const err = new Error(`请求超时:${stallReason()},连接空闲 ${timeoutMs}ms`);
+      req.destroy(); settle(err);
+    });
+    // ③ 绝对 deadline:与活动无关的墙钟兜底,#49n2 的慢速续命只有这一条能掐断
+    wall = setTimeout(() => {
+      const err = new Error(`请求超时:${stallReason()},绝对 deadline ${deadlineMs}ms 到期`);
+      req.destroy(); settle(err);
+    }, deadlineMs);
+    if (data !== null) req.write(data);
+    req.end();
   });
 }
 
+function httpPost (path, body, timeoutMs = HTTP_TIMEOUT_MS) {
+  return requestJson('POST', path, body, { timeoutMs });
+}
+
 function httpGet (path, timeoutMs = GET_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const headers = {};
-    if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;
-    const rq = http.get({ hostname: BRIDGE_HOST, port: BRIDGE_PORT, path, timeout: timeoutMs, headers }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        // L1':非 2xx reject 带结构化上下文(status/body),错误体 error 原文透传(取不到则 HTTP <code>)
-        let parsed = null; let parsedOk = false;
-        try { parsed = JSON.parse(d); parsedOk = true; } catch (_) {}
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          if (parsedOk) resolve(parsed); else reject(new Error('格式错误'));
-          return;
-        }
-        const err = new Error((parsedOk && (parsed.error || parsed.message)) || ('HTTP ' + res.statusCode));
-        err.status = res.statusCode;
-        err.body = parsedOk ? parsed : null;
-        reject(err);
-      });
-    });
-    // 与 httpPost 同形:Node 的 timeout 选项只发 'timeout' 事件,不监听就永久悬空
-    rq.on('timeout', () => { rq.destroy(); reject(new Error('请求超时')); });
-    rq.on('error', e => reject(new Error(`无法连接服务: ${e.message}`)));
-  });
+  return requestJson('GET', path, null, { timeoutMs });
 }
 
 // ── MCP 工具调用 → HTTP API ──
@@ -310,11 +366,271 @@ function skippedLabel (list) {
   }).filter(Boolean).join(', ');
 }
 
+// ── #27 表驱动:MCP 工具面出站声明 + 单一执行器 ──
+// 每项:path(端点,静态字符串或依 args 构造)/ method / requiredArgs(发出前校验)/ render(成功形状)。
+// 特殊流程工具保留各自实现(discuss 多步 / manage_client 一工具多动作 / recognize_image 视觉);
+// dispatch 摘要渲染较厚,留在 dispatchToolCall 的 case 里(#36/I3 结构锁依赖该 case 与 requested 文案),
+// 但其出站同样经 runTool 走执行器,不再内联拼 HTTP。所有出站统一收敛到 requestJson 内核(#49 语义不变)。
+const TOOL_TABLE = {
+  list_tools: {
+    method: 'GET',
+    path: '/api/tools',
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const d = _resp;
+    const lines = ['# 本机 AI 编程工具\n', '| 工具 | 检测 | 开关 | tokens | 次数 |', '|------|------|------|--------|------|'];
+    d.tools.forEach(t => lines.push(`| ${t.displayName} (${t.name}) | ${t.available ? '✅' : '❌'} | ${t.enabled ? '🟢' : '🔴'} | ${(t.tokens || 0).toLocaleString()} | ${t.calls || 0} |`));
+    lines.push(`\n**总计: ${(d.total.total || 0).toLocaleString()} tokens, ${d.total.calls || 0} 次**`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  toggle_tool: {
+    method: 'POST',
+    path: '/api/toggle',
+    // R1:中枢只校验 tool(server.js:1342),:1347 `sw[tool.id] = !!body.enabled`
+    // ⇒ 省略 enabled 是合法的"关闭它"通道,不得抄成桥侧必填(#27s9/#27s9b)。
+    requiredArgs: ['tool'],
+    render: (_resp, args) => {
+    return { content: [{ type: 'text', text: `✅ ${args.tool} 已${args.enabled ? '打开' : '关闭'}` }] };
+    }
+  },
+  list_switches: {
+    method: 'GET',
+    path: '/api/tools',
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const d = _resp;
+    const lines = ['# 工具开关状态\n'];
+    d.tools.forEach(t => lines.push(`- ${t.enabled ? '🟢' : '🔴'} **${t.displayName}** (${t.name}) — ${t.enabled ? '开' : '关'}`));
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  list_workspaces: {
+    method: 'GET',
+    path: '/api/workspaces',
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const d = _resp;
+    const lines = ['# 工作区\n'];
+    if (!(d.workspaces || []).length) lines.push('(无工作区。用 create_workspace 创建受管目录,或传 path 登记已有目录)');
+    (d.workspaces || []).forEach(w => {
+      const status = w.status === 'active' ? '[active]' : '[archived]';
+      const runs = w.activeRuns ? ` [运行中 ${w.activeRuns}]` : '';
+      lines.push(`- ${status} **${w.name}** (${w.mode})${runs} — ${w.useCount || 0} 次使用${w.exists ? '' : ' — 目录缺失!'}`);
+      lines.push(`  \`${w.path}\``);
+      if (w.description) lines.push(`  ${w.description}`);
+    });
+    if (d.stats) lines.push(`\n受管根目录: \`${d.stats.root}\` | 共 ${d.stats.total} 个(active ${d.stats.active} / archived ${d.stats.archived})`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  create_workspace: {
+    method: 'POST',
+    path: '/api/workspaces',
+    requiredArgs: ["name"],
+    render: (_resp, args) => {
+    const r = _resp;
+    if (!r.id) return { content: [{ type: 'text', text: `创建失败: ${r.error || '未知错误'}` }], isError: true };
+    return { content: [{ type: 'text', text: `工作区已创建\n\n- 名称: ${r.name}\n- ID: ${r.id}\n- 模式: ${r.mode}\n- 路径: ${r.path}\n${r.exclusive ? '- 独占: 是\n' : ''}\ndispatch 时传 workspace: "${r.name}" 即可在该目录执行。` }] };
+    }
+  },
+  token_stats: {
+    method: 'GET',
+    path: '/api/stats',
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const d = _resp;
+    if (!d.tools || Object.keys(d.tools).length === 0) return { content: [{ type: 'text', text: '暂无 token 记录' }] };
+    const lines = ['# 📊 Token 统计\n', '| 工具 | 输入 | 输出 | 总计 | 次数 |', '|------|------|------|------|------|'];
+    for (const [n, s] of Object.entries(d.tools)) lines.push(`| ${n} | ${(s.input || 0).toLocaleString()} | ${(s.output || 0).toLocaleString()} | ${(s.total || 0).toLocaleString()} | ${s.calls || 0} |`);
+    lines.push(`\n**总计: ${(d.total?.total || 0).toLocaleString()} tokens, ${d.total?.calls || 0} 次**`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  handoff: {
+    method: 'POST',
+    path: '/api/handoff',
+    requiredArgs: ["task","existing_code","to"],
+    render: (_resp, args) => {
+    const r = _resp;
+    if (!r.success) return { content: [{ type: 'text', text: `接力失败: ${r.error}` }], isError: true };
+    // from undefined 防御
+    const fromLabel = r.from && r.from !== 'unknown' ? `${r.from} → ` : '';
+    const lines = [`# 接力: ${fromLabel}${r.displayName} ✅ (${r.duration})`];
+    if (r.codeBlocks && r.codeBlocks.length > 0) {
+      r.codeBlocks.forEach(b => lines.push(`\`\`\`${b.language}\n${b.code}\n\`\`\``));
+    } else { lines.push(r.content?.substring(0, 500) || '(无输出)'); }
+    lines.push(`\n📊 ${r.tokens.total} tokens`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  memory_search: {
+    method: 'POST',
+    path: '/api/memory/search',
+    // R1:中枢从不因缺 query 报错(server.js:1843 `body.query || ''` → store.js:355 空串=浏览前 10),
+    // 省略 query 是既有合法浏览通道,不得抄成桥侧必填(#27s10)。
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const r = _resp;
+    const lines = ['# 🔍 记忆搜索\n'];
+    if (r.tasks?.length > 0) {
+      lines.push('## 任务历史');
+      // #36:分母口径统一为 total(与 dispatch 汇总行同源);store.recordTask 目前不落 total,
+      // 旧记录(现存 136 条全部无 total)以 results 长度回退,避免渲染出 1/undefined 的新谎言。
+      r.tasks.forEach(t => lines.push(`- [${t.ts}] "${t.task}" → ${t.successCount}/${t.total || (t.results || []).length || 0} 成功, ${t.totalTokens} tokens`));
+    }
+    if (r.experiences?.length > 0) {
+      lines.push('\n## 经验记录');
+      r.experiences.forEach(e => lines.push(`- [${e.category}] ${e.content.substring(0, 100)}`));
+    }
+    if (!r.tasks?.length && !r.experiences?.length) lines.push('未找到匹配记录');
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  memory_recent: {
+    method: 'GET',
+    path: (args) => {
+    const limit = args.limit || 10;
+    return '/api/memory/recent?limit=' + limit;
+  },
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const r = _resp;
+    const lines = ['# 📋 最近任务\n'];
+    (r.tasks || []).forEach(t => {
+      lines.push(`[${t.ts}] "${t.task}"`);
+      lines.push(`  工具: ${(t.tools || []).join(', ')} | ${t.successCount}/${t.total || (t.results || []).length || 0} 成功 | ${t.totalTokens} tokens`);
+      if (t.fallbackLog?.length) lines.push(`  ⚡ ${t.fallbackLog.map(f => `${f.from}→${f.to}`).join(', ')}`);
+      lines.push('');
+    });
+    if (!r.tasks?.length) lines.push('暂无任务记录');
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  logs: {
+    method: 'GET',
+    path: (args) => {
+    const params = new URLSearchParams();
+    if (args.level) params.set('level', args.level);
+    params.set('limit', args.limit || 50);
+    return '/api/logs?' + params.toString();
+  },
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const r = _resp;
+    const lines = ['# 📝 服务日志\n'];
+    (r.logs || []).forEach(l => {
+      const time = l.ts?.substring(11, 19) || '';
+      lines.push(`[${time}] ${l.level?.toUpperCase() || '?'} ${l.msg}`);
+    });
+    if (!r.logs?.length) lines.push('暂无日志');
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  list_clients: {
+    method: 'GET',
+    path: '/api/clients',
+    requiredArgs: [],
+    render: (_resp, args) => {
+    const d = _resp;
+    const lines = ['# 🔌 接入共享中枢的客户端\n', '## 已连接'];
+    if ((d.clients || []).length) d.clients.forEach(c => lines.push(`- 🟢 ${c.name} (${c.id})${c.busy ? ' [忙]' : ''} — 自 ${c.connectedAt || '?'}`));
+    else lines.push('(无)');
+    lines.push('\n## 待审批');
+    if ((d.pending || []).length) d.pending.forEach(pd => lines.push(`- ⏳ ${pd.name} (${pd.clientId}) — 请求于 ${pd.requestedAt || '?'}`));
+    else lines.push('(无)');
+    lines.push('\n## 黑名单');
+    lines.push((d.blocklist || []).length ? d.blocklist.map(x => `- ⛔ ${x}`).join('\n') : '(无)');
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  // 异步任务取回:中枢 GET /api/task/:id(内存优先、回落 SQLite),普通 GET 表项,不另设超时/重试。
+  // 404 的 {error:'任务不存在'} 由出站内核按非 2xx reject 并带原文,上层降级成 "桥调用失败: 任务不存在"(isError),
+  // 故本 render 只负责 2xx 的三种状态;两条路径都不会压成空文本、不会报成成功、不会输出 undefined / [object Object]。
+  task_status: {
+    method: 'GET',
+    // taskId 必须编码:中枢该路由只按路径末段取 id,未编码的斜杠/换行会改写路由或把探测内容带进路径
+    path: (args) => '/api/task/' + encodeURIComponent(args.taskId),
+    requiredArgs: ['taskId'],
+    render: (_resp, args) => {
+    const r = _resp || {};
+    const taskId = r.taskId || args.taskId || '未知';
+    const status = typeof r.status === 'string' && r.status ? r.status : '未知';
+    const lines = [`# 任务状态: ${status}`, '', `- taskId: \`${taskId}\``];
+    if (status === 'running') {
+      lines.push('- 进度: running(后台执行中,稍后用 task_status 再查)');
+    } else if (status === 'done') {
+      const result = r.result || {};
+      const results = Array.isArray(result.results) ? result.results : [];
+      const total = Number.isFinite(result.total) ? result.total : results.length;
+      const success = Number.isFinite(result.successCount) ? result.successCount : results.filter(x => x && x.success).length;
+      const tokens = Number.isFinite(result.totalTokens) ? result.totalTokens : 0;
+      lines.push(`- 状态: done(成功 ${success}/${total},${tokens} tokens)`);
+      results.forEach(res => {
+        if (!res) return;
+        if (res.success) lines.push(`  - ✅ ${res.displayName || res.tool || '未知工具'}${res.duration ? ` (${res.duration})` : ''}`);
+        else lines.push(`  - ❌ ${res.tool || res.displayName || '未知工具'} ${res.reason || '失败'}`);
+      });
+      if (!results.length) lines.push('  (无工具级结果)');
+    } else if (status === 'failed') {
+      const reason = (r.result && r.result.error) || r.error || '未提供失败原因';
+      lines.push('- 状态: failed');
+      lines.push(`- 失败原因: ${reason}`);
+    } else {
+      // 超出已知三态:如实回显原始响应(截断),不假造状态、不渲染 undefined
+      lines.push(`- 原始响应: ${JSON.stringify(r).substring(0, 500)}`);
+    }
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  },
+  dispatch: {
+    method: 'POST',
+    path: '/api/dispatch',
+    requiredArgs: ["task"]
+  }
+};
+
+// 执行器:先按表校验必填(缺失即抛,交给 handleMessage 的 "桥调用失败: "+isError 降级路径,发出前拦下),
+// 再按 method 走 httpGet/httpPost 薄封装 —— 超时预算(POST=HTTP_TIMEOUT_MS / GET=GET_TIMEOUT_MS)
+// 与 #49/#53 的墙钟 deadline、三路归因、非 2xx reject 语义全部原样继承,不改一处。
+async function runTool (name, args) {
+  const spec = TOOL_TABLE[name];
+  const missing = (spec.requiredArgs || []).filter(k => args[k] === undefined || args[k] === null || args[k] === '');
+  if (missing.length) throw new Error(`缺少必填参数: ${missing.join(', ')}(工具 ${name})`);
+  const p = typeof spec.path === 'function' ? spec.path(args) : spec.path;
+  if (spec.method === 'GET') return httpGet(p);
+  return httpPost(p, args);
+}
+
+// 简单工具的公共路径:查表 → 校验/发出 → 交给该表项 render。未知工具名保持 "未知工具" 归因(#27s8)。
+async function runTableTool (name, args) {
+  const spec = TOOL_TABLE[name];
+  if (!spec) return { content: [{ type: 'text', text: `未知工具: ${name}` }], isError: true };
+  const r = await runTool(name, args);
+  return spec.render(r, args);
+}
+
+// 收敛为:特殊工具各自的 case(委托到模块级实现)→ 其余走表(runTableTool)。
+// 函数体内不再出现内联 httpPost/httpGet(#27r1 机械判据:内联出站归零)。
 async function dispatchToolCall (name, args) {
   switch (name) {
   case 'dispatch': {
-    const r = await httpPost('/api/dispatch', args);
+    const r = await runTool('dispatch', args);
     if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
+    // 异步受理形状(中枢 202:交回 taskId、不带 results):这是"刚入队",不是"跑完没结果"。
+    // 按响应形状分支而非按入参判断:宿主/中枢任一侧的 async 透传都能落到这里;
+    // 继续走下面的同步渲染会把入队渲染成 0 成功的假失败(且把 undefined 印给宿主)。
+    if (r.taskId && !Array.isArray(r.results)) {
+      const lines = [
+        '# ✅ 任务已入队(异步)',
+        '',
+        `- taskId: \`${r.taskId}\``,
+        `- 状态: ${r.status || 'running'}`,
+        '',
+        `任务在后台执行,本次调用不占用同步等待窗口。用 task_status {taskId:"${r.taskId}"} 查询结果。`
+      ];
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
     const lines = [];
     (r.results || []).forEach(res => {
       if (res.success) {
@@ -340,105 +656,19 @@ async function dispatchToolCall (name, args) {
     if (skippedTxt) lines.push(`⚠️ 跳过(${r.skipped.length} 个): ${skippedTxt}`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
-  case 'list_tools': {
-    const d = await httpGet('/api/tools');
-    const lines = ['# 本机 AI 编程工具\n', '| 工具 | 检测 | 开关 | tokens | 次数 |', '|------|------|------|--------|------|'];
-    d.tools.forEach(t => lines.push(`| ${t.displayName} (${t.name}) | ${t.available ? '✅' : '❌'} | ${t.enabled ? '🟢' : '🔴'} | ${(t.tokens || 0).toLocaleString()} | ${t.calls || 0} |`));
-    lines.push(`\n**总计: ${(d.total.total || 0).toLocaleString()} tokens, ${d.total.calls || 0} 次**`);
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  case 'discuss':
+    return discussTool(args);
+  case 'manage_client':
+    return manageClientTool(args);
+  case 'recognize_image':
+    return recognizeImage(args);
+  default:
+    return runTableTool(name, args);
   }
-  case 'toggle_tool': {
-    await httpPost('/api/toggle', args);
-    return { content: [{ type: 'text', text: `✅ ${args.tool} 已${args.enabled ? '打开' : '关闭'}` }] };
-  }
-  case 'list_switches': {
-    const d = await httpGet('/api/tools');
-    const lines = ['# 工具开关状态\n'];
-    d.tools.forEach(t => lines.push(`- ${t.enabled ? '🟢' : '🔴'} **${t.displayName}** (${t.name}) — ${t.enabled ? '开' : '关'}`));
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'list_workspaces': {
-    const d = await httpGet('/api/workspaces');
-    const lines = ['# 工作区\n'];
-    if (!(d.workspaces || []).length) lines.push('(无工作区。用 create_workspace 创建受管目录,或传 path 登记已有目录)');
-    (d.workspaces || []).forEach(w => {
-      const status = w.status === 'active' ? '[active]' : '[archived]';
-      const runs = w.activeRuns ? ` [运行中 ${w.activeRuns}]` : '';
-      lines.push(`- ${status} **${w.name}** (${w.mode})${runs} — ${w.useCount || 0} 次使用${w.exists ? '' : ' — 目录缺失!'}`);
-      lines.push(`  \`${w.path}\``);
-      if (w.description) lines.push(`  ${w.description}`);
-    });
-    if (d.stats) lines.push(`\n受管根目录: \`${d.stats.root}\` | 共 ${d.stats.total} 个(active ${d.stats.active} / archived ${d.stats.archived})`);
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'create_workspace': {
-    const r = await httpPost('/api/workspaces', args);
-    if (!r.id) return { content: [{ type: 'text', text: `创建失败: ${r.error || '未知错误'}` }], isError: true };
-    return { content: [{ type: 'text', text: `工作区已创建\n\n- 名称: ${r.name}\n- ID: ${r.id}\n- 模式: ${r.mode}\n- 路径: ${r.path}\n${r.exclusive ? '- 独占: 是\n' : ''}\ndispatch 时传 workspace: "${r.name}" 即可在该目录执行。` }] };
-  }
-  case 'token_stats': {
-    const d = await httpGet('/api/stats');
-    if (!d.tools || Object.keys(d.tools).length === 0) return { content: [{ type: 'text', text: '暂无 token 记录' }] };
-    const lines = ['# 📊 Token 统计\n', '| 工具 | 输入 | 输出 | 总计 | 次数 |', '|------|------|------|------|------|'];
-    for (const [n, s] of Object.entries(d.tools)) lines.push(`| ${n} | ${(s.input || 0).toLocaleString()} | ${(s.output || 0).toLocaleString()} | ${(s.total || 0).toLocaleString()} | ${s.calls || 0} |`);
-    lines.push(`\n**总计: ${(d.total?.total || 0).toLocaleString()} tokens, ${d.total?.calls || 0} 次**`);
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'handoff': {
-    const r = await httpPost('/api/handoff', args);
-    if (!r.success) return { content: [{ type: 'text', text: `接力失败: ${r.error}` }], isError: true };
-    // from undefined 防御
-    const fromLabel = r.from && r.from !== 'unknown' ? `${r.from} → ` : '';
-    const lines = [`# 接力: ${fromLabel}${r.displayName} ✅ (${r.duration})`];
-    if (r.codeBlocks && r.codeBlocks.length > 0) {
-      r.codeBlocks.forEach(b => lines.push(`\`\`\`${b.language}\n${b.code}\n\`\`\``));
-    } else { lines.push(r.content?.substring(0, 500) || '(无输出)'); }
-    lines.push(`\n📊 ${r.tokens.total} tokens`);
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'memory_search': {
-    const r = await httpPost('/api/memory/search', args);
-    const lines = ['# 🔍 记忆搜索\n'];
-    if (r.tasks?.length > 0) {
-      lines.push('## 任务历史');
-      // #36:分母口径统一为 total(与 dispatch 汇总行同源);store.recordTask 目前不落 total,
-      // 旧记录(现存 136 条全部无 total)以 results 长度回退,避免渲染出 1/undefined 的新谎言。
-      r.tasks.forEach(t => lines.push(`- [${t.ts}] "${t.task}" → ${t.successCount}/${t.total || (t.results || []).length || 0} 成功, ${t.totalTokens} tokens`));
-    }
-    if (r.experiences?.length > 0) {
-      lines.push('\n## 经验记录');
-      r.experiences.forEach(e => lines.push(`- [${e.category}] ${e.content.substring(0, 100)}`));
-    }
-    if (!r.tasks?.length && !r.experiences?.length) lines.push('未找到匹配记录');
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'memory_recent': {
-    const limit = args.limit || 10;
-    const r = await httpGet('/api/memory/recent?limit=' + limit);
-    const lines = ['# 📋 最近任务\n'];
-    (r.tasks || []).forEach(t => {
-      lines.push(`[${t.ts}] "${t.task}"`);
-      lines.push(`  工具: ${(t.tools || []).join(', ')} | ${t.successCount}/${t.total || (t.results || []).length || 0} 成功 | ${t.totalTokens} tokens`);
-      if (t.fallbackLog?.length) lines.push(`  ⚡ ${t.fallbackLog.map(f => `${f.from}→${f.to}`).join(', ')}`);
-      lines.push('');
-    });
-    if (!r.tasks?.length) lines.push('暂无任务记录');
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'logs': {
-    const params = new URLSearchParams();
-    if (args.level) params.set('level', args.level);
-    params.set('limit', args.limit || 50);
-    const r = await httpGet('/api/logs?' + params.toString());
-    const lines = ['# 📝 服务日志\n'];
-    (r.logs || []).forEach(l => {
-      const time = l.ts?.substring(11, 19) || '';
-      lines.push(`[${time}] ${l.level?.toUpperCase() || '?'} ${l.msg}`);
-    });
-    if (!r.logs?.length) lines.push('暂无日志');
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'discuss': {
+}
+
+// ── #27:以下三个是原 case 体逐字搬出的模块级实现(行为不变,只是交出去) ──
+async function discussTool (args) {
     const action = args.action || 'start'; // 向后兼容:旧会话未给 action 时按 start
     if (!['start', 'status', 'interrupt', 'inject'].includes(action)) {
       return { content: [{ type: 'text', text: `非法 action: ${action}(合法值: start / status / interrupt / inject)` }], isError: true };
@@ -494,20 +724,9 @@ async function dispatchToolCall (name, args) {
     const r = await httpPost('/api/discuss/inject', body);
     if (r.error) return { content: [{ type: 'text', text: r.error }], isError: true };
     return { content: [{ type: 'text', text: `✅ 已向会议 ${r.meetingId} 注入主持人消息` }] };
-  }
-  case 'list_clients': {
-    const d = await httpGet('/api/clients');
-    const lines = ['# 🔌 接入共享中枢的客户端\n', '## 已连接'];
-    if ((d.clients || []).length) d.clients.forEach(c => lines.push(`- 🟢 ${c.name} (${c.id})${c.busy ? ' [忙]' : ''} — 自 ${c.connectedAt || '?'}`));
-    else lines.push('(无)');
-    lines.push('\n## 待审批');
-    if ((d.pending || []).length) d.pending.forEach(pd => lines.push(`- ⏳ ${pd.name} (${pd.clientId}) — 请求于 ${pd.requestedAt || '?'}`));
-    else lines.push('(无)');
-    lines.push('\n## 黑名单');
-    lines.push((d.blocklist || []).length ? d.blocklist.map(x => `- ⛔ ${x}`).join('\n') : '(无)');
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
-  case 'manage_client': {
+}
+
+async function manageClientTool (args) {
     const action = args.action;
     const clientKey = args.client_key;
     if (!['approve', 'deny', 'kick'].includes(action)) {
@@ -528,8 +747,9 @@ async function dispatchToolCall (name, args) {
     const r = await httpPost('/api/clients/kick', { clientId: clientKey, block: !!args.block });
     if (!r.success) return { content: [{ type: 'text', text: r.error || '踢出失败' }], isError: true };
     return { content: [{ type: 'text', text: `👢 已踢出客户端 ${r.clientId}${r.blocked ? '(并拉黑)' : ''}` }] };
-  }
-  case 'recognize_image': {
+}
+
+async function recognizeImage (args) {
     const VISION_PORT = parsePositiveInt(process.env.AI_BRIDGE_VISION_PORT, 11434, 'AI_BRIDGE_VISION_PORT');
     const VISION_HOST = process.env.AI_BRIDGE_VISION_HOST || '127.0.0.1';
     const question = args.question || '请详细描述这张图片的内容,包括所有可见的文字、UI元素和布局。';
@@ -670,10 +890,6 @@ async function dispatchToolCall (name, args) {
     } catch (e) {
       return { content: [{ type: 'text', text: e.message }], isError: true };
     }
-  }
-  default:
-    return { content: [{ type: 'text', text: `未知工具: ${name}` }], isError: true };
-  }
 }
 
 // ── 角色套餐:AI_BRIDGE_TOOLSET=full(默认)|lite(CLI 对端智能体精简面) ──
@@ -801,6 +1017,16 @@ async function registerWithRetry () {
         r = await httpPost('/api/client/register', { name: CLIENT_NAME, capabilities: { sampling: hostSupportsSampling, exec: CAP_EXEC }, registerSeq: nextRegisterSeq() });
       } catch (e) {
         if (e && e.status === 403 && e.body && e.body.status === 'denied') r = e.body;
+        else if (e && e.status >= 500 && e.body && e.body.persisted === false) {
+          // #107 R1/R2:中枢明确回了「持久化被拒」回执(5xx + persisted:false)——它活着且说了真话,
+          // 这不是连接层失败。归因必须诚实:打「拒写/名单 + 原因」且整条不含「连接失败」;原因原文
+          // 取自回执 e.body.error(#105 的 aclRefusal 已带「原因: …」),回执没有就写「原因未记录」,绝不编造。
+          // 节奏归入待审批档(5 秒,与 :969 同):不 retryCount++、不碰 retryDelay 指数退避——100 次预算
+          // 留给真连接失败;进程保持存活,等管理员修复 clients-acl 后自动注册成功。
+          process.stderr.write(`[ai-bridge] 中枢拒写名单(HTTP ${e.status},persisted=false),注册未落盘,${pacingSeconds(REGISTER_PERSIST_REFUSED_MS)} 秒后重试;原因: ${typeof e.body.error === 'string' && e.body.error ? e.body.error : '原因未记录'}\n`);
+          await new Promise(res => setTimeout(res, REGISTER_PERSIST_REFUSED_MS));
+          continue;
+        }
         else throw e; // 连接层失败:交给外层既有 catch(指数退避)
       }
       if (r && r.status === 'approved') {
@@ -817,17 +1043,17 @@ async function registerWithRetry () {
         return true;
       }
       if (r && r.status === 'denied') {
-        process.stderr.write('[ai-bridge] 已被管理员拒绝,30 秒后重试...\n');
-        await new Promise(res => setTimeout(res, 30000));
+        process.stderr.write(`[ai-bridge] 已被管理员拒绝,${pacingSeconds(REGISTER_REFUSED_MS)} 秒后重试...\n`);
+        await new Promise(res => setTimeout(res, REGISTER_REFUSED_MS));
         continue;
       }
-      process.stderr.write('[ai-bridge] 已进入待审批队列,等待批准(5 秒后重试)...\n');
-      await new Promise(res => setTimeout(res, 5000));
+      process.stderr.write(`[ai-bridge] 已进入待审批队列,等待批准(${pacingSeconds(REGISTER_PENDING_MS)} 秒后重试)...\n`);
+      await new Promise(res => setTimeout(res, REGISTER_PENDING_MS));
     } catch (e) {
       retryCount++;
-      process.stderr.write(`[ai-bridge] 连接失败(${retryCount}/${MAX_RETRIES}),${Math.round(retryDelay/1000)}秒后重试: ${e.message.substring(0, 80)}\n`);
+      process.stderr.write(`[ai-bridge] 连接失败(${retryCount}/${MAX_RETRIES}),${pacingSeconds(retryDelay)}秒后重试: ${e.message.substring(0, 80)}\n`);
       await new Promise(res => setTimeout(res, retryDelay));
-      retryDelay = Math.min(retryDelay * 1.5, 30000);
+      retryDelay = Math.min(retryDelay * 1.5, REGISTER_BACKOFF_CAP_MS);
     }
   }
   // 重试耗尽不再静默退出,明确告知已放弃注册
@@ -908,7 +1134,7 @@ async function pollLoop () {
         lastPollErrorLogAt = now;
         process.stderr.write(`[ai-bridge] 轮询失败(60 秒内同类错误不再重复打印): ${String(e.message || e).substring(0, 80)}\n`);
       }
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise(r => setTimeout(r, POLL_RETRY_MS));
     }
   }
 }
