@@ -181,7 +181,20 @@ function markOrphanTasks () {
 
 // ── 全局观测事件流 ──
 
-// 只存用量摘要:detail 由调用方负责截断+脱敏,本层再做一道硬截断兜底
+// detail 列上限:2000 字是合法上限(恰好 2000 一字不改),超长才截。
+const EVENT_DETAIL_MAX = 2000;
+
+// 只存用量摘要:detail 由调用方负责截断+脱敏,本层再做一道硬截断兜底。
+// 兜底不许静默:超长时把尾部标记接在截断前缀之后(#124),句式沿用内存层截断的那一句
+// 「…(已截断,原长 N 字符)」——读回方(含讨论止损原因的降级视图)才能看出"这句被截过",
+// 而不是把一句断话当成完整原因。未超长/恰好到上限一律原样落库,留痕不得变成噪音。
+function clipEventDetail (detail) {
+  if (!detail) return null;
+  const text = String(detail);
+  if (text.length <= EVENT_DETAIL_MAX) return text;
+  return text.substring(0, EVENT_DETAIL_MAX) + `\n…(已截断,原长 ${text.length} 字符)`;
+}
+
 function recordEvent (ev) {
   return safeRun(db => {
     db.prepare(`INSERT INTO events
@@ -194,7 +207,7 @@ function recordEvent (ev) {
         Number.isFinite(ev.outputTokens) ? ev.outputTokens : 0,
         Number.isFinite(ev.durationMs) ? ev.durationMs : 0,
         ev.success === false ? 0 : 1,
-        ev.detail ? String(ev.detail).substring(0, 2000) : null);
+        clipEventDetail(ev.detail));
   });
 }
 

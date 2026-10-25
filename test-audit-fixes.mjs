@@ -1393,6 +1393,57 @@ const lines=(f)=>{try{return String(fs.readFileSync(path.join(dir,f),'utf-8')).s
     'server.js 内 INSERT INTO events=' + inlineInsert + ' 含 db.recordEvent=' + /db\.recordEvent/.test(src114))
 }
 
+section('#124) recordEvent 的 detail 兜底截断不得静默(读回来要能看出被截过、原长多少)');
+{
+  // 取证(2026-10-25):db.js 的 recordEvent 用 String(ev.detail).substring(0, 2000) 做兜底硬截断,
+  //   **不留任何标记**。#114 刚把"止损原因"托付给这张 events 表当第二个健康落点 —— 一旦原因被上游
+  //   长上下文拼长超过 2000 字符,降级视图读回来的就是一句断话,而调用方无从知道它被截过。
+  //   同族病灶:#54 归因误导、#97 类别标签窄于事实、#111 外泄 [object Object](都是"丢了还不说")。
+  // 工装说明:六套里没有任何一套在进程内加载 db.js(#124 立项前未实测这条,是指挥官补测的),
+  //   故本段自带一个最小 RUNNER:独立 AI_BRIDGE_DB,不启中枢、不占端口、零网络零配额。
+  const dbRunner124 = path.join(tmpRoot, 'db124-runner.cjs');
+  fs.writeFileSync(dbRunner124, `'use strict';
+const path = require('path');
+const db = require(path.join(process.env.CASE_DB_DIR, 'db.js'));
+const long = 'X'.repeat(2500);
+const mid = 'Y'.repeat(2000);
+const short = '普通止损原因,不含长内容';
+db.recordEvent({ source: 's124-long', channel: 'hub', type: 't124', success: false, detail: long });
+db.recordEvent({ source: 's124-exact', channel: 'hub', type: 't124', success: false, detail: mid });
+db.recordEvent({ source: 's124-short', channel: 'hub', type: 't124', success: false, detail: short });
+const grab = (src) => {
+  const rows = (db.queryEvents ? db.queryEvents({ source: src, eventType: 't124', limit: 5 }) : null);
+  if (!Array.isArray(rows) || rows.length !== 1) return { rows: rows && rows.length };
+  return { detail: String(rows[0].detail == null ? '' : rows[0].detail) };
+};
+process.stdout.write(JSON.stringify({
+  hasQuery: typeof db.queryEvents === 'function',
+  long: grab('s124-long'), exact: grab('s124-exact'), short: grab('s124-short')
+}) + '\\n');
+`, 'utf-8');
+  const dbDir = path.join(tmpRoot, 'db124');
+  fs.mkdirSync(dbDir, { recursive: true });
+  const r124 = spawnSync(process.execPath, [dbRunner124], {
+    cwd: import.meta.dirname,
+    env: { ...process.env, AI_BRIDGE_DB: path.join(dbDir, 'b124.db'), CASE_DB_DIR: import.meta.dirname },
+    encoding: 'utf-8', timeout: 30000
+  })
+  let J124 = null
+  try { J124 = JSON.parse(String(r124.stdout || '').trim().split(/\r?\n/).pop()) } catch (_) { /* 交给断言判失败,不静默绿 */ }
+  const dOf = (k) => (J124 && J124[k] && typeof J124[k].detail === 'string') ? J124[k].detail : null
+  const truncMarked = (s) => /已截断/.test(s) && /原长\s*2500/.test(s)
+  check('#124a0 前置:queryEvents 必须存在且能按 source 读回一条(读不到就没有"截断可见性"可谈)',
+    !!J124 && J124.hasQuery === true && dOf('long') !== null,
+    '解析=' + JSON.stringify(J124).substring(0, 200) + ' stderr=' + String(r124.stderr || '').slice(-160))
+  check('#124a1 红:超长 detail 读回必须自带"已截断 + 原长 2500"标记(现状 substring(0,2000) 静默砍尾)',
+    dOf('long') !== null && truncMarked(dOf('long')),
+    '长度=' + (dOf('long') || '').length + ' 尾部=' + JSON.stringify((dOf('long') || '').slice(-40)))
+  check('#124a2 反向自证(留痕不得变成噪音):未超长的 detail 读回必须一字不变,不得被追加任何标记',
+    dOf('short') === '普通止损原因,不含长内容', '实读=' + JSON.stringify(dOf('short')))
+  check('#124a3 边界哨兵:恰好 2000 字符属合法上限,不得被截也不得被标记(防实现把边界写成 >=)',
+    dOf('exact') === 'Y'.repeat(2000), '长度=' + (dOf('exact') || '').length + ' 含标记=' + /已截断/.test(dOf('exact') || ''))
+}
+
 section('#112) 行号锚点保真:源码/测试注释与说明书里的"点号锚点"必须指向真实非空行');
 {
   // 取证(基线 237d04a,分母由判据自身重算,不沿用盘点脚本输出——#100 的教训):

@@ -5,9 +5,9 @@
  * P0 静默清库对抗测试(隔离临时目录,无网络,指挥官亲笔 —— 锁定文件,编码手禁改)
  *
  * 针对的真实缺陷(两路独立审计收敛确认):
- *   store.js load()/loadList() 用 catch(_) 吞掉 JSON.parse 失败返回 {}/[]，
- *   而 loadMemory()(现锚点 store.js:271-277)/loadACL()(现 store.js:517-523) 把缺字段补成"合法空结构"，
- *   随后 saveSync(现 store.js:147;修复前是无条件 tmp+rename 覆写) —— 一次文件损坏或手改坏
+ *   store.js 的 load()/loadList() 用 catch(_) 吞掉 JSON.parse 失败返回 {}/[]，
+ *   而 loadMemory()/loadACL() 把缺字段补成"合法空结构"，
+ *   随后 saveSync() 无条件覆写(修复前是 tmp+rename 直接盖) —— 一次文件损坏或手改坏
  *   就会把任务历史洗成只剩 1 条、把 clients-acl.json 的 blocklist 清空(准入控制静默失效)。
  *
  * 契约(P0 要求):
@@ -207,6 +207,26 @@ if (scenario === 'normal') {
     q: store.isQuarantined('memory'), reason: store.quarantineReason('memory'),
     wrote: store.saveSync('memory', { tasks: [], meetings: [] }),
     dir: fs.readdirSync(process.env.AI_BRIDGE_DATA_DIR).filter(f => !/^logs/.test(f))
+  });
+} else if (scenario === 'meeting123') {
+  // #123 取证:把时钟钉死,同一毫秒连开两场会。现状 id 只有 Date.now() 一个因子 ⇒ 必然撞成同一个,
+  //   撞完之后 mem.meetings 里有两条同 id 记录,而 find(m => m.id === id) 永远只返回先建的那条
+  //   ⇒ 两个后台讨论循环共用同一条记录(发言串台、终态互相覆盖),且没有任何地方知道撞过。
+  const REAL_NOW = Date.now;
+  const PINNED = 1700000000000;
+  Date.now = () => PINNED;
+  const a123 = store.createMeeting('话题A', ['t1']);
+  const b123 = store.createMeeting('话题B', ['t2']);
+  Date.now = REAL_NOW;
+  const mem123 = store.loadMemory();
+  out({
+    idA: a123.meeting.id, idB: b123.meeting.id, distinct: a123.meeting.id !== b123.meeting.id,
+    prefixOk: /^meeting_/.test(a123.meeting.id) && /^meeting_/.test(b123.meeting.id),
+    foundA: mem123.meetings.filter(m => m.id === a123.meeting.id).length,
+    foundB: mem123.meetings.filter(m => m.id === b123.meeting.id).length,
+    total: mem123.meetings.length,
+    topics: mem123.meetings.map(m => m.topic).join('|'),
+    persistedA: a123.persisted === true, persistedB: b123.persisted === true
   });
 } else {
   process.exitCode = 3;
@@ -730,6 +750,21 @@ section('#62) 台账必须留住路由分解字段(requested/total/skipped),不�
   //   台账体积随调用增长、且 routing 内含运行期对象)。白名单必须**逐字段列举**,所以 routing 今天不收 ⇒ 断言它仍不存在。
   check('#62a2 反向哨兵:白名单仍是逐字段列举,不得"顺手"把整个 task 对象原样落盘(routing/dispatchId 不许进台账)',
     p.hasRouting === false, 'hasRouting=' + JSON.stringify(p.hasRouting));
+}
+
+// ── #123 建会 id 的同毫秒撞车 ──
+section('#123) 同一毫秒连开两场会不得撞 id(撞了=两个讨论循环共用同一条记录,且不可观测)');
+{
+  const m123 = runScenario('meeting123', 'meeting123').parsed || {};
+  check('#123a1 红:把时钟钉死在同一毫秒时,两次 createMeeting 必须拿到不同 id(现状 id 只有 Date.now 一个因子)',
+    m123.distinct === true && !!m123.idA && !!m123.idB,
+    'idA=' + JSON.stringify(m123.idA) + ' idB=' + JSON.stringify(m123.idB));
+  check('#123a2 撞车的下游必须可分辨:按各自 id 回查只命中一条、两场会都在册(total=2、话题各一)',
+    m123.foundA === 1 && m123.foundB === 1 && m123.total === 2 && m123.topics === '话题B|话题A',
+    'foundA=' + m123.foundA + ' foundB=' + m123.foundB + ' total=' + m123.total + ' topics=' + JSON.stringify(m123.topics));
+  check('#123a3 反向自证(修 id 不得修成不可读或不落盘):前缀仍是 meeting_,两场会都必须落盘成功',
+    m123.prefixOk === true && m123.persistedA === true && m123.persistedB === true,
+    'prefixOk=' + JSON.stringify(m123.prefixOk) + ' persistedA=' + JSON.stringify(m123.persistedA) + ' persistedB=' + JSON.stringify(m123.persistedB));
 }
 
 process.stdout.write('\n' + '='.repeat(40) + '\n');

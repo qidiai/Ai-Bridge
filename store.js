@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // 生产默认仍落在 ai-bridge 目录；测试可通过环境变量使用独立运行目录，
 // 避免隔离端口的 E2E 在执行期间改写生产服务正在读取的 JSON 文件。
@@ -280,10 +281,12 @@ function loadMemory () {
 // ── 会议(多 Agent 讨论) ──
 
 // #109:隔离期 saveSync 返回 false 不抛错,调用方必须知道建会有没有落盘;本函数是 store 内唯一曾丢弃该返回值的写点,故回传 { meeting, persisted }。
+// #123:Date.now 只有毫秒精度,同毫秒并发建会会撞出同一个 id;此时按 id 回查永远只命中先建的那条,
+// 两个讨论循环共用同一条记录(发言串台、终态互相覆盖),且撞车不可观测。故 id 追加 3 字节随机(6 位十六进制)保证同毫秒也唯一。
 function createMeeting (topic, participants) {
   const mem = loadMemory();
   const meeting = {
-    id: `meeting_${Date.now()}`,
+    id: `meeting_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
     ts: new Date().toISOString(),
     topic,
     participants: participants || [],
