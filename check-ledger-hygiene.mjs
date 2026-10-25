@@ -134,6 +134,8 @@ let headCommit = null
 let headNote = ''
 if (headRaw === null) {
   headNote = 'head 字段缺失或非字符串,head 不可解析'
+} else if (headRaw.startsWith('-') || !/^[0-9a-zA-Z._~^@{}+/-]{2,64}$/.test(headRaw)) {
+  headNote = 'head 字段形状非法,head 不可解析: ' + headRaw
 } else {
   const r = git(opts.repo, ['rev-parse', '--verify', headRaw + '^{commit}'])
   if (r.ok && r.out !== '') headCommit = r.out

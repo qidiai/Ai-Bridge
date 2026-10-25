@@ -91,7 +91,7 @@ try {
 
   if (!fs.existsSync(GUARD)) {
     process.stdout.write('守卫未实现,后续判据无法执行 —— 逐条记红(不许静默绿)\n');
-    for (const nm of ['#127a1', '#127a1b', '#127a2', '#127a2b', '#127a2c', '#127a3', '#127a4', '#127a5', '#127a6', '#127a6b', '#127a7', '#127a8']) {
+    for (const nm of ['#127a1', '#127a1b', '#127a2', '#127a2b', '#127a2c', '#127a3', '#127a4', '#127a5', '#127a6', '#127a6b', '#127a7', '#127a8', '#127a10', '#127a10b']) {
       check(nm + ' (依赖守卫实现)', false, '守卫脚本尚未实现');
     }
   } else {
@@ -203,6 +203,24 @@ try {
       '含字面 19 比较=' + (/===\s*19\b|==\s*19\b/.test(src)) + ' 含 Object.keys=' + /Object\.keys\(/.test(src));
     check('#127a8c 短哈希必须钉死为 short=7 口径(不依赖 core.abbrev 浮动的 %h)',
       /--short=7/.test(src), '源码含 --short=7=' + /--short=7/.test(src));
+    // ── a10 台账 head 是外部可控文本:以 - 开头可能被 git 当选项解析(选项注入面) ──
+    // 分两把尺,别再犯"锁文案"第 9 次:
+    //   a10  行为锁(现状已安全 ⇒ 本条应为绿,作用是防未来回归):注入 - 开头的 head 后,守卫必须 drift、逐面点名、回显原值
+    //   a10c 结构锁(现状缺 ⇒ 本条应为红):源码必须在把 head 交给 git **之前**做形状白名单,或用 --end-of-options 阻断选项解析
+    const evil = writeFixture('ledger-head-injection.json', j => { j.head = '--show-toplevel'; });
+    const g10 = runGuard([GUARD, '--repo', REPO, '--ledger', evil]);
+    const h10 = hitsOf(lineOf(g10.out, 'J1'));
+    check('#127a10 行为锁:注入以 - 开头的 head ⇒ 必须 drift(退出码非0、无 STATUS=ok)、J1 逐面点名、且原值被回显(不锁任何措辞)',
+      g10.code === 1 && !/STATUS=ok/.test(g10.out) && verdictOf(lineOf(g10.out, 'J1')) === 'FAIL' && h10 && h10.n === 0 && h10.total === N && g10.out.includes('--show-toplevel'),
+      '退出码=' + g10.code + ' J1=' + JSON.stringify(lineOf(g10.out, 'J1')) + ' 回显原值=' + g10.out.includes('--show-toplevel'));
+    check('#127a10b 行为锁补牙:仓库根路径绝不得被当成"解析成功的 head"写入(选项被 git 吞掉时的最坏形态)',
+      !lineOf(g10.out, 'J1').includes(REPO.replace(/\\/g, '/')) && g10.code === 1,
+      'J1行=' + JSON.stringify(lineOf(g10.out, 'J1')));
+    const src10 = fs.readFileSync(GUARD, 'utf-8');
+    const hasShapeGate = /--end-of-options/.test(src10) || /headRaw[^\n]*(startsWith\(['-]|match\(|test\()/.test(src10) || /\^\[-[0-9a-zA-Z]/.test(src10);
+    check('#127a10c 结构锁:head 交给 git 之前必须有形状白名单或 --end-of-options(否则台账文本可直接影响命令行解析,属注入面)',
+      hasShapeGate,
+      '含 --end-of-options=' + /--end-of-options/.test(src10) + ' 含 head 形状校验=' + /headRaw[^\n]*(startsWith\(|match\(|test\()/.test(src10));
   }
 
   // ── a9 真实台账全程只读(反向自证绝不允许污染原件) ──
