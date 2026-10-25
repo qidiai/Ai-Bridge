@@ -60,7 +60,7 @@ curl -s http://127.0.0.1:9800/v1/chat/completions \
 | `AI_BRIDGE_DAILY_TOKEN_BUDGET` | 无 | 每日 token 预算，超出时 /api/health 告警 |
 | `AI_BRIDGE_OLLAMA_BASE` | http://127.0.0.1:11434 | local-vl 模型的 Ollama 地址 |
 | `AI_BRIDGE_WORKSPACE_ROOT` | `~/.ai-bridge/workspaces` | 受管工作区根目录（托管目录创建/回收均限制在此） |
-| `AI_BRIDGE_TOOLSET` | full | 桥暴露的工具套餐：full=全部 15 个；lite=面向被派发 CLI 对端智能体的 5 工具精简面（dispatch/handoff/list_tools/memory_search/memory_recent）；非法值按 full |
+| `AI_BRIDGE_TOOLSET` | full | 桥暴露的工具套餐：full=全部 16 个；lite=面向被派发 CLI 对端智能体的 5 工具精简面（dispatch/handoff/list_tools/memory_search/memory_recent）；非法值按 full |
 
 | `AI_BRIDGE_MAX_CONCURRENT_DISPATCH` | 5 | 并发讨论/派发闸门额度（`server.js:66`，走 `parsePositiveInt`：非正数与坏值落默认） |
 | `AI_BRIDGE_RESULT_MAX_CHARS` | 2000 | dispatch 结果 `content` 截断上限（`server.js:67`，`parsePositiveInt`） |
@@ -149,18 +149,28 @@ node test-audit-fixes.mjs   # 137 项  审计修复验收（含结构锁 E/F/G/H
 node test-external-fixes.mjs# 55 项  外部模型审计修复（端口 9811）
 node test-e2e.mjs           # 260 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 死端口 9899（故意无人监听，验连接失败路径） + 第二实例 9821/9827/9830 + 第四实例 9841 + 注册表接缝与假 CLI 实例 9833/9834/9835，均不影响生产）
 npx eslint . --ext .js,.mjs # 0 error / 18 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
+node test-progress-watch.mjs    # 14 项  派工心跳观察器（隔离临时目录；判活五态与只读/无终止能力结构锁）
 node test-ledger-hygiene.mjs # 19 项  台账新鲜度守卫(旁挂只读,全绿路径自证 + 注入漂移必报名)
 node check-swallow-ratchet.mjs # 0=棘轮通过并打印 STATUS=ok / TOTAL=<实测>；非 0 时点名 GROWTH / SCOPE-DRIFT / TOTAL-SUM-CONFLICT。**只认 `--root/--baseline/--count/--update/--help`，位置参数直接报"未知参数"（默认根 = 脚本所在目录 = ai-bridge）**
 ```
 
-合计 **707 项**（分项机械相加 65+91+80+137+55+260=688 六套 + 19 第七套 = 707，不手算；旧值 615 是 #62 之前的快照，此后各套持续增判据而表未跟着涨，属"文档写着现状但已失真"，本轮起由 test-audit-fixes 的 #61 系与守卫共同盯）；`npm test` 只串了前四项，全量口径以七套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+合计 **721 项**（分项机械相加 65+91+80+137+55+260=688 六套 + 19 第七套 + 14 第八套 = 721，不手算；旧值 615 是 #62 之前的快照，此后各套持续增判据而表未跟着涨，属"文档写着现状但已失真"，本轮起由 test-audit-fixes 的 #61 系与守卫共同盯）；`npm test` 只串了前四项，全量口径以八套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
 
 
 ### 派发长任务前必读（超时口径）
 
-- MCP 的 `dispatch` 工具是**同步** HTTP 往返：中枢窗口默认 15 分钟（`AI_BRIDGE_EXECUTE_TIMEOUT`），桥预算默认 16 分钟（`AI_BRIDGE_HTTP_TIMEOUT`）。**超过窗口的任务现在没有可用的规避路径**——中枢本身支持 `async: true` 异步队列（`/api/dispatch`），但 15 个 MCP 工具既没有 `async` 入参、也没有取回异步结果的工具（见「已知问题」#58）。
+- MCP 的 `dispatch` 工具是**同步** HTTP 往返：中枢窗口默认 15 分钟（`AI_BRIDGE_EXECUTE_TIMEOUT`），桥预算默认 16 分钟（`AI_BRIDGE_HTTP_TIMEOUT`）。超过窗口的任务**走异步**：`dispatch` 已带 `async` 入参（#58），受理后立刻交回 `taskId`，再用 `task_status` 轮询取回（`running` / `done` / `failed`；taskId 不存在时如实报"任务不存在"）。仍待补的是**按次覆盖超时**：`timeout_ms` 的 body→`doDispatch`→`opts.timeout` 三段通路还没接通（#129），现在要给某个工具更多时间只能改 `tools.json` 档位并重启中枢（`tool-registry.js` 启动时读一次，无热加载）。
 - 中枢侧**不会**因为宿主放弃而停止执行：客户端断开/超时后，任务照常跑完并烧配额，只是结果回不到调用方。这也是台账里曾出现 `Command exited with code null` 的同一族问题。
 - 桥侧对超时已改为如实归因：`命令被信号 SIGTERM 终止(超时预算 Nms 用尽…): <输出尾部>`，不再输出 `code null` + 启动横幅。要看真因请查 `/api/traffic` 的 `error` 字段（持久化在 SQLite 流量表，含正文）。
+
+### 派工心跳契约（判活看**新步骤**，不看字节增长）
+
+派给子代理或对端智能体的活"看不见它在干什么"是本会话实测缺陷：一次 291.6s 的真实审稿只回传 68 字符，另一次跑到 600s 被信号终止只剩尾部 247 字符；而对进行中的派发，`GET /api/health` 只给一个计数 `activeDispatches=1`。中枢侧步骤流上收是 #132；Qoder 子代理侧平台不推流，所以先用**被派工者自己每步落盘**这个等价物。
+
+- **契约**：每完成一步就往 `progress-<编号>.jsonl` 追加一行 JSON：`{"ts":"<ISO>","seq":<从1递增不重复>,"step":"plan|read|write|test-run|test-result|blocker|handback","detail":"<≤200字符>","files":[…],"checks":{"<命令>":<退出码>}}`。动手前落 `plan`；思考/读码也要落 `read`；收尾必须落 `handback`（半成品也要落，不许沉默退出）。
+- **每份派工单两条必填**：墙钟预算（分钟）+ 本契约全文。超预算先 `blocker` 再 `handback`。
+- **观察器**：`node ai-bridge/watch-agent-progress.mjs --file <心跳绝对路径> --budget-ms <n> [--stale-ms 60000] [--interval-ms 5000] [--once]`。只读、无任何终止能力（杀不杀由指挥官决定）。`VERDICT=` 五态：`WORKING`（新鲜且 `distinct seq ≥ 2`）/ `THINKING`（新鲜但 seq 未推进 ⇒ **绝不判死**，慢或想得多是合法的）/ `STALLED`（静默超阈值但预算未超 ⇒ 只报）/ `STALE`（静默超阈值**且**预算用满 ⇒ 可收割，退出码 1）/ `STALE-NO-HEARTBEAT`（无文件或一行都解析不出，退出码 1）。坏行给 `CONTRACT-BAD-LINE: <行号>`；数字参数非法一律退出码 2 并点名参数（#96 同族）；单行输出硬顶 400 字符。
+- **当前用法一律带 `--once`**：不带它时 `STALLED` 因预算未超而永不退出（判据如此设计），常驻命令会一直打印；退出开关挂在 #136。
 
 ## 工作区管理
 
@@ -228,13 +238,14 @@ curl -X POST http://127.0.0.1:9800/api/dispatch -H "Content-Type: application/js
 }
 ```
 
-### 全量工具清单（15 个）
+### 全量工具清单（16 个）
 
-默认套餐（`AI_BRIDGE_TOOLSET=full`）下 `tools/list` 暴露以下 15 个工具，「用途」逐字摘自 `bridge-stdio.js` 的 description：
+默认套餐（`AI_BRIDGE_TOOLSET=full`）下 `tools/list` 暴露以下 16 个工具，「用途」逐字摘自 `bridge-stdio.js` 的 description：
 
 | 工具 | 用途 |
 |------|------|
 | `dispatch` | 把任务分发给已开启的工具(可多个并行)。工具限额/断开时自动转给其他工具接力。返回代码产出和 token 用量。 |
+| `task_status` | 查询异步派发任务的状态与结果:传 dispatch 异步受理时返回的 taskId。状态为 running(后台执行中)/ done(已完成,给结果要点)/ failed(失败,给原因);taskId 不存在时如实报"任务不存在"。 |
 | `list_tools` | 列出所有工具:检测状态 + 开关状态 + 累计 token |
 | `toggle_tool` | 打开/关闭工具开关 |
 | `list_switches` | 查看所有工具开关状态 |
@@ -393,7 +404,7 @@ node watchdog.js    # 自动重启 + 熔断（连续崩溃5次停止）
 ai-bridge/
 ├── server.js              # HTTP 常驻服务 (40+ API 端点)
 ├── codely-client.js       # 团结 LiteLLM 客户端(凭据/签名/UA跟版/请求)
-├── bridge-stdio.js        # MCP stdio 桥接器 (全量 15 个 MCP 工具;AI_BRIDGE_TOOLSET=lite 时 5 个)
+├── bridge-stdio.js        # MCP stdio 桥接器 (全量 16 个 MCP 工具;AI_BRIDGE_TOOLSET=lite 时 5 个)
 ├── tool-registry.js       # 配置驱动工具注册表
 ├── workspace-manager.js   # 工作区注册表（登记/受管/归档/租约）
 ├── routing-score.js       # 7维复合路由评分
