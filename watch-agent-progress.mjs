@@ -19,12 +19,18 @@
  *   {"ts":"<ISO>","seq":<int>,"step":"plan|read|write|test-run|test-result|blocker|handback",
  *    "detail":"<文本>","files":[...],"checks":{...}}
  *
- * 五态判定(互斥且完备,严格按此顺序短路):
- *   1. 文件不存在 / 无一条可解析               ⇒ STALE-NO-HEARTBEAT  exit 1
- *   2. 心跳过期 且 预算已超                    ⇒ STALE                exit 1
- *   3. 心跳过期 但 预算未超                    ⇒ STALLED              exit 0(只报,不建议收割)
- *   4. 新鲜 且 distinct seq >= 2               ⇒ WORKING              exit 0
- *   5. 新鲜 但 distinct seq <= 1               ⇒ THINKING             exit 0
+ * 七态判定(互斥且完备,严格按此顺序短路;终态只认"按 ts 最后那一条"心跳):
+ *   1. 文件不存在 / 无一条可解析                ⇒ STALE-NO-HEARTBEAT  exit 1
+ *   2. 末条心跳 step=handback(已交工)         ⇒ HANDED-BACK          exit 0 ← 终态,优先级高于静默钟与活跃度
+ *   3. 末条心跳 step=blocker(自报停工)        ⇒ BLOCKED              exit 0 ← 同上(申报停工 ≠ 卡死)
+ *   4. 非终态 且 心跳过期 且 预算已超           ⇒ STALE                exit 1
+ *   5. 非终态 且 心跳过期 但 预算未超           ⇒ STALLED              exit 0(只报,不建议收割)
+ *   6. 新鲜 且 distinct seq >= 2                ⇒ WORKING              exit 0
+ *   7. 新鲜 但 distinct seq <= 1                ⇒ THINKING             exit 0
+ *
+ * #135: handback/blocker 是被派工者**自己申报的终止态**,静默再久也不叫卡死 ⇒ 必须先于第 4~7 条判。
+ *   但终态判据只许看"按 ts 最后那一条":文件中间出现过 handback、更晚还有一条 read ⇒ 不算终态,
+ *   仍走第 4~7 条。否则任何带 handback 的文件都永不判死,修复会变成新缺陷。
  *
  * 只读承诺: 本文件没有任何写盘调用,也没有任何中断/终止能力(收割由指挥官决定)。
  */
@@ -49,6 +55,16 @@ const VERDICT_STALE = 'STALE';
 const VERDICT_STALLED = 'STALLED';
 const VERDICT_WORKING = 'WORKING';
 const VERDICT_THINKING = 'THINKING';
+// #135: 被派工者自我申报的两个终态(终态步骤名与 verdict 名都具名,判据里不散写字面量)。
+const VERDICT_HANDED_BACK = 'HANDED-BACK';
+const VERDICT_BLOCKED = 'BLOCKED';
+
+const STEP_HANDBACK = 'handback';
+const STEP_BLOCKER = 'blocker';
+const TERMINAL_STEP_VERDICTS = new Map([
+  [STEP_HANDBACK, VERDICT_HANDED_BACK],
+  [STEP_BLOCKER, VERDICT_BLOCKED]
+]);
 
 function usageError (message) {
   const err = new Error(message);
@@ -140,7 +156,7 @@ function parseBeat (line) {
   };
 }
 
-// 只读一次文件;文件不存在不算异常,交给五态判定的第 1 条处理。
+// 只读一次文件;文件不存在不算异常,交给七态判定的第 1 条处理。
 function readHeartbeats (filePath) {
   let raw;
   try {
@@ -176,7 +192,7 @@ function clipDetail (detail) {
 }
 
 /**
- * 五态判定。nowMs 由调用方在一次采样里只读一次 Date.now(),age 与 budget 共用同一个钟。
+ * 七态判定。nowMs 由调用方在一次采样里只读一次 Date.now(),age 与 budget 共用同一个钟。
  *   heartbeat_age_ms = now - max(ts)   —— "最近一次心跳离现在多久"(看它还在不在动)
  *   budget_used_ms   = now - min(ts)   —— 心跳文件里最早的证据离现在多久;不用进程启动时刻,
  *                     因为观察器可能在派发途中才被拉起,用启动时刻会把已跑的时长算丢,让 STALE 误报。
@@ -222,6 +238,15 @@ function evaluate (state, opts, nowMs) {
     budgetUsedMs,
     lastBeat
   };
+  // ── 终态短路(#135)━━ 只看 lastBeat = 按 ts 最大的那一条。━━━━━━━━━━━━━━━━━━━━━
+  // handback(已交工)/ blocker(自报停工)是被派工者申报的终止态,不是卡死:
+  // 静默再久、预算再超、seq 再新鲜,都不得判 STALE(建议收割)也不得判 WORKING。
+  // 反向:文件中间出现过 handback 但更晚还有一条 read ⇒ lastBeat.step 是 read,
+  //   这里自然不命中,继续走下面的时间/活跃度判据(带 handback 的文件仍会判死)。
+  const terminalVerdict = TERMINAL_STEP_VERDICTS.get(lastBeat.step);
+  if (terminalVerdict !== undefined) {
+    return Object.assign({ verdict: terminalVerdict, exitCode: 0 }, common);
+  }
   if (heartbeatAgeMs > opts.staleMs && budgetUsedMs > opts.budgetMs) {
     return Object.assign({ verdict: VERDICT_STALE, exitCode: 1 }, common);
   }

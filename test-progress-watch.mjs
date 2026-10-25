@@ -22,15 +22,20 @@
  *                            "detail":"<≤200字符>","files":[...],"checks":{...}}
  *
  * 输出协议(断言只解析这些标记,不锁任何自然语言措辞):
- *   VERDICT=<WORKING|THINKING|STALLED|STALE|STALE-NO-HEARTBEAT>
+ *   VERDICT=<WORKING|THINKING|STALLED|STALE|STALE-NO-HEARTBEAT|HANDED-BACK|BLOCKED>
  *   metrics: seq=<n> distinct=<n> heartbeat_age_s=<f> budget_used_ms=<n> budget_limit_ms=<n> files=<n>
  *   仅当存在解析失败的行时输出: CONTRACT-BAD-LINE: <行号,行号,...>
- *   状态判据(必须严格按此实现,五态互斥且完备):
+ *   状态判据(必须严格按此实现,七态互斥且完备):
  *     STALE-NO-HEARTBEAT  文件不存在或无一条可解析 ⇒ exit 1
- *     STALE               heartbeat_age_ms > stale_ms 且 budget_used_ms > budget_ms ⇒ exit 1
- *     STALLED             heartbeat_age_ms > stale_ms 但预算未超 ⇒ exit 0(只报,不建议收割)
+ *     HANDED-BACK         **最后一条心跳(按 ts 最大)的 step=handback** ⇒ exit 0，优先级高于静默钟
+ *     BLOCKED             **最后一条心跳的 step=blocker** ⇒ exit 0，同上（自我申报停工不等于卡死）
+ *     STALE               非终态且 heartbeat_age_ms > stale_ms 且 budget_used_ms > budget_ms ⇒ exit 1
+ *     STALLED             非终态且 heartbeat_age_ms > stale_ms 但预算未超 ⇒ exit 0(只报,不建议收割)
  *     WORKING             年龄新鲜且 distinct seq ≥ 2 ⇒ exit 0
  *     THINKING            年龄新鲜但 distinct seq ≤ 1(在同一个判断里)⇒ exit 0
+ *   #135 的本会话实测红：交工后静默会被时间判据误判 STALE（可收割），而 handback/blocker 是
+ *   被派工者自己申报的**终止态**；但终态判据必须只看"按 ts 最后那一条"，否则一个文件里只要
+ *   出现过 handback 就永不判死，STALE 会被新缺陷抵消。
  *   detail 超长必须截断且带标记(…(已截断,原长 N 字符) 或等价的"截断/truncat"字样),
  *   且**任何单行输出 ≤ 400 字符**(防灌爆指挥官终端)。
  *   只许读: 不得有任何写盘 API;不得有任何终止/中断能力(收割由指挥官决定)。
@@ -73,7 +78,7 @@ try {
     fs.existsSync(WATCHER) ? WATCHER : '文件不存在: ai-bridge/watch-agent-progress.mjs(红基线预期)');
 
   if (!fs.existsSync(WATCHER)) {
-    for (const n of ['#130a1', '#130a2', '#130a2b', '#130a3', '#130a4', '#130a5', '#130a6', '#130a7', '#130a8', '#130a9a', '#130a9b', '#130a9c', '#130a10']) {
+    for (const n of ['#130a1', '#130a2', '#130a2b', '#130a3', '#130a4', '#130a5', '#130a6', '#130a7', '#130a8', '#130a9a', '#130a9b', '#130a9c', '#130a10', '#135a1', '#135a2', '#135a3', '#135a4', '#135a5']) {
       check(n + ' (依赖观察器实现)', false, '观察器尚未实现');
     }
   } else {
@@ -134,6 +139,34 @@ try {
     const r1b = run(['--file', f1, '--budget-ms', '600000', '--stale-ms', '60000', '--once']);
     check('#130a10 同一份输入两次判定必须一致(判据不许掺随机或依赖遍历顺序)',
       r1b.verdict === r1.verdict && r1b.code === r1.code, '第一次=' + r1.verdict + '/' + r1.code + ' 第二次=' + r1b.verdict + '/' + r1b.code);
+
+    // ── #135 终止态与卡死分开(交工/停工的自我申报不得被静默钟判死) ──
+    const t1 = mk('p135-handback-stale.jsonl', [hb(1, 120000, 'read'), hb(2, 110000, 'handback')]);
+    const q1 = run(['--file', t1, '--budget-ms', '60000', '--stale-ms', '30000', '--once']);
+    check('#135a1 已交工(handback)且静默超 stale、预算用满 ⇒ 必须 HANDED-BACK 且退出码 0,绝不可判 STALE(判死=建议收割已完成的工作)',
+      q1.verdict === 'HANDED-BACK' && q1.code === 0, 'verdict=' + q1.verdict + ' 退出码=' + q1.code + ' 输出=' + JSON.stringify(q1.out.replace(/\r?\n/g, ' | ').substring(0, 200)));
+
+    const t2 = mk('p135-blocker-stale.jsonl', [hb(1, 120000, 'read'), hb(2, 110000, 'blocker')]);
+    const q2 = run(['--file', t2, '--budget-ms', '60000', '--stale-ms', '30000', '--once']);
+    check('#135a2 自报停工(blocker)且静默超 stale、预算用满 ⇒ 必须 BLOCKED 且退出码 0(停工是被派工者申报的终态,不是卡死)',
+      q2.verdict === 'BLOCKED' && q2.code === 0, 'verdict=' + q2.verdict + ' 退出码=' + q2.code + ' 输出=' + JSON.stringify(q2.out.replace(/\r?\n/g, ' | ').substring(0, 200)));
+
+    const t3 = mk('p135-handback-fresh.jsonl', [hb(1, 3000, 'read'), hb(2, 1000, 'handback')]);
+    const q3 = run(['--file', t3, '--budget-ms', '600000', '--stale-ms', '60000', '--once']);
+    check('#135a3 刚交工完 1 秒(新鲜)⇒ 仍是 HANDED-BACK,不得因"新鲜+多步"被判 WORKING/THINKING(终态优先于活跃度)',
+      q3.verdict === 'HANDED-BACK' && q3.code === 0, 'verdict=' + q3.verdict + ' 退出码=' + q3.code);
+
+    const t4 = mk('p135-testrun-stale.jsonl', [hb(1, 120000, 'read'), hb(2, 110000, 'test-run')]);
+    const q4 = run(['--file', t4, '--budget-ms', '60000', '--stale-ms', '30000', '--once']);
+    check('#135a4 反向锁:同样静默 110s+预算超满但末步是 test-run ⇒ 仍必须 STALE 且退出码 1(修终态不许把判死能力阉掉)',
+      q4.verdict === 'STALE' && q4.code === 1, 'verdict=' + q4.verdict + ' 退出码=' + q4.code);
+
+    const t5 = mk('p135-handback-then-work.jsonl', [hb(1, 110000, 'handback'), hb(2, 1000, 'read')]);
+    const q5 = run(['--file', t5, '--budget-ms', '600000', '--stale-ms', '60000', '--once']);
+    check('#135a5 反向锁:文件里出现过 handback 但按 ts 最后一条是 read ⇒ 不得判终态(终态只看最后一条,否则带 handback 的文件永不判死)',
+      q5.verdict !== 'HANDED-BACK' && q5.verdict !== 'BLOCKED' && q5.verdict === 'WORKING' && q5.code === 0,
+      'verdict=' + q5.verdict + ' 退出码=' + q5.code);
+
   }
 } finally {
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { process.stdout.write('清理临时目录失败: ' + e.message + '\n'); }

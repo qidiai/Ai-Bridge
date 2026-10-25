@@ -149,12 +149,12 @@ node test-audit-fixes.mjs   # 137 项  审计修复验收（含结构锁 E/F/G/H
 node test-external-fixes.mjs# 55 项  外部模型审计修复（端口 9811）
 node test-e2e.mjs           # 260 项 全链路 E2E（主中枢 9810 + 假中枢 9813 + 黑洞 9814/9815 + 死端口 9899（故意无人监听，验连接失败路径） + 第二实例 9821/9827/9830 + 第四实例 9841 + 注册表接缝与假 CLI 实例 9833/9834/9835，均不影响生产）
 npx eslint . --ext .js,.mjs # 0 error / 18 warning（warning 为既有基线；**必须在 ai-bridge/ 目录内跑**，仓根跑会命中指挥官未提交的 WIP 而报出上千条无关错误）
-node test-progress-watch.mjs    # 14 项  派工心跳观察器（隔离临时目录；判活五态与只读/无终止能力结构锁）
+node test-progress-watch.mjs    # 19 项  派工心跳观察器（隔离临时目录；判活七态含终态优先、反向锁"判死能力未被阉"与只读/无终止能力结构锁）
 node test-ledger-hygiene.mjs # 19 项  台账新鲜度守卫(旁挂只读,全绿路径自证 + 注入漂移必报名)
 node check-swallow-ratchet.mjs # 0=棘轮通过并打印 STATUS=ok / TOTAL=<实测>；非 0 时点名 GROWTH / SCOPE-DRIFT / TOTAL-SUM-CONFLICT。**只认 `--root/--baseline/--count/--update/--help`，位置参数直接报"未知参数"（默认根 = 脚本所在目录 = ai-bridge）**
 ```
 
-合计 **721 项**（分项机械相加 65+91+80+137+55+260=688 六套 + 19 第七套 + 14 第八套 = 721，不手算；旧值 615 是 #62 之前的快照，此后各套持续增判据而表未跟着涨，属"文档写着现状但已失真"，本轮起由 test-audit-fixes 的 #61 系与守卫共同盯）；`npm test` 只串了前四项，全量口径以八套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
+合计 **726 项**（分项机械相加 65+91+80+137+55+260=688 六套 + 19 第七套 + 19 第八套 = 726，不手算；旧值 615 是 #62 之前的快照，此后各套持续增判据而表未跟着涨，属"文档写着现状但已失真"，本轮起由 test-audit-fixes 的 #61 系与守卫共同盯）；`npm test` 只串了前四项，全量口径以八套件为准。合并纪律：**同一棵树连跑两轮同数全绿**才算过（编码手贴的输出不作数，指挥官亲跑才作数）。E2E 会自举隔离数据目录（`AI_BRIDGE_DATA_DIR`/`AI_BRIDGE_DB`/`AI_BRIDGE_WORKSPACE_ROOT` 全部指向套件自建的临时运行目录），不会写生产数据；测后自动清理并打印"生产数据未改写"（已知残留见 #63：Windows 下 SQLite 句柄未关，`test-runtime-data/` 可能留 `*.db-journal`）。
 
 
 ### 派发长任务前必读（超时口径）
@@ -169,8 +169,9 @@ node check-swallow-ratchet.mjs # 0=棘轮通过并打印 STATUS=ok / TOTAL=<实�
 
 - **契约**：每完成一步就往 `progress-<编号>.jsonl` 追加一行 JSON：`{"ts":"<ISO>","seq":<从1递增不重复>,"step":"plan|read|write|test-run|test-result|blocker|handback","detail":"<≤200字符>","files":[…],"checks":{"<命令>":<退出码>}}`。动手前落 `plan`；思考/读码也要落 `read`；收尾必须落 `handback`（半成品也要落，不许沉默退出）。
 - **每份派工单两条必填**：墙钟预算（分钟）+ 本契约全文。超预算先 `blocker` 再 `handback`。
-- **观察器**：`node ai-bridge/watch-agent-progress.mjs --file <心跳绝对路径> --budget-ms <n> [--stale-ms 60000] [--interval-ms 5000] [--once]`。只读、无任何终止能力（杀不杀由指挥官决定）。`VERDICT=` 五态：`WORKING`（新鲜且 `distinct seq ≥ 2`）/ `THINKING`（新鲜但 seq 未推进 ⇒ **绝不判死**，慢或想得多是合法的）/ `STALLED`（静默超阈值但预算未超 ⇒ 只报）/ `STALE`（静默超阈值**且**预算用满 ⇒ 可收割，退出码 1）/ `STALE-NO-HEARTBEAT`（无文件或一行都解析不出，退出码 1）。坏行给 `CONTRACT-BAD-LINE: <行号>`；数字参数非法一律退出码 2 并点名参数（#96 同族）；单行输出硬顶 400 字符。
-- **当前用法一律带 `--once`**：不带它时 `STALLED` 因预算未超而永不退出（判据如此设计），常驻命令会一直打印；退出开关挂在 #136。
+- **观察器**：`node ai-bridge/watch-agent-progress.mjs --file <心跳绝对路径> --budget-ms <n> [--stale-ms 60000] [--interval-ms 5000] [--once]`。只读、无任何终止能力（杀不杀由指挥官决定）。`VERDICT=` 七态，**终态优先于静默钟与活跃度**：`HANDED-BACK`（按 ts 最后一条心跳 `step=handback` ⇒ 已交工，退出码 0；静默再久、预算再超都不叫卡死）/ `BLOCKED`（最后一条 `step=blocker` ⇒ 自己申报停工，退出码 0）/ `WORKING`（非终态，新鲜且 `distinct seq ≥ 2`）/ `THINKING`（非终态，新鲜但 seq 未推进 ⇒ **绝不判死**，慢或想得多是合法的）/ `STALLED`（非终态，静默超阈值但预算未超 ⇒ 只报）/ `STALE`（非终态，静默超阈值**且**预算用满 ⇒ 可收割，退出码 1）/ `STALE-NO-HEARTBEAT`（无文件或一行都解析不出，退出码 1）。终态**只认按 ts 最后那一条**：文件中间出现过 `handback` 而更晚还有 `read` 不算交工，仍会判死（否则任何带 handback 的心跳都永不判死，修复就变成新缺陷）。坏行给 `CONTRACT-BAD-LINE: <行号>`；数字参数非法一律退出码 2 并点名参数（#96 同族）；单行输出硬顶 400 字符。
+- **终态步骤名要精确小写**：判据按 `handback`/`blocker` 字面量精确匹配，写成 `Handback`、`handback `（尾随空格）或中文步骤名都不算终态，会落回时间判据 ⇒ 已交工的可能被判 `STALE`。归一化是 **#141**（未修）。
+- **当前用法一律带 `--once`**：不带它时，凡退出码 0 的判据都不会结束常驻命令（`STALLED` 因预算未超而不退出，#135 新增的 `HANDED-BACK`/`BLOCKED` 同为退出码 0，也会一直重复打印）；退出开关挂在 #136。
 
 ## 工作区管理
 
