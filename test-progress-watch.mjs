@@ -27,7 +27,7 @@
  *   仅当存在解析失败的行时输出: CONTRACT-BAD-LINE: <行号,行号,...>
  *   状态判据(必须严格按此实现,七态互斥且完备):
  *     STALE-NO-HEARTBEAT  文件不存在或无一条可解析 ⇒ exit 1
- *     HANDED-BACK         **最后一条心跳(按 ts 最大)的 step=handback** ⇒ exit 0，优先级高于静默钟
+ *     HANDED-BACK         **最后一条心跳(按 ts 最大;ts 相等取文件里靠后者)的 step=handback** ⇒ exit 0，优先级高于静默钟
  *     BLOCKED             **最后一条心跳的 step=blocker** ⇒ exit 0，同上（自我申报停工不等于卡死）
  *     STALE               非终态且 heartbeat_age_ms > stale_ms 且 budget_used_ms > budget_ms ⇒ exit 1
  *     STALLED             非终态且 heartbeat_age_ms > stale_ms 但预算未超 ⇒ exit 0(只报,不建议收割)
@@ -36,6 +36,10 @@
  *   #135 的本会话实测红：交工后静默会被时间判据误判 STALE（可收割），而 handback/blocker 是
  *   被派工者自己申报的**终止态**；但终态判据必须只看"按 ts 最后那一条"，否则一个文件里只要
  *   出现过 handback 就永不判死，STALE 会被新缺陷抵消。
+ *   #143 追加口径：**"按 ts 最后那一条"在 ts 相等(平局)时必须取文件里靠后的那条**(后写者胜)。
+ *   选 lastBeat 若用严格 `>`,平局会保留先出现的那条 ⇒ 同秒写 [read,handback] 时交工申报被吞、
+ *   已交工的仍被判 STALE/退 1;同秒写 [handback,read] 时又会把还在干活的钉成终态。
+ *   契约只要求 ts 是 ISO、**不强制毫秒精度**,故宿主写秒级粒度时同秒两步必然并列,这不是极端输入。
  *   detail 超长必须截断且带标记(…(已截断,原长 N 字符) 或等价的"截断/truncat"字样),
  *   且**任何单行输出 ≤ 400 字符**(防灌爆指挥官终端)。
  *   只许读: 不得有任何写盘 API;不得有任何终止/中断能力(收割由指挥官决定)。
@@ -70,6 +74,8 @@ function mk (name, lines) {
 const now = () => Date.now();
 const iso = (ms) => new Date(ms).toISOString();
 const hb = (seq, ageMs, step, detail) => JSON.stringify({ ts: iso(now() - ageMs), seq, step: step || 'read', detail: detail || ('第 ' + seq + ' 步'), files: ['ai-bridge/x.js'], checks: {} });
+// 平局用例必须共享同一个 ts 字面量:两次 now() 会差亚毫秒,判据就变成随机锁(#115 同族的假红)
+const hbTs = (seq, tsIso, step, detail) => JSON.stringify({ ts: tsIso, seq, step: step || 'read', detail: detail || ('第 ' + seq + ' 步'), files: ['ai-bridge/x.js'], checks: {} });
 
 process.stdout.write('#130 派工心跳观察器对抗测试 (隔离临时目录,无网络,不占端口)\n');
 
@@ -78,7 +84,7 @@ try {
     fs.existsSync(WATCHER) ? WATCHER : '文件不存在: ai-bridge/watch-agent-progress.mjs(红基线预期)');
 
   if (!fs.existsSync(WATCHER)) {
-    for (const n of ['#130a1', '#130a2', '#130a2b', '#130a3', '#130a4', '#130a5', '#130a6', '#130a7', '#130a8', '#130a9a', '#130a9b', '#130a9c', '#130a10', '#135a1', '#135a2', '#135a3', '#135a4', '#135a5']) {
+    for (const n of ['#130a1', '#130a2', '#130a2b', '#130a3', '#130a4', '#130a5', '#130a6', '#130a7', '#130a8', '#130a9a', '#130a9b', '#130a9c', '#130a10', '#135a1', '#135a2', '#135a3', '#135a4', '#135a5', '#143a1', '#143a2', '#143a3', '#143a4']) {
       check(n + ' (依赖观察器实现)', false, '观察器尚未实现');
     }
   } else {
@@ -166,6 +172,39 @@ try {
     check('#135a5 反向锁:文件里出现过 handback 但按 ts 最后一条是 read ⇒ 不得判终态(终态只看最后一条,否则带 handback 的文件永不判死)',
       q5.verdict !== 'HANDED-BACK' && q5.verdict !== 'BLOCKED' && q5.verdict === 'WORKING' && q5.code === 0,
       'verdict=' + q5.verdict + ' 退出码=' + q5.code);
+
+    // ── #143 ts 平局(同一毫秒/秒级粒度)时"末条"归属 ──
+    // 病灶:选 lastBeat 用严格大于 ⇒ 同 ts 打平时保留文件里**先出现**的那条,与规则自己写的
+    // "按 ts 最后那一条"相反。契约只要求 ts 是 ISO、不强制毫秒精度,宿主写秒级粒度时同秒两步必然并列。
+    const T_stale = iso(now() - 120000);   // 静默 120s:超 stale(30s) 且超预算(60s)
+    const T_fresh = iso(now() - 2000);     // 新鲜:远低于 stale(60s)
+
+    const z1 = mk('p143-tie-fresh.jsonl', [hbTs(1, T_fresh, 'read'), hbTs(2, T_fresh, 'handback')]);
+    const z1r = run(['--file', z1, '--budget-ms', '600000', '--stale-ms', '60000', '--once']);
+    check('#143a1 同一 ts 的 [read, handback](新鲜)⇒ 必须 HANDED-BACK 且退出码 0(后写者胜,交工申报不得被平局吞掉)',
+      z1r.verdict === 'HANDED-BACK' && z1r.code === 0,
+      'verdict=' + z1r.verdict + ' 退出码=' + z1r.code + ' 两行 ts 完全相同=' + JSON.stringify(T_fresh));
+
+    const z2 = mk('p143-tie-stale.jsonl', [hbTs(1, T_stale, 'read'), hbTs(2, T_stale, 'handback')]);
+    const z2r = run(['--file', z2, '--budget-ms', '60000', '--stale-ms', '30000', '--once']);
+    check('#143a2 同一 ts 的 [read, handback](静默超 stale 且预算用满)⇒ 仍必须 HANDED-BACK 退出码 0,绝不可判 STALE(#135 的误判在平局场景复活)',
+      z2r.verdict === 'HANDED-BACK' && z2r.code === 0,
+      'verdict=' + z2r.verdict + ' 退出码=' + z2r.code + ' 输出=' + JSON.stringify(z2r.out.replace(/\r?\n/g, ' | ').substring(0, 200)));
+
+    const z3 = mk('p143-tie-reverse.jsonl', [hbTs(1, T_fresh, 'handback'), hbTs(2, T_fresh, 'read')]);
+    const z3r = run(['--file', z3, '--budget-ms', '600000', '--stale-ms', '60000', '--once']);
+    check('#143a3 反向锁:同一 ts 的 [handback, read] ⇒ 末条是 read,不得判终态(修平局不许把"见过 handback"变成永久免死)',
+      z3r.verdict !== 'HANDED-BACK' && z3r.verdict !== 'BLOCKED' && z3r.verdict === 'WORKING' && z3r.code === 0,
+      'verdict=' + z3r.verdict + ' 退出码=' + z3r.code);
+
+    const z4base = now();   // 单一基准:两条只差 1ms 必须由同一时刻派生,否则两次 now() 的耗时会抹平甚至反超该差值
+    const z4lines = [hbTs(1, iso(z4base - 120000), 'read'), hbTs(2, iso(z4base - 119999), 'handback')];
+    const z4 = mk('p143-nontie-control.jsonl', z4lines);
+    const z4r = run(['--file', z4, '--budget-ms', '60000', '--stale-ms', '30000', '--once']);
+    check('#143a4 对照组:ts 只差 1ms(非平局)的 [read, handback] ⇒ HANDED-BACK 退出码 0(钉死 #143a1/a2 的根因是平局,不是终态逻辑本身)',
+      z4r.verdict === 'HANDED-BACK' && z4r.code === 0,
+      'verdict=' + z4r.verdict + ' 退出码=' + z4r.code);
+
 
   }
 } finally {

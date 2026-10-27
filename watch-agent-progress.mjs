@@ -19,7 +19,8 @@
  *   {"ts":"<ISO>","seq":<int>,"step":"plan|read|write|test-run|test-result|blocker|handback",
  *    "detail":"<文本>","files":[...],"checks":{...}}
  *
- * 七态判定(互斥且完备,严格按此顺序短路;终态只认"按 ts 最后那一条"心跳):
+ * 七态判定(互斥且完备,严格按此顺序短路;终态只认"按 ts 最后那一条"心跳;
+ *   ts 相等的多条按**文件里更靠后**的那条算末条——契约不强制毫秒精度,同秒并列是常态):
  *   1. 文件不存在 / 无一条可解析                ⇒ STALE-NO-HEARTBEAT  exit 1
  *   2. 末条心跳 step=handback(已交工)         ⇒ HANDED-BACK          exit 0 ← 终态,优先级高于静默钟与活跃度
  *   3. 末条心跳 step=blocker(自报停工)        ⇒ BLOCKED              exit 0 ← 同上(申报停工 ≠ 卡死)
@@ -31,6 +32,8 @@
  * #135: handback/blocker 是被派工者**自己申报的终止态**,静默再久也不叫卡死 ⇒ 必须先于第 4~7 条判。
  *   但终态判据只许看"按 ts 最后那一条":文件中间出现过 handback、更晚还有一条 read ⇒ 不算终态,
  *   仍走第 4~7 条。否则任何带 handback 的文件都永不判死,修复会变成新缺陷。
+ *   #143: "最后那一条"含平局规则——ts 相等时取**文件里靠后**的那条(秒级粒度下同秒两步必然并列),
+ *   于是同 ts 的 [read, handback] 判终态、同 ts 的 [handback, read] 判 WORKING,两边都不误判。
  *
  * 只读承诺: 本文件没有任何写盘调用,也没有任何中断/终止能力(收割由指挥官决定)。
  */
@@ -194,6 +197,9 @@ function clipDetail (detail) {
 /**
  * 七态判定。nowMs 由调用方在一次采样里只读一次 Date.now(),age 与 budget 共用同一个钟。
  *   heartbeat_age_ms = now - max(ts)   —— "最近一次心跳离现在多久"(看它还在不在动)
+ *                     末条心跳(lastBeat)取 ts 最大的一条;ts 打平时取文件里**更靠后**的那条(#143:
+ *                     心跳契约只要求 ts 是 ISO、不强制毫秒精度,秒级粒度下同秒两步必然并列,
+ *                     平局若取靠前者,"按 ts 最后一条"的规则会被自相矛盾地执行)。
  *   budget_used_ms   = now - min(ts)   —— 心跳文件里最早的证据离现在多久;不用进程启动时刻,
  *                     因为观察器可能在派发途中才被拉起,用启动时刻会把已跑的时长算丢,让 STALE 误报。
  *   distinct seq     = 不同 seq 的个数 —— 判活看"新步骤",不看字节增长。
@@ -219,7 +225,10 @@ function evaluate (state, opts, nowMs) {
   const seqSet = new Set();
   const fileSet = new Set();
   for (const beat of beats) {
-    if (beat.ts > maxTs) {
+    // #143: 用 `>=` 而非 `>` —— ts 相等时**后出现的行胜出**(后写者胜)。
+    // 心跳契约只要求 ts 是 ISO,不强制毫秒精度;宿主写秒级粒度时同秒两步必然并列,
+    // 若平局保留文件里靠前那条,"按 ts 最后那一条"就名不副实(已交工的 handback 会被同 ts 的前一条 read 吞掉)。
+    if (beat.ts >= maxTs) {
       maxTs = beat.ts;
       lastBeat = beat;
     }
@@ -238,11 +247,12 @@ function evaluate (state, opts, nowMs) {
     budgetUsedMs,
     lastBeat
   };
-  // ── 终态短路(#135)━━ 只看 lastBeat = 按 ts 最大的那一条。━━━━━━━━━━━━━━━━━━━━━
+  // ── 终态短路(#135)━━ 只看 lastBeat = 按 ts 最大的那一条(平局取文件靠后者,#143)。━━━━━━━━
   // handback(已交工)/ blocker(自报停工)是被派工者申报的终止态,不是卡死:
   // 静默再久、预算再超、seq 再新鲜,都不得判 STALE(建议收割)也不得判 WORKING。
   // 反向:文件中间出现过 handback 但更晚还有一条 read ⇒ lastBeat.step 是 read,
   //   这里自然不命中,继续走下面的时间/活跃度判据(带 handback 的文件仍会判死)。
+  // 平局同理受最后一条约束:同 ts 的 [read, handback] ⇒ 终态;同 ts 的 [handback, read] ⇒ 不判终态。
   const terminalVerdict = TERMINAL_STEP_VERDICTS.get(lastBeat.step);
   if (terminalVerdict !== undefined) {
     return Object.assign({ verdict: terminalVerdict, exitCode: 0 }, common);
