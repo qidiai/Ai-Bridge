@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18.x', '20.x', '22.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Unit + workspace + store-corrupt
+        run: |
+          node test-unit.mjs
+          node test-workspace.mjs
+          node test-store-corrupt.mjs
+      - name: End-to-end (isolated runner, fixed port is safe here)
+        run: node test-e2e.mjs
+      - name: External-auth regressions
+        run: node test-external-fixes.mjs

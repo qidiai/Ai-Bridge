@@ -26,3 +26,9 @@ codely-client.js
 # ── 本地环境 ──
 .env
 *.local
+
+# ---- internal work ledger (local only, never published) ----
+.local/
+
+# ---- test runtime scratch ----
+test-runtime-data/

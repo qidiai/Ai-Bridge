@@ -50,7 +50,11 @@ function git (repo, args) {
 }
 
 function parseArgs (argv) {
-  const opts = { repo: path.resolve(SCRIPT_DIR, '..'), ledger: null }
+  // Repo root: this script lives at the root of the standalone repo, but historically
+// it lived in <QiDi-Agent>/ai-bridge/. Prefer the layout that actually has a .git.
+const REPO_CANDIDATES = [SCRIPT_DIR, path.resolve(SCRIPT_DIR, '..')]
+const DEFAULT_REPO = REPO_CANDIDATES.find((p) => fs.existsSync(path.join(p, '.git'))) || REPO_CANDIDATES[0]
+const opts = { repo: DEFAULT_REPO, ledger: null }
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]
     if (a !== '--repo' && a !== '--ledger') exitUsage('未知参数: ' + a + '（用法: ' + USAGE + '）')
@@ -60,7 +64,18 @@ function parseArgs (argv) {
     if (a === '--repo') opts.repo = v; else opts.ledger = v
     i += 1
   }
-  if (opts.ledger === null) opts.ledger = path.join(opts.repo, 'ai-bridge', 'TEST-LOCK.json')
+  if (opts.ledger === null) {
+  // TEST-LOCK.json is an internal work ledger kept in .local/ (gitignored).
+  // Candidates are tried in order so both the standalone repo layout and the
+  // historical <repo>/ai-bridge/ layout resolve.
+  const cands = [
+    path.join(SCRIPT_DIR, '.local', 'TEST-LOCK.json'),
+    path.join(SCRIPT_DIR, 'TEST-LOCK.json'),
+    path.join(opts.repo, 'ai-bridge', 'TEST-LOCK.json'),
+    path.join(opts.repo, 'TEST-LOCK.json')
+  ];
+  opts.ledger = cands.find((p) => fs.existsSync(p)) || cands[0];
+}
   return opts
 }
 

@@ -40,9 +40,21 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO = path.resolve(__dirname, '..');
+const REPO_CANDIDATES = [__dirname, path.resolve(__dirname, '..')];
+const REPO = REPO_CANDIDATES.find((p) => fs.existsSync(p + '/.git')) || REPO_CANDIDATES[0];
 const GUARD = path.join(__dirname, 'check-ledger-hygiene.mjs');
-const REAL_LEDGER = path.join(__dirname, 'TEST-LOCK.json');
+const LEDGER_CANDIDATES = [
+  path.join(__dirname, '.local', 'TEST-LOCK.json'),
+  path.join(__dirname, 'TEST-LOCK.json'),
+  path.join(REPO, 'ai-bridge', 'TEST-LOCK.json'),
+  path.join(REPO, 'TEST-LOCK.json')
+];
+const REAL_LEDGER = LEDGER_CANDIDATES.find((p) => fs.existsSync(p)) || null;
+if (!REAL_LEDGER) {
+  // TEST-LOCK.json is an internal ledger and is not part of the public repo.
+  console.log('SKIP test-ledger-hygiene: TEST-LOCK.json not present (internal ledger, .local/)');
+  process.exit(0);
+}
 const TMP = path.join(__dirname, 'test-runtime-data', 'ledger-hygiene-' + Date.now() + '-' + process.pid);
 
 let passed = 0; let failed = 0; const fails = [];
